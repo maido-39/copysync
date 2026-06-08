@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import com.copysync.android.data.Settings
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.SyncService
 import com.copysync.android.ui.AppRoot
@@ -28,6 +29,8 @@ class MainActivity : ComponentActivity() {
             requestNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         handleDeepLink(intent)
+        // Ensure the sync service is running whenever a paired app is opened.
+        if (Settings(this).isPaired) SyncService.start(this)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) { AppRoot() }

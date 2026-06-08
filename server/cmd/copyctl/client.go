@@ -14,7 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -111,8 +114,9 @@ type Client struct {
 	echo  *echoGuard
 	hist  *History
 
-	mu  sync.Mutex
-	seq uint64
+	mu     sync.Mutex
+	seq    uint64
+	served map[model.BlobID]string // on-demand blobs this client holds: id -> file path
 }
 
 func newClient(cfg Config, hist *History) (*Client, error) {
@@ -120,7 +124,7 @@ func newClient(cfg Config, hist *History) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg, httpc: hc, echo: newEchoGuard(), hist: hist}, nil
+	return &Client{cfg: cfg, httpc: hc, echo: newEchoGuard(), hist: hist, served: make(map[model.BlobID]string)}, nil
 }
 
 func (c *Client) wsURL() string {
@@ -181,18 +185,18 @@ func (c *Client) sendText(ctx context.Context, conn *websocket.Conn, text string
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
 }
 
-func (c *Client) sendBlob(ctx context.Context, conn *websocket.Conn, content []byte, mime string, targets model.Targets) (string, error) {
+func (c *Client) sendBlob(ctx context.Context, conn *websocket.Conn, content []byte, mimeType, name string, targets model.Targets) (string, error) {
 	bid, err := c.putBlob(content)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(content)
-	if mime == "" {
-		mime = "application/octet-stream"
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
 	}
 	ev := model.ClipEvent{
-		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{mime},
-		BlobID: bid, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
+		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{mimeType},
+		Name: name, BlobID: bid, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
 	}
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
 }
@@ -303,4 +307,108 @@ func (e *echoGuard) seen(sha string) bool {
 	defer e.mu.Unlock()
 	t, ok := e.seenAt[sha]
 	return ok && time.Since(t) < 10*time.Second
+}
+
+func (c *Client) holdFile(id model.BlobID, path string) {
+	c.mu.Lock()
+	c.served[id] = path
+	c.mu.Unlock()
+}
+
+func (c *Client) servedPath(id model.BlobID) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.served[id]
+	return p, ok
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func mimeOf(path string) string {
+	if t := mime.TypeByExtension(filepath.Ext(path)); t != "" {
+		return t
+	}
+	return "application/octet-stream"
+}
+
+// sendLazyClip advertises a file as on-demand (no upload) and remembers it so a
+// later blob_request from the server can be served.
+func (c *Client) sendLazyClip(ctx context.Context, conn *websocket.Conn, path string, size int64, targets model.Targets) (model.BlobID, error) {
+	sum, err := fileSHA256(path)
+	if err != nil {
+		return "", err
+	}
+	bid := model.BlobID("sha256:" + sum)
+	c.holdFile(bid, path)
+	ev := model.ClipEvent{
+		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339),
+		Mime: []string{mimeOf(path)}, Name: filepath.Base(path), BlobID: bid,
+		Size: size, Sha256: sum, OnDemand: true, Targets: targets,
+	}
+	return bid, writeMsg(ctx, conn, protocol.TypeClip, ev)
+}
+
+// serveLoop reads frames and answers blob_request by uploading the held file.
+func (c *Client) serveLoop(ctx context.Context, conn *websocket.Conn) error {
+	for {
+		env, err := readMsg(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if env.T != protocol.TypeBlobReq {
+			continue
+		}
+		var br protocol.BlobRequest
+		if env.Decode(&br) != nil {
+			continue
+		}
+		path, ok := c.servedPath(model.BlobID(br.ID))
+		if !ok {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "serve: read failed:", err)
+			continue
+		}
+		if _, err := c.putBlob(data); err != nil {
+			fmt.Fprintln(os.Stderr, "serve: upload failed:", err)
+			continue
+		}
+		fmt.Printf("served on demand: %s (%d bytes)\n", br.ID, len(data))
+	}
+}
+
+// pinnedFetch GETs a blob over a long-timeout pinned connection (the server may
+// long-poll while it pulls the blob from the origin device on demand).
+func (c *Client) pinnedFetch(id model.BlobID, timeout time.Duration) ([]byte, int, error) {
+	tc, err := pinnedTLS(c.cfg.Pin)
+	if err != nil {
+		return nil, 0, err
+	}
+	hc := &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: tc}}
+	req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(c.cfg.ServerURL, "/")+"/blob/"+string(id), nil)
+	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, resp.StatusCode, fmt.Errorf("%s", strings.TrimSpace(string(b)))
+	}
+	data, err := io.ReadAll(resp.Body)
+	return data, resp.StatusCode, err
 }

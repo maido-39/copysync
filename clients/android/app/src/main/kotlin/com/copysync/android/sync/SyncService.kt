@@ -1,5 +1,6 @@
 package com.copysync.android.sync
 
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -7,12 +8,14 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.copysync.android.capture.Captured
 import com.copysync.android.capture.ClipboardCaptureEngine
 import com.copysync.android.data.ClipEntity
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
 import com.copysync.android.net.Ack
+import com.copysync.android.net.BlobClient
 import com.copysync.android.net.ClipEvent
 import com.copysync.android.net.Envelope
 import com.copysync.android.net.Hello
@@ -33,9 +36,9 @@ import java.util.UUID
 
 /**
  * The specialUse foreground service: it hosts the persistent WebSocket session,
- * runs the clipboard capture engine, relays local copies to the server, writes
- * inbound clips back, and records history. specialUse avoids the dataSync 6h cap
- * and the BOOT_COMPLETED restriction.
+ * runs the clipboard capture engine, relays local copies (text + images) to the
+ * server, writes inbound clips back, and records history. specialUse avoids the
+ * dataSync 6h cap and the BOOT_COMPLETED restriction.
  */
 class SyncService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -45,6 +48,7 @@ class SyncService : Service() {
 
     private var capture: ClipboardCaptureEngine? = null
     @Volatile private var ws: WsClient? = null
+    @Volatile private var blob: BlobClient? = null
     private var seq = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -70,27 +74,59 @@ class SyncService : Service() {
 
     private fun startCapture() {
         if (capture != null) return
-        capture = ClipboardCaptureEngine(this) { text -> onLocalCopy(text) }.also { it.start() }
+        capture = ClipboardCaptureEngine(this) { onCaptured(it) }.also { it.start() }
     }
 
-    private fun onLocalCopy(text: String) {
+    private fun onCaptured(c: Captured) {
         scope.launch {
-            val sha = sha256Hex(text)
-            dao.insert(
-                ClipEntity(
-                    clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
-                    direction = "out", origin = settings.deviceId.orEmpty(), text = text, sha = sha,
-                ),
-            )
+            when (c) {
+                is Captured.Text -> {
+                    val sha = sha256Hex(c.text)
+                    dao.insert(
+                        ClipEntity(
+                            clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
+                            direction = "out", origin = settings.deviceId.orEmpty(), text = c.text, sha = sha,
+                        ),
+                    )
+                    val sent = ws?.sendClip(
+                        ClipEvent(
+                            id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf("text/plain"),
+                            inlineText = c.text, size = c.text.toByteArray().size.toLong(), sha256 = sha,
+                        ),
+                    )
+                    SyncState.lastEvent.value = "↑ ${c.text.take(40)}"
+                    Log.i("CopySync", "local copy -> sendClip (ws=${ws != null}, sent=$sent, ${c.text.length} chars)")
+                }
+                is Captured.Image -> {
+                    val b = blob
+                    if (b == null) {
+                        Log.w("CopySync", "no blob channel; image not sent")
+                    } else {
+                        val sha = sha256Hex(c.bytes)
+                        val id = runCatching { b.put(c.bytes) }.getOrElse {
+                            Log.w("CopySync", "image blob upload failed: ${it.message}")
+                            return@launch
+                        }
+                        dao.insert(
+                            ClipEntity(
+                                clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
+                                direction = "out", origin = settings.deviceId.orEmpty(),
+                                text = "(image ${c.bytes.size / 1024}KB)", sha = sha,
+                            ),
+                        )
+                        ws?.sendClip(
+                            ClipEvent(
+                                id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime),
+                                blobId = id, size = c.bytes.size.toLong(), sha256 = sha,
+                            ),
+                        )
+                        SyncState.lastEvent.value = "↑ image ${c.bytes.size / 1024}KB"
+                        Log.i("CopySync", "sent image ${c.bytes.size} bytes ($id)")
+                    }
+                }
+            }
             dao.prune(300)
-            val sent = ws?.sendClip(
-                ClipEvent(
-                    id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf("text/plain"),
-                    inlineText = text, size = text.toByteArray().size.toLong(), sha256 = sha,
-                ),
-            )
-            SyncState.lastEvent.value = "sent: ${text.take(40)}"
-            Log.i("CopySync", "local copy -> sendClip (ws=${ws != null}, sent=$sent, ${text.length} chars)")
+            refreshNotification()
         }
     }
 
@@ -106,14 +142,17 @@ class SyncService : Service() {
                     if (url == null || pin == null || token == null || devId == null) {
                         update("not paired"); break
                     }
-                    val w = WsClient(pinnedClient(pin))
+                    val client = pinnedClient(pin)
+                    val w = WsClient(client)
                     ws = w
+                    blob = BlobClient(client, url, token)
                     val incomingJob = launch { w.incoming.collect { handle(it) } }
                     val wsUrl = url.replaceFirst("https://", "wss://")
                         .replaceFirst("http://", "ws://").trimEnd('/') + "/ws"
                     update("connecting…")
                     w.connect(wsUrl, object : WsClient.Listener {
                         override fun onOpen() {
+                            SyncState.connected.value = true
                             w.sendHello(
                                 Hello(deviceId = devId, deviceName = settings.deviceName ?: "android", token = token),
                             )
@@ -121,6 +160,7 @@ class SyncService : Service() {
                         }
 
                         override fun onClosed(reason: String) {
+                            SyncState.connected.value = false
                             update("disconnected: $reason")
                         }
                     })
@@ -131,12 +171,12 @@ class SyncService : Service() {
                     }
                     if (w.connected.value) backoff = 1000L
                     while (isActive && SyncState.running.value && w.connected.value) {
-                        SyncState.connected.value = true
                         delay(1000)
                     }
                     SyncState.connected.value = false
                     incomingJob.cancel()
                     w.close()
+                    blob = null
                 } catch (e: Exception) {
                     update("error: ${e.message}")
                     SyncState.connected.value = false
@@ -160,19 +200,44 @@ class SyncService : Service() {
             }
             MsgType.CLIP -> {
                 val ev = runCatching { env.decodePayload<ClipEvent>() }.getOrNull() ?: return
-                val text = ev.inlineText ?: return // blob payloads handled in a later stage
-                dao.insert(
-                    ClipEntity(
-                        clipId = ev.id, ts = System.currentTimeMillis(), direction = "in",
-                        origin = ev.originDeviceId, text = text,
-                        sha = ev.sha256.ifEmpty { sha256Hex(text) },
-                    ),
-                )
+                val imageMime = ev.mime.firstOrNull { it.startsWith("image/") }
+                when {
+                    ev.inlineText != null -> {
+                        val text = ev.inlineText!!
+                        dao.insert(
+                            ClipEntity(
+                                clipId = ev.id, ts = System.currentTimeMillis(), direction = "in",
+                                origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) },
+                            ),
+                        )
+                        capture?.applyInbound(text)
+                        Notifications.notifyClip(this, ev.originDeviceId, text)
+                        SyncState.lastEvent.value = "↓ ${text.take(40)}"
+                        Log.i("CopySync", "received text (${text.length} chars)")
+                    }
+                    ev.blobId != null && imageMime != null -> {
+                        val data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
+                        if (data != null) {
+                            val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
+                            capture?.applyInboundImage(data, "in-${ev.id.take(8)}.$ext")
+                            dao.insert(
+                                ClipEntity(
+                                    clipId = ev.id, ts = System.currentTimeMillis(), direction = "in",
+                                    origin = ev.originDeviceId, text = "(image ${data.size / 1024}KB)",
+                                    sha = ev.sha256.ifEmpty { sha256Hex(data) },
+                                ),
+                            )
+                            Notifications.notifyClip(this, ev.originDeviceId, "(image)")
+                            SyncState.lastEvent.value = "↓ image ${data.size / 1024}KB"
+                            Log.i("CopySync", "received image ${data.size} bytes")
+                        } else {
+                            Log.w("CopySync", "inbound image: blob fetch failed for ${ev.blobId}")
+                        }
+                    }
+                    else -> Log.i("CopySync", "ignoring unsupported clip (mime=${ev.mime})")
+                }
                 dao.prune(300)
-                capture?.applyInbound(text)
-                Notifications.notifyClip(this, ev.originDeviceId, text)
-                SyncState.lastEvent.value = "received: ${text.take(40)}"
-                Log.i("CopySync", "received clip from ${ev.originDeviceId} (${text.length} chars)")
+                refreshNotification()
             }
         }
     }
@@ -180,10 +245,21 @@ class SyncService : Service() {
     private fun update(s: String) {
         SyncState.status.value = s
         Log.i("CopySync", "status: $s")
+        refreshNotification()
+    }
+
+    private fun refreshNotification() {
+        val text = SyncState.lastEvent.value.ifEmpty { SyncState.status.value }
+        runCatching {
+            getSystemService(NotificationManager::class.java).notify(
+                Notifications.SERVICE_NOTIF_ID,
+                Notifications.serviceNotification(this, text, SyncState.connected.value),
+            )
+        }
     }
 
     private fun startForegroundCompat(text: String) {
-        val n = Notifications.serviceNotification(this, text)
+        val n = Notifications.serviceNotification(this, text, SyncState.connected.value)
         when {
             Build.VERSION.SDK_INT >= 34 ->
                 startForeground(Notifications.SERVICE_NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)

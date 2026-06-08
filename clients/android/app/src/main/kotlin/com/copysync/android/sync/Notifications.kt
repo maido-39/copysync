@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import com.copysync.android.MainActivity
+import com.copysync.android.R
 
 object Notifications {
     const val SERVICE_CHANNEL = "copysync_service"
@@ -24,14 +25,22 @@ object Notifications {
         )
     }
 
-    fun serviceNotification(ctx: Context, text: String): Notification {
+    private const val GREEN = 0xFF22C55E.toInt()
+    private const val GREY = 0xFF9E9E9E.toInt()
+
+    /** The ongoing status-bar notification. Green + colorized while connected;
+     *  its text is refreshed on every clip so the status-bar icon visibly reacts. */
+    fun serviceNotification(ctx: Context, text: String, connected: Boolean): Notification {
         val pi = PendingIntent.getActivity(
             ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(ctx, SERVICE_CHANNEL)
-            .setContentTitle("CopySync")
+            .setContentTitle(if (connected) "CopySync · connected" else "CopySync")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setSmallIcon(R.drawable.ic_stat_sync)
+            .setColor(if (connected) GREEN else GREY)
+            .setColorized(true)
+            .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setContentIntent(pi)
             .build()

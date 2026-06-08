@@ -47,6 +47,11 @@ type rosterReq struct {
 	reply chan []protocol.DeviceInfo
 }
 
+type blobReqMsg struct {
+	id    model.BlobID
+	reply chan bool
+}
+
 // Hub owns the registry of connected clients and routes clips.
 type Hub struct {
 	store      Store
@@ -59,8 +64,10 @@ type Hub struct {
 	unregister chan *Client
 	route      chan routeReq
 	roster     chan rosterReq
+	blobReq    chan blobReqMsg
 
-	clients map[model.DeviceID]*Client // owned by Run only
+	clients  map[model.DeviceID]*Client      // owned by Run only
+	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
 }
 
 // New creates a hub.
@@ -78,7 +85,9 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		unregister: make(chan *Client),
 		route:      make(chan routeReq),
 		roster:     make(chan rosterReq),
+		blobReq:    make(chan blobReqMsg),
 		clients:    make(map[model.DeviceID]*Client),
+		onDemand:   make(map[model.BlobID]model.DeviceID),
 	}
 }
 
@@ -96,6 +105,8 @@ func (h *Hub) Run(ctx context.Context) {
 			r.reply <- h.handleRoute(r.ev)
 		case r := <-h.roster:
 			r.reply <- h.snapshot()
+		case r := <-h.blobReq:
+			r.reply <- h.handleBlobRequest(r.id)
 		}
 	}
 }
@@ -125,6 +136,30 @@ func (h *Hub) Snapshot() []protocol.DeviceInfo {
 	return <-reply
 }
 
+// RequestBlob asks the origin holder of an on-demand blob to upload it now.
+// Returns false if the blob's origin is unknown or currently offline.
+func (h *Hub) RequestBlob(id model.BlobID) bool {
+	reply := make(chan bool, 1)
+	h.blobReq <- blobReqMsg{id: id, reply: reply}
+	return <-reply
+}
+
+func (h *Hub) handleBlobRequest(id model.BlobID) bool {
+	origin, ok := h.onDemand[id]
+	if !ok {
+		return false
+	}
+	c, online := h.clients[origin]
+	if !online {
+		return false
+	}
+	b, err := protocol.Encode(protocol.TypeBlobReq, protocol.BlobRequest{ID: string(id)})
+	if err != nil {
+		return false
+	}
+	return c.Enqueue(b)
+}
+
 func (h *Hub) handleRegister(r registerReq) {
 	c := r.client
 	id := c.Device.ID
@@ -137,13 +172,14 @@ func (h *Hub) handleRegister(r registerReq) {
 
 	settings, _ := h.store.GetSettings()
 	ok := protocol.HelloOK{
-		ServerID:   h.serverID,
-		ServerName: h.serverName,
-		E2E:        settings.E2EEnabled,
-		You:        c.Device,
-		Roster:     h.snapshot(),
-		MaxMsg:     settings.MaxMessageBytes,
-		BlobCap:    settings.BlobMaxBytes,
+		ServerID:          h.serverID,
+		ServerName:        h.serverName,
+		E2E:               settings.E2EEnabled,
+		You:               c.Device,
+		Roster:            h.snapshot(),
+		MaxMsg:            settings.MaxMessageBytes,
+		BlobCap:           settings.BlobMaxBytes,
+		OnDemandThreshold: settings.OnDemandThresholdBytes,
 	}
 	if b, err := protocol.Encode(protocol.TypeHelloOK, ok); err == nil {
 		c.Enqueue(b)
@@ -178,6 +214,10 @@ func (h *Hub) handleUnregister(c *Client) {
 func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	settings, _ := h.store.GetSettings()
 	targets := h.resolveTargets(ev)
+	// Remember who holds an on-demand blob so a later GET can pull it from them.
+	if ev.OnDemand && ev.BlobID != "" {
+		h.onDemand[ev.BlobID] = ev.OriginDevice
+	}
 	var queuedFor []model.DeviceID
 	relayedAny := false
 

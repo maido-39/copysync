@@ -32,6 +32,8 @@ func main() {
 		err = cmdPair(os.Args[2:])
 	case "send":
 		err = cmdSend(os.Args[2:])
+	case "pull":
+		err = cmdPull(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "run":
@@ -58,13 +60,16 @@ func usage() {
 Usage:
   copyctl pair    --server URL --otp CODE --name NAME [--pin B64] [--config FILE]
   copyctl send    [--text STR | --file PATH] [--targets all|id,id] [--config FILE]
+  copyctl pull    --id sha256:HEX --out PATH [--config FILE]
   copyctl watch   [--save-dir DIR] [--config FILE]
   copyctl run     [--targets all|id,id] [--save-dir DIR] [--config FILE]
   copyctl history [--search TERM]
 
 Commands:
   pair     Redeem an OTP and store the device token + server pin.
-  send     Send one clip (text or file) and exit.
+  send     Send a clip. Text/small files upload eagerly; files over the server
+           threshold are advertised on demand and served while this stays running.
+  pull     Download a blob by id (triggers an on-demand pull from the source).
   watch    Connect and print/save every incoming clip (no clipboard needed).
   run      Two-way sync with the OS clipboard (Wayland/X11; headless = receive only).
   history  Show or search the local clipboard log.
@@ -122,42 +127,96 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	conn, _, err := cl.connect(ctx)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	conn, hello, err := cl.connect(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.CloseNow()
-
 	targets := parseTargets(*targetsArg)
-	var id string
-	switch {
-	case *file != "":
+
+	if *file != "" {
+		st, err := os.Stat(*file)
+		if err != nil {
+			return err
+		}
+		size := st.Size()
+		// Over the server threshold → advertise on demand (no upload) and stay to serve.
+		if hello.OnDemandThreshold > 0 && size > hello.OnDemandThreshold {
+			bid, err := cl.sendLazyClip(ctx, conn, *file, size, targets)
+			if err != nil {
+				return err
+			}
+			cl.hist.append("out", cfg.DeviceID, "(file on-demand) "+filepath.Base(*file), string(bid))
+			fmt.Printf("sent %s on demand (%d bytes > %d threshold) as %s\n", filepath.Base(*file), size, hello.OnDemandThreshold, bid)
+			fmt.Println("holding the file; serving when another device requests it. Ctrl-C to stop.")
+			if err := cl.serveLoop(ctx, conn); err != nil && ctx.Err() == nil {
+				return err
+			}
+			return nil
+		}
+		// Small file → eager upload.
 		data, err := os.ReadFile(*file)
 		if err != nil {
 			return err
 		}
-		id, err = cl.sendBlob(ctx, conn, data, "application/octet-stream", targets)
+		id, err := cl.sendBlob(ctx, conn, data, mimeOf(*file), filepath.Base(*file), targets)
 		if err != nil {
 			return err
 		}
 		cl.hist.append("out", cfg.DeviceID, "(file) "+filepath.Base(*file), "")
-	case *text != "":
-		id, err = cl.sendText(ctx, conn, *text, targets)
+		ack, err := cl.waitAck(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("sent %s → status=%s queuedFor=%v\n", id, ack.Status, ack.QueuedFor)
+		return nil
+	}
+
+	if *text != "" {
+		id, err := cl.sendText(ctx, conn, *text, targets)
 		if err != nil {
 			return err
 		}
 		cl.hist.append("out", cfg.DeviceID, *text, "")
-	default:
-		return fmt.Errorf("provide --text or --file")
+		ack, err := cl.waitAck(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("sent %s → status=%s queuedFor=%v\n", id, ack.Status, ack.QueuedFor)
+		return nil
 	}
+	return fmt.Errorf("provide --text or --file")
+}
 
-	ack, err := cl.waitAck(ctx, conn, id)
+func cmdPull(args []string) error {
+	fs := flag.NewFlagSet("pull", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
+	id := fs.String("id", "", "blob id (sha256:<hex>)")
+	out := fs.String("out", "", "output file path")
+	_ = fs.Parse(args)
+	if *id == "" || *out == "" {
+		return fmt.Errorf("--id and --out are required")
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config (run `copyctl pair` first): %w", err)
+	}
+	cl, err := newClient(cfg, nil)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent %s → status=%s queuedFor=%v\n", id, ack.Status, ack.QueuedFor)
+	fmt.Printf("requesting %s (server pulls from the source device on demand)…\n", *id)
+	data, code, err := cl.pinnedFetch(model.BlobID(*id), 120*time.Second)
+	if err != nil {
+		return fmt.Errorf("pull failed (HTTP %d): %w", code, err)
+	}
+	if err := os.WriteFile(*out, data, 0o644); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	fmt.Printf("downloaded %d bytes → %s (sha256 %s)\n", len(data), *out, hex.EncodeToString(sum[:]))
 	return nil
 }
 

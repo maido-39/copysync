@@ -36,6 +36,8 @@ type Server struct {
 
 	loginLimiter *ipLimiter
 	pairLimiter  *ipLimiter
+
+	blobWaiters *blobWaiters
 }
 
 // Config holds what the HTTP server needs at construction time.
@@ -75,6 +77,7 @@ func New(c Config) *Server {
 		validateBlobToken: c.ValidateBlobToken,
 		loginLimiter:      newIPLimiter(rate.Every(2*time.Second), 5),
 		pairLimiter:       newIPLimiter(rate.Every(2*time.Second), 5),
+		blobWaiters:       newBlobWaiters(),
 	}
 }
 

@@ -115,6 +115,8 @@ type ClipEvent struct {
 	Mime         []string `json:"mime"`
 	InlineText   string   `json:"inlineText,omitempty"`
 	BlobID       BlobID   `json:"blobId,omitempty"`
+	Name         string   `json:"name,omitempty"`     // filename hint for file payloads
+	OnDemand     bool     `json:"onDemand,omitempty"` // bytes not uploaded yet; pull from origin on request
 	Size         int64    `json:"size"`
 	Sha256       string   `json:"sha256"`
 	Targets      Targets  `json:"targets"`

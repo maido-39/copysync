@@ -48,6 +48,7 @@ Every control-channel frame is:
 | `roster` | DeviceInfo[] | all paired devices + online flags |
 | `maxMsg` | int | max control-frame size in bytes |
 | `blobCap` | int | max blob size in bytes |
+| `onDemandThreshold` | int | files ≤ this are uploaded eagerly; larger ones are advertised on demand |
 
 After `hello_ok`, the server immediately replays any **queued** clips (see
 *Offline queue*), then live traffic begins.
@@ -65,6 +66,8 @@ After `hello_ok`, the server immediately replays any **queued** clips (see
 | `mime` | string[] | ordered MIME preferences, e.g. `["image/png","text/plain"]` |
 | `inlineText` | string? | small text only, and only when E2E is off |
 | `blobId` | string? | content address (`sha256:<hex>`) for large payloads |
+| `name` | string? | filename hint for file payloads |
+| `onDemand` | bool? | `true` ⇒ bytes not uploaded; the origin holds them and uploads on a `blob_request` |
 | `size` | int | payload size in bytes |
 | `sha256` | string | hash of the payload (plaintext if E2E off, ciphertext if on) |
 | `targets` | `"all"` \| string[] | recipients: all paired devices, or explicit ids |
@@ -75,6 +78,10 @@ it for any offline targets.
 
 ### `ack` (server → client) — disposition of a sent clip
 `{ "id": "...", "status": "relayed"|"queued"|"rejected", "queuedFor": [ids] }`
+
+### `blob_request` (server → client) — upload an on-demand blob now
+`{ "id": "sha256:<hex>" }` — sent to the **origin** of an on-demand clip when
+another device requests its bytes. The origin responds by `PUT`ting the blob.
 
 ### `presence` (server → client) — roster delta
 `{ "device": Device, "online": bool }`
@@ -117,6 +124,16 @@ Large payloads are content-addressed by `sha256`:
 
 A `clip` with a `blobId` is queued for offline devices with its blob **pinned**
 (refcounted) so garbage collection cannot remove a blob a device still needs.
+
+### On-demand large files (reference + pull)
+
+Files larger than `onDemandThreshold` are **not uploaded** when copied. The origin
+sends a `clip` with `blobId`, `name`, `size` and `onDemand: true`, and keeps the
+bytes locally. When another device wants them, its `GET /blob/{id}` misses on the
+server, which then sends a `blob_request` to the origin and **long-polls** (up to
+60s) until the origin `PUT`s the blob, then streams it to the requester and caches
+it (later requesters are served directly). If the origin is offline, `GET` returns
+`404`; if it doesn't deliver in time, `504`.
 
 ## Pairing
 

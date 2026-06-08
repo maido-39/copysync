@@ -14,14 +14,15 @@ const Proto = 1
 
 // Message types — the "t" field of the envelope.
 const (
-	TypeHello    = "hello"     // C->S
-	TypeHelloOK  = "hello_ok"  // S->C
-	TypeHelloErr = "hello_err" // S->C
-	TypeClip     = "clip"      // both directions
-	TypeAck      = "ack"       // S->C
-	TypePresence = "presence"  // S->C
-	TypeRoster   = "roster"    // S->C
-	TypeError    = "error"     // S->C
+	TypeHello    = "hello"        // C->S
+	TypeHelloOK  = "hello_ok"     // S->C
+	TypeHelloErr = "hello_err"    // S->C
+	TypeClip     = "clip"         // both directions
+	TypeAck      = "ack"          // S->C
+	TypeBlobReq  = "blob_request" // S->C: asks the origin to upload an on-demand blob
+	TypePresence = "presence"     // S->C
+	TypeRoster   = "roster"       // S->C
+	TypeError    = "error"        // S->C
 )
 
 // Envelope wraps every control-channel frame: {"t": <type>, "d": <payload>}.
@@ -47,13 +48,19 @@ type Hello struct {
 
 // HelloOK is the server's acceptance of a Hello.
 type HelloOK struct {
-	ServerID   string       `json:"serverId"`
-	ServerName string       `json:"serverName"`
-	E2E        bool         `json:"e2e"`
-	You        model.Device `json:"you"`
-	Roster     []DeviceInfo `json:"roster"`
-	MaxMsg     int64        `json:"maxMsg"`
-	BlobCap    int64        `json:"blobCap"`
+	ServerID          string       `json:"serverId"`
+	ServerName        string       `json:"serverName"`
+	E2E               bool         `json:"e2e"`
+	You               model.Device `json:"you"`
+	Roster            []DeviceInfo `json:"roster"`
+	MaxMsg            int64        `json:"maxMsg"`
+	BlobCap           int64        `json:"blobCap"`
+	OnDemandThreshold int64        `json:"onDemandThreshold"`
+}
+
+// BlobRequest asks the origin device to upload an on-demand blob to the server now.
+type BlobRequest struct {
+	ID string `json:"id"`
 }
 
 // HelloErr explains why a Hello was rejected (the connection then closes).
