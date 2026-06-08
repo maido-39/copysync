@@ -1,18 +1,15 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>CopySync Admin</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">CopySync <span id="server-name" class="muted"></span></div>
-    <button id="logout" class="ghost hidden">Logout</button>
-  </header>
-  <main id="app" class="container"><p class="muted">Loading…</p></main>
-  <footer class="container muted small">CopySync server · self-hosted LAN clipboard sync</footer>
+  <div id="root"><div class="auth-wrap"><p class="muted">불러오는 중…</p></div></div>
+  <div id="toasts" class="toasts"></div>
   <script src="/app.js"></script>
 </body>
 </html>
