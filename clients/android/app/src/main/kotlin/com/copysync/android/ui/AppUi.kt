@@ -4,41 +4,61 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.Settings as AndroidSettings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.copysync.android.data.ClipEntity
 import com.copysync.android.data.Downloads
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
@@ -50,23 +70,23 @@ import com.copysync.android.sync.SyncState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 @Composable
 fun AppRoot() {
     val ctx = LocalContext.current
     var paired by remember { mutableStateOf(Settings(ctx).isPaired) }
-    if (paired) {
-        StatusScreen(onUnpair = { paired = false })
-    } else {
-        PairingScreen(onPaired = { paired = true })
-    }
+    if (paired) MainScaffold(onUnpair = { paired = false })
+    else PairingScreen(onPaired = { paired = true })
 }
+
+// ---------------------------------------------------------------- Pairing
 
 @Composable
 private fun PairingScreen(onPaired: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    var server by remember { mutableStateOf("https://10.0.2.2:8443") }
+    var server by remember { mutableStateOf("https://192.168.20.177:8443") }
     var otp by remember { mutableStateOf("") }
     var name by remember { mutableStateOf("android") }
     var pin by remember { mutableStateOf("") }
@@ -74,60 +94,44 @@ private fun PairingScreen(onPaired: () -> Unit) {
     var busy by remember { mutableStateOf(false) }
 
     Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Pair this device", style = MaterialTheme.typography.headlineSmall)
+        Text("기기 페어링", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "Generate a pairing code in the server's admin UI, then enter it here. " +
-                "Leave the pin blank to trust the server on first use.",
+            "서버 관리자 화면에서 OTP를 생성해 입력하세요. 핀을 비우면 최초 접속 시 자동 신뢰합니다.",
             style = MaterialTheme.typography.bodySmall,
         )
-        OutlinedTextField(server, { server = it }, label = { Text("Server URL") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(otp, { otp = it }, label = { Text("OTP") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(name, { name = it }, label = { Text("Device name") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(pin, { pin = it }, label = { Text("SPKI pin (optional)") }, modifier = Modifier.fillMaxWidth())
-        Button(
-            enabled = !busy,
-            onClick = {
-                busy = true; msg = "pairing…"
-                scope.launch {
-                    val result = withContext(Dispatchers.IO) {
-                        runCatching { claimAndStore(ctx, server.trim(), otp.trim(), name.trim(), pin.trim()) }
-                    }
-                    busy = false
-                    result.onSuccess {
-                        SyncService.start(ctx)
-                        onPaired()
-                    }.onFailure { msg = "failed: ${it.message}" }
+        OutlinedTextField(server, { server = it }, label = { Text("서버 주소") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(otp, { otp = it }, label = { Text("OTP") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(name, { name = it }, label = { Text("기기 이름") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(pin, { pin = it }, label = { Text("SPKI 핀 (선택)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        Button(enabled = !busy, onClick = {
+            busy = true; msg = "페어링 중…"
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { claimAndStore(ctx, server.trim(), otp.trim(), name.trim(), pin.trim()) }
                 }
-            },
-        ) { Text(if (busy) "pairing…" else "Pair") }
+                busy = false
+                result.onSuccess { SyncService.start(ctx); onPaired() }
+                    .onFailure { msg = "실패: ${it.message}" }
+            }
+        }) { Text(if (busy) "페어링 중…" else "페어링") }
         if (msg.isNotEmpty()) Text(msg, color = MaterialTheme.colorScheme.error)
     }
 }
 
+// ---------------------------------------------------------------- Tabs shell
+
 @Composable
-private fun StatusScreen(onUnpair: () -> Unit) {
+private fun MainScaffold(onUnpair: () -> Unit) {
     val ctx = LocalContext.current
-    val settings = remember { Settings(ctx) }
-    val dao = remember { HistoryDb.get(ctx).clipDao() }
     val scope = rememberCoroutineScope()
+    val dao = remember { HistoryDb.get(ctx).clipDao() }
+    var tab by remember { mutableIntStateOf(0) }
 
-    val status by SyncState.status.collectAsState()
-    val connected by SyncState.connected.collectAsState()
-    val lastEvent by SyncState.lastEvent.collectAsState()
-
-    var query by remember { mutableStateOf("") }
-    val history by remember(query) {
-        if (query.isBlank()) dao.recent() else dao.search(query)
-    }.collectAsState(initial = emptyList())
-    var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
-
-    // Save-location picker for received files (notification tap or the 받기 button).
+    // Save-location picker (works from any tab; triggered by the 받기 button or a
+    // notification tap that routes through PendingDownload).
     val pending by PendingDownload.req.collectAsState()
     var current by remember { mutableStateOf<DownloadReq?>(null) }
     val savePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
@@ -136,13 +140,12 @@ private fun StatusScreen(onUnpair: () -> Unit) {
         PendingDownload.req.value = null
         if (uri != null && req != null) {
             scope.launch {
-                val r = withContext(Dispatchers.IO) { runCatching { Downloads.fetchToUri(ctx, req.blobId, uri) } }
-                r.onSuccess {
-                    if (req.rowid >= 0) dao.setLocalPath(req.rowid, uri.toString())
-                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: ${req.name}")
-                }.onFailure {
-                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 실패: ${it.message}")
-                }
+                withContext(Dispatchers.IO) { runCatching { Downloads.fetchToUri(ctx, req.blobId, uri) } }
+                    .onSuccess {
+                        if (req.rowid >= 0) dao.setLocalPath(req.rowid, uri.toString())
+                        Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: ${req.name}")
+                    }
+                    .onFailure { Notifications.notifyInfo(ctx, "CopySync", "다운로드 실패: ${it.message}") }
             }
         }
     }
@@ -152,27 +155,176 @@ private fun StatusScreen(onUnpair: () -> Unit) {
         savePicker.launch(p.name)
     }
 
+    val tabs = listOf("연결" to "🔗", "기록" to "📋", "설정" to "⚙️", "디버깅" to "🐞")
+    Scaffold(bottomBar = {
+        NavigationBar {
+            tabs.forEachIndexed { i, (label, icon) ->
+                NavigationBarItem(
+                    selected = tab == i,
+                    onClick = { tab = i },
+                    icon = { Text(icon, fontSize = 18.sp) },
+                    label = { Text(label) },
+                )
+            }
+        }
+    }) { pad ->
+        Box(Modifier.padding(pad).fillMaxSize()) {
+            when (tab) {
+                0 -> ConnectionTab(onUnpair)
+                1 -> HistoryTab()
+                2 -> SettingsTab()
+                else -> DebugTab()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 연결
+
+@Composable
+private fun ConnectionTab(onUnpair: () -> Unit) {
+    val ctx = LocalContext.current
+    val settings = remember { Settings(ctx) }
+    val status by SyncState.status.collectAsState()
+    val connected by SyncState.connected.collectAsState()
+    val lastEvent by SyncState.lastEvent.collectAsState()
+
     Column(
-        Modifier
-            .fillMaxSize()
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("CopySync", style = MaterialTheme.typography.headlineMedium)
-        Text("server: ${settings.serverName ?: "?"} — ${settings.serverUrl ?: "?"}", style = MaterialTheme.typography.bodySmall)
-        Text("status: $status  ${if (connected) "● connected" else "○ offline"}")
-        if (lastEvent.isNotEmpty()) Text("last: $lastEvent", style = MaterialTheme.typography.bodySmall)
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { SyncService.start(ctx) }) { Text("Start") }
-            OutlinedButton(onClick = { SyncService.stop(ctx) }) { Text("Stop") }
-            OutlinedButton(onClick = { copyTest(ctx) }) { Text("Copy test") }
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (connected) Color(0xFF16A34A) else Color(0xFF9E9E9E),
+                contentColor = Color.White,
+            ),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(if (connected) "● 연결됨" else "○ 오프라인", style = MaterialTheme.typography.titleMedium)
+                Text(status, style = MaterialTheme.typography.bodyMedium)
+                if (lastEvent.isNotEmpty()) Text("최근: $lastEvent", style = MaterialTheme.typography.bodySmall)
+            }
         }
+        InfoRow("서버", "${settings.serverName ?: "?"}")
+        InfoRow("주소", "${settings.serverUrl ?: "?"}")
+        InfoRow("기기 이름", "${settings.deviceName ?: "?"}")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { SyncService.start(ctx) }) { Text("시작") }
+            OutlinedButton(onClick = { SyncService.stop(ctx) }) { Text("중지") }
+        }
+        Spacer(Modifier.size(8.dp))
+        TextButton(onClick = {
+            SyncService.stop(ctx)
+            Settings(ctx).clear()
+            Secrets(ctx).clear()
+            onUnpair()
+        }) { Text("페어링 해제", color = MaterialTheme.colorScheme.error) }
+    }
+}
 
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth()) {
+        Text(label, modifier = Modifier.width(80.dp), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+// ---------------------------------------------------------------- 기록
+
+@Composable
+private fun HistoryTab() {
+    val ctx = LocalContext.current
+    val dao = remember { HistoryDb.get(ctx).clipDao() }
+    var query by remember { mutableStateOf("") }
+    val history by remember(query) {
+        if (query.isBlank()) dao.recent() else dao.search(query)
+    }.collectAsState(initial = emptyList())
+
+    Column(Modifier.fillMaxSize().padding(12.dp)) {
+        OutlinedTextField(
+            query, { query = it },
+            label = { Text("기록 검색") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.size(8.dp))
+        if (history.isEmpty()) {
+            Text("기록이 없습니다.", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(history, key = { it.rowid }) { e -> HistoryCard(e) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryCard(e: ClipEntity) {
+    val ctx = LocalContext.current
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = categoryColor(e)),
+    ) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
+                val thumb = if (e.kind == "image") rememberThumb(ctx, e) else null
+                if (thumb != null) {
+                    Image(
+                        thumb, contentDescription = null,
+                        modifier = Modifier.size(46.dp).clip(RoundedCornerShape(8.dp)),
+                        contentScale = ContentScale.Crop,
+                    )
+                } else {
+                    Text(iconFor(e), fontSize = 24.sp)
+                }
+            }
+            Spacer(Modifier.size(12.dp))
+            Column(Modifier.weight(1f)) {
+                val dir = if (e.direction == "in") "←" else "→"
+                val title = if (e.kind == "text") e.text.replace("\n", " ").trim() else e.name.ifEmpty { e.text }
+                Text("$dir $title", maxLines = 2, style = MaterialTheme.typography.bodyMedium)
+                val meta = buildString {
+                    if (e.kind != "text") {
+                        append(e.mime.ifEmpty { e.kind })
+                        if (e.sizeBytes > 0) append(" · ${formatBytes(e.sizeBytes)}")
+                        append(" · ")
+                    }
+                    append(relTime(e.ts))
+                }
+                Text(meta, style = MaterialTheme.typography.bodySmall, color = Color(0xFF607D8B))
+            }
+            val canDownload = e.direction == "in" && e.blobId.isNotEmpty() &&
+                (e.kind == "file" || e.kind == "image") && e.localPath == null
+            when {
+                canDownload -> TextButton(onClick = {
+                    PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid)
+                }) { Text("⬇ 받기") }
+                e.localPath != null -> Text("✓ 저장됨", style = MaterialTheme.typography.bodySmall, color = Color(0xFF16A34A))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 설정
+
+@Composable
+private fun SettingsTab() {
+    val ctx = LocalContext.current
+    val settings = remember { Settings(ctx) }
+    var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("설정", style = MaterialTheme.typography.headlineSmall)
         Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Background capture setup", style = MaterialTheme.typography.titleSmall)
-                Text("overlay permission: ${if (canOverlay) "granted" else "NOT granted"}")
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("백그라운드 캡처 권한", style = MaterialTheme.typography.titleSmall)
+                Text("오버레이: ${if (canOverlay) "허용됨 ✓" else "필요함"}")
                 if (!canOverlay) {
                     OutlinedButton(onClick = {
                         ctx.startActivity(
@@ -182,56 +334,139 @@ private fun StatusScreen(onUnpair: () -> Unit) {
                             ),
                         )
                         canOverlay = AndroidSettings.canDrawOverlays(ctx)
-                    }) { Text("Grant overlay") }
+                    }) { Text("오버레이 권한 열기") }
                 }
-                Text("One-time ADB grant (background clipboard read):", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "백그라운드에서 다른 앱의 복사를 잡으려면 READ_LOGS도 필요합니다 (디버깅 탭의 ADB/Shizuku 명령 참고).",
+                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                )
+            }
+        }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("서버", style = MaterialTheme.typography.titleSmall)
+                InfoRow("이름", settings.serverName ?: "?")
+                InfoRow("주소", settings.serverUrl ?: "?")
+                InfoRow("E2E", if (settings.e2e) "켜짐" else "꺼짐")
+                val t = settings.onDemandThreshold
+                InfoRow("온디맨드", if (t > 0) "${formatBytes(t)} 초과 시" else "—")
+            }
+        }
+        Text(
+            "큰 파일은 클립보드로 못 보냅니다 — 다른 앱에서 공유 → CopySync 로 보내세요.",
+            style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- 디버깅
+
+@Composable
+private fun DebugTab() {
+    val ctx = LocalContext.current
+    val status by SyncState.status.collectAsState()
+    val connected by SyncState.connected.collectAsState()
+    val lastEvent by SyncState.lastEvent.collectAsState()
+    val pkg = ctx.packageName
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("디버깅", style = MaterialTheme.typography.headlineSmall)
+        InfoRow("연결", if (connected) "connected" else "offline")
+        InfoRow("상태", status)
+        InfoRow("최근", lastEvent.ifEmpty { "—" })
+        OutlinedButton(onClick = {
+            ctx.getSystemService(ClipboardManager::class.java)
+                .setPrimaryClip(ClipData.newPlainText("CopySync", "test ${System.currentTimeMillis()}"))
+        }) { Text("클립보드 테스트 복사") }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("1회 권한 부여 (ADB 또는 Shizuku rish)", style = MaterialTheme.typography.titleSmall)
                 SelectionContainer {
                     Text(
-                        "adb shell pm grant ${ctx.packageName} android.permission.READ_LOGS\n" +
-                            "adb shell appops set ${ctx.packageName} SYSTEM_ALERT_WINDOW allow",
+                        "pm grant $pkg android.permission.READ_LOGS\n" +
+                            "appops set $pkg SYSTEM_ALERT_WINDOW allow",
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
+                Text(
+                    "부여 후 앱을 완전히 종료했다가 다시 여세요 (logcat 권한 적용).",
+                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                )
             }
         }
-
-        OutlinedTextField(
-            query, { query = it },
-            label = { Text("Search history") },
-            modifier = Modifier.fillMaxWidth(),
-        )
-        LazyColumn(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            items(history) { e ->
-                val arrow = if (e.direction == "in") "←" else "→"
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "$arrow ${e.text.replace("\n", " ").take(80)}",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    val downloadable = e.direction == "in" && e.blobId.isNotEmpty() &&
-                        (e.kind == "file" || e.kind == "image") && e.localPath == null
-                    when {
-                        downloadable -> TextButton(onClick = {
-                            PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid)
-                        }) { Text("⬇ 받기") }
-                        e.localPath != null -> Text("✓", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-        }
-
-        TextButton(onClick = {
-            SyncService.stop(ctx)
-            Settings(ctx).clear()
-            Secrets(ctx).clear()
-            onUnpair()
-        }) { Text("Unpair") }
     }
 }
 
-private fun copyTest(ctx: Context) {
-    val cm = ctx.getSystemService(ClipboardManager::class.java)
-    cm.setPrimaryClip(ClipData.newPlainText("CopySync", "test ${System.currentTimeMillis()}"))
+// ---------------------------------------------------------------- helpers
+
+private fun categoryColor(e: ClipEntity): Color {
+    val m = e.mime.lowercase()
+    val ext = e.name.substringAfterLast('.', "").lowercase()
+    return when {
+        e.kind == "text" -> Color(0xFFF1F3F4)
+        m.startsWith("image/") -> Color(0xFFE3F2FD)
+        m.startsWith("video/") -> Color(0xFFF3E5F5)
+        m.startsWith("audio/") -> Color(0xFFE0F2F1)
+        m.contains("pdf") || ext in setOf("doc", "docx", "txt", "md", "rtf", "odt", "hwp") -> Color(0xFFFFF3E0)
+        ext in setOf("zip", "rar", "7z", "tar", "gz", "apk") -> Color(0xFFFFF8E1)
+        else -> Color(0xFFECEFF1)
+    }
 }
+
+private fun iconFor(e: ClipEntity): String {
+    val m = e.mime.lowercase()
+    val ext = e.name.substringAfterLast('.', "").lowercase()
+    return when {
+        e.kind == "text" -> "🔤"
+        m.startsWith("image/") -> "🖼️"
+        m.startsWith("video/") -> "🎞️"
+        m.startsWith("audio/") -> "🎵"
+        m.contains("pdf") -> "📕"
+        ext in setOf("zip", "rar", "7z", "tar", "gz", "apk") -> "📦"
+        else -> "📄"
+    }
+}
+
+private fun formatBytes(b: Long): String = when {
+    b >= 1024L * 1024 * 1024 -> "%.1f GB".format(b / 1024.0 / 1024 / 1024)
+    b >= 1024L * 1024 -> "%.1f MB".format(b / 1024.0 / 1024)
+    b >= 1024 -> "%.0f KB".format(b / 1024.0)
+    else -> "$b B"
+}
+
+private fun relTime(ts: Long): String {
+    val d = System.currentTimeMillis() - ts
+    return when {
+        d < 60_000 -> "방금"
+        d < 3_600_000 -> "${d / 60_000}분 전"
+        d < 86_400_000 -> "${d / 3_600_000}시간 전"
+        else -> "${d / 86_400_000}일 전"
+    }
+}
+
+@Composable
+private fun rememberThumb(ctx: Context, e: ClipEntity): ImageBitmap? {
+    val sha = e.blobId.removePrefix("sha256:")
+    if (sha.isEmpty()) return null
+    val path = File(File(ctx.cacheDir, "clip-src"), sha).absolutePath
+    val state = produceState<ImageBitmap?>(initialValue = null, key1 = sha) {
+        value = withContext(Dispatchers.IO) { decodeThumb(path) }
+    }
+    return state.value
+}
+
+private fun decodeThumb(path: String, maxPx: Int = 256): ImageBitmap? = runCatching {
+    val f = File(path)
+    if (!f.exists()) return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / sample > maxPx || bounds.outHeight / sample > maxPx) sample *= 2
+    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
+}.getOrNull()

@@ -230,6 +230,7 @@ class SyncService : Service() {
             MsgType.HELLO_OK -> {
                 val ok = runCatching { env.decodePayload<HelloOk>() }.getOrNull()
                 threshold = ok?.onDemandThreshold ?: 0
+                settings.onDemandThreshold = threshold
                 update("synced with ${ok?.serverName ?: "server"}")
             }
             MsgType.ACK -> {
@@ -270,6 +271,11 @@ class SyncService : Service() {
                         if (data != null) {
                             val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
                             capture?.applyInboundImage(data, ev.name ?: "in-${ev.id.take(8)}.$ext")
+                            // Cache the bytes (keyed by blob hash) so the history tab can preview them.
+                            runCatching {
+                                val dir = File(cacheDir, "clip-src").apply { mkdirs() }
+                                File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data)
+                            }
                             dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data) }, "image", ev.blobId!!, ev.name ?: "image.$ext", data.size.toLong(), imageMime))
                             Notifications.notifyClip(this, ev.originDeviceId, "(image)")
                             SyncState.lastEvent.value = "↓ image ${data.size / 1024}KB"
