@@ -4,9 +4,10 @@ Self-hosted, cross-platform **real-time clipboard sync** over your LAN through a
 central server. Copy on one device, paste on another — text now, images/files
 next. Built for Android, Windows, and Linux.
 
-> **Status:** The **server** (this milestone) is implemented and tested. The
-> desktop (Tauri) and Android (Kotlin) clients are designed and scheduled next —
-> see [Roadmap](#roadmap).
+> **Status:** The **server**, a headless **`copyctl`** reference client, and the
+> **Android** client (text sync) are implemented and verified — the Android app
+> was tested end-to-end against the server on an Android 16 emulator. The desktop
+> (Tauri) client and image/file sync are next — see [Roadmap](#roadmap).
 
 ## Why
 
@@ -39,8 +40,8 @@ wire contract.
 ```
 server/             Go relay server (this milestone)
 server/cmd/copyctl  Reference CLI client + protocol conformance harness
+clients/android/    Kotlin + Jetpack Compose client (text sync — implemented)
 clients/desktop/    Tauri v2 + Svelte desktop client (planned)
-clients/android/    Kotlin + Jetpack Compose client (planned)
 docs/PROTOCOL.md    wire protocol — source of truth for all clients
 ```
 
@@ -97,6 +98,30 @@ cd server && go build -o copyctl ./cmd/copyctl
 
 On a desktop with `wl-clipboard` or `xclip`, `run` syncs the real OS clipboard;
 on a headless host it runs receive-only.
+
+## Android client
+
+`clients/android` is a native Kotlin + Jetpack Compose app (target API 36, min
+API 29). Build a debug APK with the Gradle wrapper (needs JDK 17 + the Android
+SDK; set `ANDROID_HOME` or `local.properties`):
+
+```bash
+cd clients/android && ./gradlew :app:assembleDebug
+```
+
+Because Android forbids background clipboard reads, the app uses the
+production-proven workaround (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) and the
+in-app setup screen): grant `READ_LOGS` and the overlay permission once via ADB —
+
+```bash
+adb shell pm grant com.copysync.android android.permission.READ_LOGS
+adb shell appops set com.copysync.android SYSTEM_ALERT_WINDOW allow
+```
+
+— then pair from the app (server URL, OTP, device name) and it syncs in the
+background via a foreground service. Verified end-to-end on an Android 16 emulator:
+ADB grant works, pairing over pinned TLS succeeds, and text syncs both ways with
+on-device history. Images/files are a later stage.
 
 ## Pairing a device
 
