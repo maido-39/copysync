@@ -31,14 +31,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.copysync.android.data.Downloads
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
 import com.copysync.android.net.claimAndStore
+import com.copysync.android.sync.Notifications
 import com.copysync.android.sync.SyncService
 import com.copysync.android.sync.SyncState
 import kotlinx.coroutines.Dispatchers
@@ -109,6 +112,7 @@ private fun StatusScreen(onUnpair: () -> Unit) {
     val ctx = LocalContext.current
     val settings = remember { Settings(ctx) }
     val dao = remember { HistoryDb.get(ctx).clipDao() }
+    val scope = rememberCoroutineScope()
 
     val status by SyncState.status.collectAsState()
     val connected by SyncState.connected.collectAsState()
@@ -172,7 +176,31 @@ private fun StatusScreen(onUnpair: () -> Unit) {
         LazyColumn(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             items(history) { e ->
                 val arrow = if (e.direction == "in") "←" else "→"
-                Text("$arrow ${e.text.replace("\n", " ").take(90)}", style = MaterialTheme.typography.bodyMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "$arrow ${e.text.replace("\n", " ").take(80)}",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    val downloadable = e.direction == "in" && e.blobId.isNotEmpty() &&
+                        (e.kind == "file" || e.kind == "image") && e.localPath == null
+                    when {
+                        downloadable -> TextButton(onClick = {
+                            scope.launch {
+                                val res = withContext(Dispatchers.IO) {
+                                    runCatching { Downloads.fetchToDownloads(ctx, e.blobId, e.name.ifEmpty { "file" }, e.mime) }
+                                }
+                                res.onSuccess {
+                                    dao.setLocalPath(e.rowid, it)
+                                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: $it")
+                                }.onFailure {
+                                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 실패: ${it.message}")
+                                }
+                            }
+                        }) { Text("⬇ 받기") }
+                        e.localPath != null -> Text("✓", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
         }
 

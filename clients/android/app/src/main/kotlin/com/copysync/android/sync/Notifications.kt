@@ -46,6 +46,17 @@ object Notifications {
             .build()
     }
 
+    fun notifyInfo(ctx: Context, title: String, text: String) {
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val n = Notification.Builder(ctx, CLIP_CHANNEL)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setAutoCancel(true)
+            .build()
+        nm.notify(nextClipId++, n)
+    }
+
     fun notifyClip(ctx: Context, origin: String, preview: String) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         val n = Notification.Builder(ctx, CLIP_CHANNEL)

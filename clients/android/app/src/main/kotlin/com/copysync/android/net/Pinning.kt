@@ -18,7 +18,7 @@ import javax.net.ssl.X509TrustManager
  * X509Certificate.publicKey.encoded is the SubjectPublicKeyInfo DER, matching
  * the server's sha256(MarshalPKIXPublicKey(pub)).
  */
-fun pinnedClient(spkiPinB64: String): OkHttpClient {
+fun pinnedClient(spkiPinB64: String, readTimeout: Duration = Duration.ZERO): OkHttpClient {
     val pin = Base64.decode(spkiPinB64, Base64.DEFAULT)
     val tm = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -30,11 +30,15 @@ fun pinnedClient(spkiPinB64: String): OkHttpClient {
         override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     }
     val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(tm), SecureRandom()) }
-    return OkHttpClient.Builder()
+    val b = OkHttpClient.Builder()
         .sslSocketFactory(ssl.socketFactory, tm)
         .hostnameVerifier { _, _ -> true } // SPKI pin is the real check
         .pingInterval(Duration.ofSeconds(20))
-        .build()
+    if (!readTimeout.isZero) {
+        // On-demand GETs long-poll while the server pulls from the origin device.
+        b.readTimeout(readTimeout).callTimeout(readTimeout.plusSeconds(15))
+    }
+    return b.build()
 }
 
 /** An OkHttpClient that skips all TLS verification — used ONLY for the

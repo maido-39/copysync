@@ -13,6 +13,7 @@ object MsgType {
     const val HELLO_ERR = "hello_err"
     const val CLIP = "clip"
     const val ACK = "ack"
+    const val BLOB_REQUEST = "blob_request"
     const val PRESENCE = "presence"
     const val ROSTER = "roster"
     const val ERROR = "error"
@@ -46,8 +47,12 @@ data class HelloOk(
     val e2e: Boolean = false,
     val maxMsg: Long = 0,
     val blobCap: Long = 0,
+    val onDemandThreshold: Long = 0,
     val roster: List<DeviceInfo> = emptyList(),
 )
+
+@Serializable
+data class BlobRequest(val id: String = "")
 
 @Serializable
 data class HelloErr(val code: String = "", val message: String = "")
@@ -66,6 +71,8 @@ data class ClipEvent(
     val mime: List<String> = emptyList(),
     val inlineText: String? = null,
     val blobId: String? = null,
+    val name: String? = null,
+    val onDemand: Boolean = false,
     val size: Long = 0,
     val sha256: String = "",
     val targets: JsonElement = JsonPrimitive("all"),
