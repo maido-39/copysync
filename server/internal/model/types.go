@@ -108,17 +108,17 @@ func (t *Targets) UnmarshalJSON(b []byte) error {
 // not inlined; InlineText carries only small text (and only while E2E is off),
 // otherwise BlobID references the payload on the HTTPS blob channel.
 type ClipEvent struct {
-	ID           string    `json:"id"`
-	OriginDevice DeviceID  `json:"originDeviceId"`
-	Seq          uint64    `json:"seq"`
-	TS           time.Time `json:"ts"`
-	Mime         []string  `json:"mime"`
-	InlineText   string    `json:"inlineText,omitempty"`
-	BlobID       BlobID    `json:"blobId,omitempty"`
-	Size         int64     `json:"size"`
-	Sha256       string    `json:"sha256"`
-	Targets      Targets   `json:"targets"`
-	Enc          *EncMeta  `json:"enc,omitempty"`
+	ID           string   `json:"id"`
+	OriginDevice DeviceID `json:"originDeviceId"`
+	Seq          uint64   `json:"seq"`
+	TS           string   `json:"ts"` // RFC3339; relayed as-is, server stamps when empty
+	Mime         []string `json:"mime"`
+	InlineText   string   `json:"inlineText,omitempty"`
+	BlobID       BlobID   `json:"blobId,omitempty"`
+	Size         int64    `json:"size"`
+	Sha256       string   `json:"sha256"`
+	Targets      Targets  `json:"targets"`
+	Enc          *EncMeta `json:"enc,omitempty"`
 }
 
 // QueueItem is a clip held for a device that was offline when it was sent.

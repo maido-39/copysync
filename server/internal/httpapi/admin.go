@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/syaro/copysync/internal/auth"
 	"github.com/syaro/copysync/internal/config"
@@ -163,7 +164,7 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 	res := s.hub.Route(model.ClipEvent{
 		ID:           auth.NewID("bcast"),
 		OriginDevice: "server",
-		TS:           s.now(),
+		TS:           s.now().Format(time.RFC3339),
 		Mime:         []string{"text/plain"},
 		InlineText:   req.Text,
 		Size:         int64(len(req.Text)),

@@ -10,6 +10,14 @@ coverage*.out
 **/data/
 *.db
 
+# Android / Gradle
+/clients/android/.gradle/
+**/build/
+/clients/android/local.properties
+/clients/android/captures/
+*.apk
+*.keystore
+
 # Editor / OS
 .DS_Store
 .idea/

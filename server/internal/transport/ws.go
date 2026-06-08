@@ -133,12 +133,13 @@ func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps
 		case protocol.TypeClip:
 			var ev model.ClipEvent
 			if err := env.Decode(&ev); err != nil {
+				d.Log.Warn("dropping undecodable clip frame", "device", originID, "err", err)
 				continue
 			}
 			// Trust the authenticated identity, not the client's self-report.
 			ev.OriginDevice = originID
-			if ev.TS.IsZero() {
-				ev.TS = d.Now()
+			if ev.TS == "" {
+				ev.TS = d.Now().Format(time.RFC3339)
 			}
 			res := d.Hub.Route(ev)
 			ack := protocol.Ack{ID: ev.ID, Status: res.Status, QueuedFor: res.QueuedFor}

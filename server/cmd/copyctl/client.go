@@ -175,7 +175,7 @@ func (c *Client) nextSeq() uint64 {
 func (c *Client) sendText(ctx context.Context, conn *websocket.Conn, text string, targets model.Targets) (string, error) {
 	sum := sha256.Sum256([]byte(text))
 	ev := model.ClipEvent{
-		ID: newID(), Seq: c.nextSeq(), TS: time.Now(), Mime: []string{"text/plain"},
+		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{"text/plain"},
 		InlineText: text, Size: int64(len(text)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
 	}
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
@@ -191,7 +191,7 @@ func (c *Client) sendBlob(ctx context.Context, conn *websocket.Conn, content []b
 		mime = "application/octet-stream"
 	}
 	ev := model.ClipEvent{
-		ID: newID(), Seq: c.nextSeq(), TS: time.Now(), Mime: []string{mime},
+		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{mime},
 		BlobID: bid, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
 	}
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
