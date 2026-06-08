@@ -37,10 +37,11 @@ search live on each client. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the
 wire contract.
 
 ```
-server/            Go relay server (this milestone)
-clients/desktop/   Tauri v2 + Svelte desktop client (planned)
-clients/android/   Kotlin + Jetpack Compose client (planned)
-docs/PROTOCOL.md   wire protocol — source of truth for all clients
+server/             Go relay server (this milestone)
+server/cmd/copyctl  Reference CLI client + protocol conformance harness
+clients/desktop/    Tauri v2 + Svelte desktop client (planned)
+clients/android/    Kotlin + Jetpack Compose client (planned)
+docs/PROTOCOL.md    wire protocol — source of truth for all clients
 ```
 
 ## Quick start (Docker)
@@ -74,6 +75,28 @@ cd server
 go test ./...
 go test -race ./internal/transport/...   # relay core under the race detector
 ```
+
+## Reference CLI client (`copyctl`)
+
+`copyctl` is a headless client that speaks the full protocol (OTP pairing + SPKI
+pinning, the WebSocket channel, and the blob channel). It's a real client for
+headless/SSH boxes, and the conformance harness the GUI clients are ported from.
+
+```bash
+cd server && go build -o copyctl ./cmd/copyctl
+
+# Pair (omit --pin to trust-on-first-use; otherwise pass the server's SPKI pin):
+./copyctl pair --server https://192.168.1.10:8443 --otp 12345678 --name laptop-a
+
+./copyctl send  --text "hello"        # send one text clip
+./copyctl send  --file ./photo.png    # send a file via the blob channel
+./copyctl watch                       # print/save incoming clips (no clipboard needed)
+./copyctl run                         # two-way OS clipboard sync (Wayland/X11)
+./copyctl history --search token      # search the local clipboard log
+```
+
+On a desktop with `wl-clipboard` or `xclip`, `run` syncs the real OS clipboard;
+on a headless host it runs receive-only.
 
 ## Pairing a device
 

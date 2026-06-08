@@ -1,0 +1,340 @@
+// Command copyctl is a headless reference/CLI client for a CopySync server. It
+// speaks the same wire protocol as the (planned) desktop and mobile clients —
+// pairing with OTP + SPKI certificate pinning, the WebSocket control channel,
+// and the HTTPS blob channel — and doubles as the protocol conformance harness.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/syaro/copysync/internal/model"
+	"github.com/syaro/copysync/internal/protocol"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "pair":
+		err = cmdPair(os.Args[2:])
+	case "send":
+		err = cmdSend(os.Args[2:])
+	case "watch":
+		err = cmdWatch(os.Args[2:])
+	case "run":
+		err = cmdRun(os.Args[2:])
+	case "history":
+		err = cmdHistory(os.Args[2:])
+	case "-h", "--help", "help":
+		usage()
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `copyctl — CopySync reference CLI client
+
+Usage:
+  copyctl pair    --server URL --otp CODE --name NAME [--pin B64] [--config FILE]
+  copyctl send    [--text STR | --file PATH] [--targets all|id,id] [--config FILE]
+  copyctl watch   [--save-dir DIR] [--config FILE]
+  copyctl run     [--targets all|id,id] [--save-dir DIR] [--config FILE]
+  copyctl history [--search TERM]
+
+Commands:
+  pair     Redeem an OTP and store the device token + server pin.
+  send     Send one clip (text or file) and exit.
+  watch    Connect and print/save every incoming clip (no clipboard needed).
+  run      Two-way sync with the OS clipboard (Wayland/X11; headless = receive only).
+  history  Show or search the local clipboard log.
+`)
+}
+
+func cmdPair(args []string) error {
+	fs := flag.NewFlagSet("pair", flag.ExitOnError)
+	server := fs.String("server", "", "server base URL, e.g. https://192.168.1.10:8443")
+	otp := fs.String("otp", "", "one-time pairing code")
+	name := fs.String("name", "", "this device's unique name")
+	pin := fs.String("pin", "", "server SPKI pin (base64); empty = trust on first use")
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
+	_ = fs.Parse(args)
+	if *server == "" || *otp == "" || *name == "" {
+		return fmt.Errorf("--server, --otp and --name are required")
+	}
+	usedPin := *pin
+	if usedPin == "" {
+		si, err := fetchServerInfoInsecure(*server)
+		if err != nil {
+			return fmt.Errorf("could not fetch server info: %w", err)
+		}
+		usedPin = si.SPKIPin
+		fmt.Printf("warning: trusting server pin on first use: %s\n", usedPin)
+	}
+	hc, err := pinnedHTTPClient(usedPin)
+	if err != nil {
+		return err
+	}
+	cfg, err := claimPairing(hc, *server, *otp, *name)
+	if err != nil {
+		return err
+	}
+	cfg.Pin = usedPin
+	if err := saveConfig(*cfgPath, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("paired as %q (%s) with server %q\nconfig saved to %s\n", cfg.DeviceName, cfg.DeviceID, cfg.ServerName, *cfgPath)
+	return nil
+}
+
+func cmdSend(args []string) error {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
+	text := fs.String("text", "", "text to send")
+	file := fs.String("file", "", "file to send via the blob channel")
+	targetsArg := fs.String("targets", "all", `"all" or comma-separated device ids`)
+	_ = fs.Parse(args)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config (run `copyctl pair` first): %w", err)
+	}
+	cl, err := newClient(cfg, openHistory(historyPathFor(*cfgPath)))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, _, err := cl.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow()
+
+	targets := parseTargets(*targetsArg)
+	var id string
+	switch {
+	case *file != "":
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		id, err = cl.sendBlob(ctx, conn, data, "application/octet-stream", targets)
+		if err != nil {
+			return err
+		}
+		cl.hist.append("out", cfg.DeviceID, "(file) "+filepath.Base(*file), "")
+	case *text != "":
+		id, err = cl.sendText(ctx, conn, *text, targets)
+		if err != nil {
+			return err
+		}
+		cl.hist.append("out", cfg.DeviceID, *text, "")
+	default:
+		return fmt.Errorf("provide --text or --file")
+	}
+
+	ack, err := cl.waitAck(ctx, conn, id)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("sent %s → status=%s queuedFor=%v\n", id, ack.Status, ack.QueuedFor)
+	return nil
+}
+
+func cmdWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
+	saveDir := fs.String("save-dir", ".", "directory to save received files")
+	exitAfter := fs.Int("exit-after", 0, "exit after receiving N clips (0 = until interrupted)")
+	_ = fs.Parse(args)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config (run `copyctl pair` first): %w", err)
+	}
+	cl, err := newClient(cfg, openHistory(historyPathFor(*cfgPath)))
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	conn, ok, err := cl.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow()
+	fmt.Printf("watching as %q on %q (%d device(s) known). Ctrl-C to stop.\n", cfg.DeviceName, cfg.ServerName, len(ok.Roster))
+	count := 0
+	for {
+		env, err := readMsg(ctx, conn)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		switch env.T {
+		case protocol.TypeClip:
+			var ev model.ClipEvent
+			if env.Decode(&ev) == nil {
+				fmt.Println(cl.handleIncoming(ev, *saveDir))
+				count++
+				if *exitAfter > 0 && count >= *exitAfter {
+					return nil
+				}
+			}
+		case protocol.TypePresence:
+			var p protocol.Presence
+			if env.Decode(&p) == nil {
+				state := "offline"
+				if p.Online {
+					state = "online"
+				}
+				fmt.Printf("· %s is now %s\n", p.Device.Name, state)
+			}
+		}
+	}
+}
+
+func cmdRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
+	saveDir := fs.String("save-dir", ".", "directory to save received files")
+	targetsArg := fs.String("targets", "all", `"all" or comma-separated device ids`)
+	_ = fs.Parse(args)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config (run `copyctl pair` first): %w", err)
+	}
+	cl, err := newClient(cfg, openHistory(historyPathFor(*cfgPath)))
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	conn, _, err := cl.connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow()
+
+	cb := detectClipboard()
+	targets := parseTargets(*targetsArg)
+	fmt.Printf("syncing clipboard with %q using the %s backend. Ctrl-C to stop.\n", cfg.ServerName, cb.Name())
+
+	// Incoming: write text clips to the clipboard; save file clips.
+	go func() {
+		for {
+			env, err := readMsg(ctx, conn)
+			if err != nil {
+				return
+			}
+			if env.T != protocol.TypeClip {
+				continue
+			}
+			var ev model.ClipEvent
+			if env.Decode(&ev) != nil {
+				continue
+			}
+			if ev.InlineText != "" {
+				cl.echo.markWritten(ev.Sha256)
+				_ = cb.Write(ev.InlineText)
+			}
+			fmt.Println(cl.handleIncoming(ev, *saveDir))
+		}
+	}()
+
+	// Outgoing: broadcast local clipboard changes (suppressing our own writes).
+	cb.Watch(ctx, func(text string) {
+		sum := sha256.Sum256([]byte(text))
+		sha := hex.EncodeToString(sum[:])
+		if cl.echo.seen(sha) {
+			return
+		}
+		if _, err := cl.sendText(ctx, conn, text, targets); err != nil {
+			fmt.Fprintln(os.Stderr, "send failed:", err)
+			return
+		}
+		cl.hist.append("out", cfg.DeviceID, text, "")
+	})
+	return nil
+}
+
+func cmdHistory(args []string) error {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	term := fs.String("search", "", "substring to filter by")
+	cfgPath := fs.String("config", defaultConfigPath(), "config file path (history sits beside it)")
+	_ = fs.Parse(args)
+	entries, err := openHistory(historyPathFor(*cfgPath)).search(*term)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("(no history)")
+		return nil
+	}
+	for _, e := range entries {
+		arrow := "←"
+		if e.Dir == "out" {
+			arrow = "→"
+		}
+		text := e.Text
+		if e.Blob != "" && text == "" {
+			text = "(blob " + e.Blob + ")"
+		}
+		fmt.Printf("%s %s %s %s\n", e.TS.Format(time.RFC3339), arrow, e.Origin, strings.ReplaceAll(text, "\n", "\\n"))
+	}
+	return nil
+}
+
+// historyPathFor places the local history log next to a client's config file,
+// so distinct --config files keep separate histories.
+func historyPathFor(cfgPath string) string {
+	return filepath.Join(filepath.Dir(cfgPath), "history.jsonl")
+}
+
+// handleIncoming records a received clip in history and returns a printable line.
+func (c *Client) handleIncoming(ev model.ClipEvent, saveDir string) string {
+	if ev.InlineText != "" {
+		c.hist.append("in", string(ev.OriginDevice), ev.InlineText, "")
+		return fmt.Sprintf("[%s] text: %s", ev.OriginDevice, ev.InlineText)
+	}
+	if ev.BlobID != "" {
+		data, err := c.getBlob(ev.BlobID)
+		if err != nil {
+			return fmt.Sprintf("[%s] blob %s (download failed: %v)", ev.OriginDevice, ev.BlobID, err)
+		}
+		sum := sha256.Sum256(data)
+		gotHex := hex.EncodeToString(sum[:])
+		wantHex := strings.TrimPrefix(string(ev.BlobID), "sha256:")
+		_ = os.MkdirAll(saveDir, 0o755)
+		path := filepath.Join(saveDir, wantHex+".blob")
+		_ = os.WriteFile(path, data, 0o644)
+		c.hist.append("in", string(ev.OriginDevice), "(blob) "+path, string(ev.BlobID))
+		integrity := "ok"
+		if gotHex != wantHex {
+			integrity = "HASH MISMATCH"
+		}
+		return fmt.Sprintf("[%s] blob %d bytes → %s (%s)", ev.OriginDevice, len(data), path, integrity)
+	}
+	return fmt.Sprintf("[%s] (empty clip)", ev.OriginDevice)
+}
