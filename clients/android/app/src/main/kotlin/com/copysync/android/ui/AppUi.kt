@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings as AndroidSettings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -124,6 +127,31 @@ private fun StatusScreen(onUnpair: () -> Unit) {
     }.collectAsState(initial = emptyList())
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
 
+    // Save-location picker for received files (notification tap or the 받기 button).
+    val pending by PendingDownload.req.collectAsState()
+    var current by remember { mutableStateOf<DownloadReq?>(null) }
+    val savePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        val req = current
+        current = null
+        PendingDownload.req.value = null
+        if (uri != null && req != null) {
+            scope.launch {
+                val r = withContext(Dispatchers.IO) { runCatching { Downloads.fetchToUri(ctx, req.blobId, uri) } }
+                r.onSuccess {
+                    if (req.rowid >= 0) dao.setLocalPath(req.rowid, uri.toString())
+                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: ${req.name}")
+                }.onFailure {
+                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 실패: ${it.message}")
+                }
+            }
+        }
+    }
+    LaunchedEffect(pending) {
+        val p = pending ?: return@LaunchedEffect
+        current = p
+        savePicker.launch(p.name)
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -186,17 +214,7 @@ private fun StatusScreen(onUnpair: () -> Unit) {
                         (e.kind == "file" || e.kind == "image") && e.localPath == null
                     when {
                         downloadable -> TextButton(onClick = {
-                            scope.launch {
-                                val res = withContext(Dispatchers.IO) {
-                                    runCatching { Downloads.fetchToDownloads(ctx, e.blobId, e.name.ifEmpty { "file" }, e.mime) }
-                                }
-                                res.onSuccess {
-                                    dao.setLocalPath(e.rowid, it)
-                                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: $it")
-                                }.onFailure {
-                                    Notifications.notifyInfo(ctx, "CopySync", "다운로드 실패: ${it.message}")
-                                }
-                            }
+                            PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid)
                         }) { Text("⬇ 받기") }
                         e.localPath != null -> Text("✓", style = MaterialTheme.typography.bodySmall)
                     }

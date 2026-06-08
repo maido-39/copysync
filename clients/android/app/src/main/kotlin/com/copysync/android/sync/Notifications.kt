@@ -57,6 +57,29 @@ object Notifications {
         nm.notify(nextClipId++, n)
     }
 
+    /** A received file: tapping opens the app and triggers the save-location picker. */
+    fun notifyDownloadable(ctx: Context, origin: String, blobId: String, name: String, mime: String) {
+        val intent = Intent(ctx, MainActivity::class.java).apply {
+            putExtra("cs_dl_blob", blobId)
+            putExtra("cs_dl_name", name)
+            putExtra("cs_dl_mime", mime)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val pi = PendingIntent.getActivity(
+            ctx, blobId.hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        val n = Notification.Builder(ctx, CLIP_CHANNEL)
+            .setContentTitle("File from ${origin.ifEmpty { "another device" }}")
+            .setContentText("$name — tap to save")
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+        nm.notify(nextClipId++, n)
+    }
+
     fun notifyClip(ctx: Context, origin: String, preview: String) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         val n = Notification.Builder(ctx, CLIP_CHANNEL)

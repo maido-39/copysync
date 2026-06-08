@@ -33,6 +33,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
 
 /**
@@ -71,7 +72,24 @@ class SyncService : Service() {
             startCapture()
             startConnectLoop()
         }
+        if (intent?.action == ACTION_SHARE_FILE) {
+            handleShare(intent)
+        }
         return START_STICKY
+    }
+
+    private fun handleShare(intent: Intent) {
+        val sha = intent.getStringExtra("sha") ?: return
+        val name = intent.getStringExtra("name") ?: "file"
+        val mime = intent.getStringExtra("mime") ?: "application/octet-stream"
+        val size = intent.getLongExtra("size", 0)
+        val file = File(File(cacheDir, "clip-src"), sha)
+        if (!file.exists()) {
+            Log.w("CopySync", "shared file missing: $sha")
+            return
+        }
+        Log.i("CopySync", "share → sending $name ($size bytes)")
+        onCaptured(Captured.Binary(file, mime, name, size, sha))
     }
 
     private fun startCapture() {
@@ -265,7 +283,7 @@ class SyncService : Service() {
                         val nm = ev.name ?: "file"
                         val kind = if (imageMime != null) "image" else "file"
                         dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: ""))
-                        Notifications.notifyClip(this, ev.originDeviceId, "$nm — open CopySync to download")
+                        Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*")
                         SyncState.lastEvent.value = "↓ $nm (download)"
                         Log.i("CopySync", "received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand})")
                     }
@@ -315,9 +333,22 @@ class SyncService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.copysync.android.STOP"
+        const val ACTION_SHARE_FILE = "com.copysync.android.SHARE_FILE"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, SyncService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+        }
+
+        /** Send a file already cached in clip-src/<sha> (used by the Share target). */
+        fun shareFile(ctx: Context, sha: String, name: String, mime: String, size: Long) {
+            val i = Intent(ctx, SyncService::class.java).apply {
+                action = ACTION_SHARE_FILE
+                putExtra("sha", sha)
+                putExtra("name", name)
+                putExtra("mime", mime)
+                putExtra("size", size)
+            }
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 

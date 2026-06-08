@@ -18,6 +18,8 @@ import com.copysync.android.data.Settings
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.SyncService
 import com.copysync.android.ui.AppRoot
+import com.copysync.android.ui.DownloadReq
+import com.copysync.android.ui.PendingDownload
 
 class MainActivity : ComponentActivity() {
     private val requestNotif =
@@ -68,6 +70,14 @@ class MainActivity : ComponentActivity() {
             getSystemService(ClipboardManager::class.java)
                 .setPrimaryClip(ClipData.newPlainText("CopySync", text))
             Log.i(TAG, "test copied (${text.length} chars)")
+        }
+        // Notification tap on a received file → trigger the save-location picker.
+        intent.getStringExtra("cs_dl_blob")?.let { blobId ->
+            PendingDownload.req.value = DownloadReq(
+                blobId = blobId,
+                name = intent.getStringExtra("cs_dl_name") ?: "file",
+                mime = intent.getStringExtra("cs_dl_mime") ?: "*/*",
+            )
         }
     }
 
