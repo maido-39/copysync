@@ -1,0 +1,7 @@
+# Keep the build context small.
+*.test
+*.out
+/copysyncd
+data/
+*.db
+.git

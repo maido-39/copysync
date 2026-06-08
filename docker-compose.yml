@@ -1,0 +1,23 @@
+services:
+  copysync:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: copysync:latest
+    container_name: copysync
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      COPYSYNC_SERVER_NAME: "CopySync"
+      COPYSYNC_ADMIN_USER: "admin"
+      # Default password; you are FORCED to change it on first admin login.
+      COPYSYNC_ADMIN_PASS: "changeme"
+      # Extra TLS SAN entries (LAN IPs / hostnames) so clients can pin & connect.
+      # Auto-detected LAN IPs + localhost are always included.
+      # COPYSYNC_TLS_HOSTS: "192.168.1.10,copysync.local"
+    volumes:
+      - copysync-data:/data
+
+volumes:
+  copysync-data:

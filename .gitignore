@@ -1,0 +1,17 @@
+# Go build output
+/server/copysyncd
+copysyncd
+*.test
+*.out
+coverage*.out
+
+# Local runtime state (bbolt db, self-signed certs, blobs)
+/data/
+**/data/
+*.db
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
