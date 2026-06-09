@@ -318,10 +318,10 @@
   // ---- settings --------------------------------------------------------------
   var SETTINGS_GROUPS = [
     { title: "제한", fields: [
-      ["maxMessageBytes", "최대 WS 메시지", "bytes", "이보다 큰 인라인 텍스트는 블롭 채널을 사용합니다."],
-      ["blobMaxBytes", "최대 블롭 크기", "bytes", "블롭 채널 업로드 파일당 상한."],
-      ["onDemandThresholdBytes", "온디맨드 임계값", "bytes", "이 크기 이하 파일은 즉시 업로드, 초과 시 요청할 때만 전송."],
-      ["blobStoreCapBytes", "블롭 저장소 상한", "bytes", "총 디스크 예산 초과 시 LRU로 삭제."],
+      ["maxMessageBytes", "최대 WS 메시지 (KB)", "kb", "이보다 큰 인라인 텍스트는 블롭 채널을 사용합니다."],
+      ["blobMaxBytes", "최대 블롭 크기 (KB)", "kb", "블롭 채널 업로드 파일당 상한."],
+      ["onDemandThresholdBytes", "온디맨드 임계값 (KB)", "kb", "이 크기 이하 파일은 즉시 업로드, 초과 시 요청할 때만 전송."],
+      ["blobStoreCapBytes", "블롭 저장소 상한 (KB)", "kb", "총 디스크 예산 초과 시 LRU로 삭제."],
     ] },
     { title: "보존", fields: [
       ["queueDepthPerDevice", "오프라인 큐 깊이", "int", "오프라인 기기당 최대 보관 클립 수."],
@@ -359,10 +359,14 @@
               el("label", { class: "toggle" }, cb, el("span", { class: "track" }))));
           } else {
             var hint = el("div", { class: "help" });
-            var inp = el("input", { type: "number", min: "0", value: String(s[key]),
-              oninput: function () { if (type === "bytes") hint.textContent = fmtBytes(inp.value) + (help ? " — " + help : ""); } });
+            var initVal = type === "kb" ? Math.round((s[key] || 0) / 1024) : s[key];
+            var inp = el("input", { type: "number", min: "0", value: String(initVal),
+              oninput: function () {
+                if (type === "bytes") hint.textContent = fmtBytes(inp.value) + (help ? " — " + help : "");
+                else if (type === "kb") hint.textContent = fmtBytes(inp.value * 1024) + (help ? " — " + help : "");
+              } });
             inputs[key] = { el: inp, type: type };
-            hint.textContent = type === "bytes" ? fmtBytes(s[key]) + (help ? " — " + help : "") : help;
+            hint.textContent = (type === "bytes" || type === "kb") ? fmtBytes(s[key] || 0) + (help ? " — " + help : "") : help;
             fg.appendChild(el("div", null, el("label", null, label), inp, hint));
           }
         });
@@ -372,7 +376,12 @@
       });
       var save = el("button", { class: "btn", onclick: async function () {
         var payload = {};
-        for (var k in inputs) payload[k] = inputs[k].type === "bool" ? inputs[k].el.checked : Number(inputs[k].el.value);
+        for (var k in inputs) {
+          var it = inputs[k];
+          payload[k] = it.type === "bool" ? it.el.checked
+            : it.type === "kb" ? Math.round(Number(it.el.value) * 1024)
+            : Number(it.el.value);
+        }
         save.disabled = true;
         try { await api("PUT", "/admin/settings", payload); toast("설정 저장됨", "ok"); go("settings"); }
         catch (e) { toast(e.message, "err"); save.disabled = false; }
