@@ -70,6 +70,9 @@ import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
 import com.copysync.android.net.MdnsDiscovery
 import com.copysync.android.net.claimAndStore
+import com.copysync.android.net.parsePairQr
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import com.copysync.android.sync.Notifications
 import com.copysync.android.sync.DebugLog
 import com.copysync.android.sync.SyncService
@@ -105,6 +108,32 @@ private fun PairingScreen(onPaired: () -> Unit) {
     val discovery = remember { MdnsDiscovery(ctx) }
     DisposableEffect(Unit) { onDispose { discovery.stop() } }
 
+    fun doPair() {
+        busy = true; msg = "페어링 중…"
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { claimAndStore(ctx, server.trim(), otp.trim(), name.trim(), pin.trim()) }
+            }
+            busy = false
+            result.onSuccess { SyncService.start(ctx); onPaired() }
+                .onFailure { msg = "실패: ${it.message}" }
+        }
+    }
+    // In-app camera QR scanner: decode the admin's pairing QR, fill the fields, pair.
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { res ->
+        val contents = res.contents
+        if (contents != null) {
+            runCatching {
+                val qr = parsePairQr(contents)
+                require(qr.host.isNotBlank() && qr.otp.isNotBlank()) { "host/otp 누락" }
+                server = "https://${qr.host}:${qr.port.ifBlank { "8443" }}"
+                otp = qr.otp
+                pin = qr.spkiPin
+            }.onSuccess { msg = "QR 인식됨 — 페어링 중…"; doPair() }
+                .onFailure { msg = "QR 형식 오류: ${it.message}" }
+        }
+    }
+
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -123,20 +152,21 @@ private fun PairingScreen(onPaired: () -> Unit) {
         found.forEach { (n, url) ->
             TextButton(onClick = { server = url }, modifier = Modifier.fillMaxWidth()) { Text("$n — $url") }
         }
+        Button(enabled = !busy, modifier = Modifier.fillMaxWidth(), onClick = {
+            scanLauncher.launch(
+                ScanOptions().apply {
+                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                    setPrompt("관리자 화면의 페어링 QR을 비추세요")
+                    setBeepEnabled(false)
+                    setOrientationLocked(false)
+                },
+            )
+        }) { Text("📷 QR 코드 스캔") }
+        Text("— 또는 직접 입력 —", style = MaterialTheme.typography.bodySmall)
         OutlinedTextField(otp, { otp = it }, label = { Text("OTP") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(name, { name = it }, label = { Text("기기 이름") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(pin, { pin = it }, label = { Text("SPKI 핀 (선택)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-        Button(enabled = !busy, onClick = {
-            busy = true; msg = "페어링 중…"
-            scope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { claimAndStore(ctx, server.trim(), otp.trim(), name.trim(), pin.trim()) }
-                }
-                busy = false
-                result.onSuccess { SyncService.start(ctx); onPaired() }
-                    .onFailure { msg = "실패: ${it.message}" }
-            }
-        }) { Text(if (busy) "페어링 중…" else "페어링") }
+        Button(enabled = !busy, onClick = { doPair() }) { Text(if (busy) "페어링 중…" else "페어링") }
         if (msg.isNotEmpty()) Text(msg, color = MaterialTheme.colorScheme.error)
     }
 }

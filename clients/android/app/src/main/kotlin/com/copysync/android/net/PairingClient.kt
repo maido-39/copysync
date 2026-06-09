@@ -35,6 +35,20 @@ data class ClaimResult(
     val e2e: Boolean = false,
 )
 
+/** Pairing QR payload — the JSON the admin UI encodes into the QR code. */
+@Serializable
+data class PairQr(
+    val serverId: String = "",
+    val serverName: String = "",
+    val host: String = "",
+    val port: String = "",
+    val spkiPin: String = "",
+    val otp: String = "",
+)
+
+/** Parse a scanned pairing QR payload. */
+fun parsePairQr(s: String): PairQr = json.decodeFromString(s)
+
 
 
 /** Handles the HTTP side of device pairing. */

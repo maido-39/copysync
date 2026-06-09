@@ -67,4 +67,5 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.bouncycastle)
     implementation(libs.androidx.datastore.preferences)
+    implementation(libs.zxing.embedded)
 }
