@@ -3,8 +3,14 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"net/http"
 
+	"github.com/syaro/copysync/internal/blob"
 	"github.com/syaro/copysync/internal/hub"
 )
 
@@ -72,4 +78,84 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"days": days, "maxCount": maxC, "maxBytes": maxB})
+}
+
+// handleMonitorBlob serves a small JPEG thumbnail of a (non-E2E) image blob for
+// the admin Monitoring feed. The blob endpoint proper requires a device token;
+// this admin-session route lets the operator preview images the server holds.
+func (s *Server) handleMonitorBlob(w http.ResponseWriter, r *http.Request) {
+	if s.blobStore == nil {
+		http.Error(w, "blob channel disabled", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if !blob.ValidID(id) {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	rc, _, err := s.blobStore.Open(id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound) // e.g. on-demand, not uploaded yet
+		return
+	}
+	defer func() { _ = rc.Close() }()
+	img, _, derr := image.Decode(rc)
+	if derr != nil {
+		http.Error(w, "not a decodable image", http.StatusUnsupportedMediaType)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "private, max-age=86400, immutable") // content-addressed
+	_ = jpeg.Encode(w, downscale(img, 256), &jpeg.Options{Quality: 80})
+}
+
+// downscale box-averages src down so its longest side is <= max (stdlib only).
+func downscale(src image.Image, max int) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return src
+	}
+	nw, nh := w, h
+	if w > max || h > max {
+		if w >= h {
+			nw, nh = max, h*max/w
+		} else {
+			nh, nw = max, w*max/h
+		}
+	}
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	if nw == w && nh == h {
+		return src
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	for dy := 0; dy < nh; dy++ {
+		sy0, sy1 := b.Min.Y+dy*h/nh, b.Min.Y+(dy+1)*h/nh
+		if sy1 <= sy0 {
+			sy1 = sy0 + 1
+		}
+		for dx := 0; dx < nw; dx++ {
+			sx0, sx1 := b.Min.X+dx*w/nw, b.Min.X+(dx+1)*w/nw
+			if sx1 <= sx0 {
+				sx1 = sx0 + 1
+			}
+			var rr, gg, bb, aa, n uint64
+			for sy := sy0; sy < sy1; sy++ {
+				for sx := sx0; sx < sx1; sx++ {
+					cr, cg, cb, ca := src.At(sx, sy).RGBA()
+					rr, gg, bb, aa, n = rr+uint64(cr), gg+uint64(cg), bb+uint64(cb), aa+uint64(ca), n+1
+				}
+			}
+			if n == 0 {
+				n = 1
+			}
+			dst.SetRGBA(dx, dy, color.RGBA{uint8(rr / n >> 8), uint8(gg / n >> 8), uint8(bb / n >> 8), uint8(aa / n >> 8)})
+		}
+	}
+	return dst
 }

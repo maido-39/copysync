@@ -385,6 +385,7 @@ type MonitorEvent struct {
 	Mime    string `json:"mime"`
 	Size    int64  `json:"size"`
 	Preview string `json:"preview"`
+	BlobId  string `json:"blobId,omitempty"`
 	E2E     bool   `json:"e2e"`
 }
 
@@ -430,6 +431,9 @@ func (h *Hub) publishMonitor(ev model.ClipEvent) {
 			me.Kind = "file"
 		}
 		me.Preview = ev.Name
+		if !me.E2E {
+			me.BlobId = string(ev.BlobID)
+		}
 	default:
 		me.Kind = "text"
 	}

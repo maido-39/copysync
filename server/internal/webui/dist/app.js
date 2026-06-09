@@ -433,11 +433,21 @@
       var ev;
       try { ev = JSON.parse(e.data); } catch (_) { return; }
       if (first) { clear(listEl); first = false; }
-      var prev = ev.preview || ("(" + (ev.mime || ev.kind) + " · " + fmtBytes(ev.size) + ")");
+      var prevText = ev.preview || ("(" + (ev.mime || ev.kind) + " · " + fmtBytes(ev.size) + ")");
+      var prevEl;
+      if (ev.kind === "image" && ev.blobId) {
+        var thumb = el("img", {
+          class: "mon-thumb", alt: "", src: "/admin/monitor/blob/" + encodeURIComponent(ev.blobId),
+          onerror: function (e2) { e2.target.style.display = "none"; },
+        });
+        prevEl = el("span", { class: "mon-prev" }, thumb, ev.preview || "");
+      } else {
+        prevEl = el("span", { class: "mon-prev" }, prevText);
+      }
       var row = el("div", { class: "mon-row" },
         el("span", { class: "mon-chip" }, ev.pool || "default"),
         el("span", { class: "mon-kind" }, ev.kind || ""),
-        el("span", { class: "mon-prev" }, prev),
+        prevEl,
         el("span", { class: "mon-meta" }, (ev.origin || "") + " · " + (ev.ts || "")));
       listEl.insertBefore(row, listEl.firstChild);
       while (listEl.childNodes.length > 200) listEl.removeChild(listEl.lastChild);
