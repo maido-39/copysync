@@ -23,6 +23,12 @@ function renderStatus(s) {
   const c = $("#conn");
   c.textContent = s.connected ? "연결됨" : "연결 끊김";
   c.className = "pill " + (s.connected ? "on" : "off");
+  const sel = $("#pool");
+  if (sel) {
+    const pools = s.pools && s.pools.length ? s.pools : ["default"];
+    const cur = s.pool || "default";
+    sel.innerHTML = pools.map((p) => `<option value="${esc(p)}"${p === cur ? " selected" : ""}>${esc(p)}</option>`).join("");
+  }
 }
 async function refreshStatus() {
   try { renderStatus(await invoke("get_status")); } catch (e) {}
@@ -165,6 +171,10 @@ $("#autostart").addEventListener("change", async (e) => {
   }
 });
 loadAutostart();
+
+$("#pool").addEventListener("change", (e) => {
+  invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
+});
 
 refreshStatus();
 setInterval(refreshStatus, 4000);

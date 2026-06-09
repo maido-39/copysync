@@ -47,6 +47,7 @@ class WsClient(private val client: OkHttpClient) {
 
     fun sendHello(h: Hello) = sendRaw(encodeEnvelope(MsgType.HELLO, h))
     fun sendClip(c: ClipEvent) = sendRaw(encodeEnvelope(MsgType.CLIP, c))
+    fun setPool(pool: String) = sendRaw(encodeEnvelope(MsgType.SET_POOL, SetPool(pool)))
 
     private fun sendRaw(frame: String): Boolean = ws?.send(frame) ?: false
 

@@ -44,10 +44,12 @@ main { flex: 1; overflow: auto; padding: 16px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; word-break: break-all; }
 
-textarea, input {
+textarea, input, select {
   width: 100%; background: var(--panel2); color: var(--fg);
   border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font: inherit;
 }
+.poolsel { display: block; margin-top: 12px; color: var(--muted); font-size: 13px; }
+.poolsel select { margin-top: 4px; }
 label { display: block; margin: 8px 0; color: var(--muted); font-size: 13px; }
 label input { margin-top: 4px; }
 

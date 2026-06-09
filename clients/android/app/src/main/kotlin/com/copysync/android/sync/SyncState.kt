@@ -15,4 +15,8 @@ object SyncState {
 
     /** Selected routing targets by device id; empty = broadcast to all. */
     val targets = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Share pool: clips only sync among devices in the same pool. */
+    val pools = MutableStateFlow<List<String>>(emptyList())
+    val currentPool = MutableStateFlow("default")
 }

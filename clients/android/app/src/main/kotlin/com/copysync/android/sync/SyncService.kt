@@ -121,6 +121,14 @@ class SyncService : Service() {
         if (intent?.action == ACTION_SHARE_FILE) {
             handleShare(intent)
         }
+        if (intent?.action == ACTION_SET_POOL) {
+            intent.getStringExtra(EXTRA_POOL)?.let { p ->
+                ws?.setPool(p)
+                SyncState.currentPool.value = p
+                DebugLog.i("pool -> $p")
+                refreshNotification()
+            }
+        }
         return START_STICKY
     }
 
@@ -300,7 +308,10 @@ class SyncService : Service() {
                 threshold = ok?.onDemandThreshold ?: 0
                 settings.onDemandThreshold = threshold
                 SyncState.roster.value = ok?.roster ?: emptyList()
+                SyncState.pools.value = ok?.pools?.ifEmpty { listOf("default") } ?: listOf("default")
+                SyncState.currentPool.value = ok?.pool?.ifEmpty { "default" } ?: "default"
                 update("synced with ${ok?.serverName ?: "server"}")
+                refreshNotification()
             }
             MsgType.ACK -> {
                 val a = runCatching { env.decodePayload<Ack>() }.getOrNull()
@@ -451,9 +462,20 @@ class SyncService : Service() {
     companion object {
         const val ACTION_STOP = "com.copysync.android.STOP"
         const val ACTION_SHARE_FILE = "com.copysync.android.SHARE_FILE"
+        const val ACTION_SET_POOL = "com.copysync.android.SET_POOL"
+        const val EXTRA_POOL = "pool"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, SyncService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+        }
+
+        /** Switch this device's share pool (from the app or a notification action). */
+        fun setPool(ctx: Context, pool: String) {
+            val i = Intent(ctx, SyncService::class.java).apply {
+                action = ACTION_SET_POOL
+                putExtra(EXTRA_POOL, pool)
+            }
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 

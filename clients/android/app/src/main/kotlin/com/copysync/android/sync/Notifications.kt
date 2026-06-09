@@ -34,8 +34,9 @@ object Notifications {
         val pi = PendingIntent.getActivity(
             ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        return Notification.Builder(ctx, SERVICE_CHANNEL)
-            .setContentTitle(if (connected) "CopySync · connected" else "CopySync")
+        val cur = SyncState.currentPool.value
+        val b = Notification.Builder(ctx, SERVICE_CHANNEL)
+            .setContentTitle(if (connected) "CopySync · 풀: $cur" else "CopySync")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat_sync)
             .setColor(if (connected) GREEN else GREY)
@@ -43,7 +44,18 @@ object Notifications {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setContentIntent(pi)
-            .build()
+        // Pull-down quick-switch: one action per other pool (max 2 fit comfortably).
+        SyncState.pools.value.filter { it != cur }.take(2).forEach { pool ->
+            val pIntent = Intent(ctx, SyncService::class.java)
+                .setAction(SyncService.ACTION_SET_POOL)
+                .putExtra(SyncService.EXTRA_POOL, pool)
+            val pPi = PendingIntent.getService(
+                ctx, ("pool_$pool").hashCode(), pIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            b.addAction(Notification.Action.Builder(R.drawable.ic_stat_sync, "→ $pool", pPi).build())
+        }
+        return b.build()
     }
 
     fun notifyInfo(ctx: Context, title: String, text: String) {

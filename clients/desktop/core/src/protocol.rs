@@ -12,6 +12,7 @@ pub const T_HELLO_ERR: &str = "hello_err";
 pub const T_CLIP: &str = "clip";
 pub const T_ACK: &str = "ack";
 pub const T_BLOB_REQUEST: &str = "blob_request";
+pub const T_SET_POOL: &str = "set_pool";
 pub const T_PRESENCE: &str = "presence";
 pub const T_ROSTER: &str = "roster";
 pub const T_ERROR: &str = "error";
@@ -23,6 +24,8 @@ pub struct Device {
     pub name: String,
     #[serde(default)]
     pub platform: String,
+    #[serde(default)]
+    pub pool: String,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -66,6 +69,10 @@ pub struct HelloOk {
     pub blob_cap: i64,
     #[serde(default)]
     pub on_demand_threshold: i64,
+    #[serde(default)]
+    pub pools: Vec<String>,
+    #[serde(default)]
+    pub pool: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -99,6 +106,12 @@ pub struct Ack {
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct BlobRequest {
     pub id: String,
+}
+
+/// Sent C→S to change this device's share pool.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct SetPool {
+    pub pool: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

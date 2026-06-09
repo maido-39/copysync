@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -229,6 +230,7 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
         InfoRow("서버", "${settings.serverName ?: "?"}")
         InfoRow("주소", "${settings.serverUrl ?: "?"}")
         InfoRow("기기 이름", "${settings.deviceName ?: "?"}")
+        PoolCard()
         RoutingCard()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { SyncService.start(ctx) }) { Text("시작") }
@@ -241,6 +243,33 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
             Secrets(ctx).clear()
             onUnpair()
         }) { Text("페어링 해제", color = MaterialTheme.colorScheme.error) }
+    }
+}
+
+/** Share pool: clips only sync among devices in the same pool. */
+@Composable
+private fun PoolCard() {
+    val ctx = LocalContext.current
+    val pools by SyncState.pools.collectAsState()
+    val current by SyncState.currentPool.collectAsState()
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("공유 풀", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "같은 풀의 기기끼리만 동기화됩니다 · 현재: $current",
+                style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+            )
+            val list = if (pools.isEmpty()) listOf("default") else pools
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                list.forEach { p ->
+                    if (p == current) Button(onClick = {}) { Text(p) }
+                    else OutlinedButton(onClick = { SyncService.setPool(ctx, p) }) { Text(p) }
+                }
+            }
+        }
     }
 }
 

@@ -14,6 +14,7 @@ object MsgType {
     const val CLIP = "clip"
     const val ACK = "ack"
     const val BLOB_REQUEST = "blob_request"
+    const val SET_POOL = "set_pool"
     const val PRESENCE = "presence"
     const val ROSTER = "roster"
     const val ERROR = "error"
@@ -37,6 +38,7 @@ data class DeviceInfo(
     val id: String,
     val name: String = "",
     val platform: String = "",
+    val pool: String = "",
     val online: Boolean = false,
 )
 
@@ -49,7 +51,12 @@ data class HelloOk(
     val blobCap: Long = 0,
     val onDemandThreshold: Long = 0,
     val roster: List<DeviceInfo> = emptyList(),
+    val pools: List<String> = emptyList(),
+    val pool: String = "",
 )
+
+@Serializable
+data class SetPool(val pool: String = "")
 
 @Serializable
 data class BlobRequest(val id: String = "")

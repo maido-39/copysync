@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
@@ -30,6 +30,7 @@ enum Cmd {
     LocalImage(Image),   // OS-clipboard image change (echo-guarded)
     SendText(String),    // explicit text send from the UI
     SendFile(String),    // explicit file send from the UI (path)
+    SetPool(String),     // switch this device's share pool
 }
 
 /// A blob held for on-demand upload when the server asks (`blob_request`).
@@ -46,6 +47,8 @@ struct Status {
     device_name: String,
     server_id: String,
     e2e: bool,
+    pool: String,
+    pools: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -61,6 +64,7 @@ struct AppState {
     status: Arc<Mutex<Status>>,
     roster: Arc<Mutex<Vec<RosterDevice>>>,
     targets: Arc<Mutex<Targets>>,
+    tray: Mutex<Option<tauri::tray::TrayIcon>>,
     cfg_path: PathBuf,
     downloads: PathBuf,
 }
@@ -129,6 +133,38 @@ fn mime_of(path: &str) -> String {
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> Status {
     state.status.lock().unwrap().clone()
+}
+
+fn build_tray_menu(app: &AppHandle, current: &str, pools: &[String]) -> Option<Menu<tauri::Wry>> {
+    let menu = Menu::new(app).ok()?;
+    menu.append(&MenuItem::with_id(app, "show", "CopySync 열기", true, None::<&str>).ok()?).ok()?;
+    if !pools.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(app).ok()?).ok()?;
+        menu.append(&MenuItem::with_id(app, "pool_hdr", "풀 전환", false, None::<&str>).ok()?).ok()?;
+        for p in pools {
+            menu.append(
+                &CheckMenuItem::with_id(app, format!("pool:{p}"), p.as_str(), true, p.as_str() == current, None::<&str>).ok()?,
+            )
+            .ok()?;
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator(app).ok()?).ok()?;
+    menu.append(&MenuItem::with_id(app, "quit", "종료", true, None::<&str>).ok()?).ok()?;
+    Some(menu)
+}
+
+/// Rebuild the tray menu so the pool submenu reflects current pools + selection.
+fn rebuild_tray(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let (pool, pools) = {
+        let s = state.status.lock().unwrap();
+        (s.pool.clone(), s.pools.clone())
+    };
+    if let Some(menu) = build_tray_menu(app, &pool, &pools) {
+        if let Some(tray) = state.tray.lock().unwrap().as_ref() {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
 }
 
 fn show_main(app: &AppHandle) {
@@ -212,6 +248,11 @@ fn send_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
 #[tauri::command]
 fn send_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     enqueue(&state, Cmd::SendFile(path))
+}
+
+#[tauri::command]
+fn set_pool(state: State<'_, AppState>, pool: String) -> Result<(), String> {
+    enqueue(&state, Cmd::SetPool(pool))
 }
 
 fn enqueue(state: &State<'_, AppState>, cmd: Cmd) -> Result<(), String> {
@@ -333,7 +374,13 @@ async fn sync_actor(
             Ok((mut sock, hello)) => {
                 let threshold = hello.on_demand_threshold;
                 set_roster(&app, &roster, hello.roster.clone());
+                {
+                    let mut s = status.lock().unwrap();
+                    s.pool = hello.pool.clone();
+                    s.pools = hello.pools.clone();
+                }
                 set_connected(&app, &status, true);
+                rebuild_tray(&app);
                 loop {
                     tokio::select! {
                         cmd = rx.recv() => match cmd {
@@ -356,6 +403,12 @@ async fn sync_actor(
                             }
                             Some(Cmd::SendFile(p)) => {
                                 if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
+                            }
+                            Some(Cmd::SetPool(name)) => {
+                                if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break; }
+                                let snap = { let mut s = status.lock().unwrap(); s.pool = name; s.clone() };
+                                let _ = app.emit("status", snap);
+                                rebuild_tray(&app);
                             }
                         },
                         frame = ws::recv(&mut sock) => match frame {
@@ -828,6 +881,7 @@ fn main() {
                 status: Arc::new(Mutex::new(Status::default())),
                 roster: Arc::new(Mutex::new(Vec::new())),
                 targets: Arc::new(Mutex::new(Targets::All)),
+                tray: Mutex::new(None),
                 cfg_path: dir.join("config.json"),
                 downloads: data.join("downloads"),
             };
@@ -837,18 +891,21 @@ fn main() {
                 start_sync(app.handle(), cfg);
             }
 
-            // System tray: left-click opens the window; menu has 열기 / 종료.
-            let show_i = MenuItem::with_id(app, "show", "CopySync 열기", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
-            TrayIconBuilder::new()
+            // System tray: left-click opens the window; menu has 열기 / 풀 전환 / 종료.
+            let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().cloned().expect("window icon"))
-                .menu(&menu)
+                .menu(&build_tray_menu(app.handle(), "", &[]).ok_or("tray menu")?)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_main(app),
-                    "quit" => app.exit(0),
-                    _ => {}
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => show_main(app),
+                        "quit" => app.exit(0),
+                        other => {
+                            if let Some(name) = other.strip_prefix("pool:") {
+                                let _ = enqueue(&app.state::<AppState>(), Cmd::SetPool(name.to_string()));
+                            }
+                        }
+                    }
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -861,6 +918,7 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            *app.state::<AppState>().tray.lock().unwrap() = Some(tray);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -874,6 +932,7 @@ fn main() {
             send_file,
             get_autostart,
             set_autostart,
+            set_pool,
             pair
         ])
         .run(tauri::generate_context!())
