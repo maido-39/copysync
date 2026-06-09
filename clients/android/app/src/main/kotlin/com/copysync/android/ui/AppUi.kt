@@ -29,6 +29,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -39,10 +40,12 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -64,11 +67,13 @@ import com.copysync.android.data.Downloads
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
+import com.copysync.android.net.MdnsDiscovery
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.Notifications
 import com.copysync.android.sync.SyncService
 import com.copysync.android.sync.SyncState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -93,6 +98,10 @@ private fun PairingScreen(onPaired: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+    var scanning by remember { mutableStateOf(false) }
+    val found = remember { mutableStateListOf<Pair<String, String>>() }
+    val discovery = remember { MdnsDiscovery(ctx) }
+    DisposableEffect(Unit) { onDispose { discovery.stop() } }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -104,6 +113,14 @@ private fun PairingScreen(onPaired: () -> Unit) {
             style = MaterialTheme.typography.bodySmall,
         )
         OutlinedTextField(server, { server = it }, label = { Text("서버 주소") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedButton(enabled = !scanning, modifier = Modifier.fillMaxWidth(), onClick = {
+            found.clear(); scanning = true
+            discovery.start { n, url -> if (found.none { it.second == url }) found.add(n to url) }
+            scope.launch { delay(5000); discovery.stop(); scanning = false }
+        }) { Text(if (scanning) "검색 중…" else "같은 네트워크에서 서버 검색") }
+        found.forEach { (n, url) ->
+            TextButton(onClick = { server = url }, modifier = Modifier.fillMaxWidth()) { Text("$n — $url") }
+        }
         OutlinedTextField(otp, { otp = it }, label = { Text("OTP") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(name, { name = it }, label = { Text("기기 이름") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(pin, { pin = it }, label = { Text("SPKI 핀 (선택)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
@@ -211,6 +228,7 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
         InfoRow("서버", "${settings.serverName ?: "?"}")
         InfoRow("주소", "${settings.serverUrl ?: "?"}")
         InfoRow("기기 이름", "${settings.deviceName ?: "?"}")
+        RoutingCard()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { SyncService.start(ctx) }) { Text("시작") }
             OutlinedButton(onClick = { SyncService.stop(ctx) }) { Text("중지") }
@@ -222,6 +240,46 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
             Secrets(ctx).clear()
             onUnpair()
         }) { Text("페어링 해제", color = MaterialTheme.colorScheme.error) }
+    }
+}
+
+/** Routing: pick specific target devices, or leave all unchecked to broadcast. */
+@Composable
+private fun RoutingCard() {
+    val roster by SyncState.roster.collectAsState()
+    val targets by SyncState.targets.collectAsState()
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("전송 대상", style = MaterialTheme.typography.titleSmall)
+            if (roster.isEmpty()) {
+                Text("연결된 다른 기기가 없습니다 · 전체 전송", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            } else {
+                Text(
+                    if (targets.isEmpty()) "전체 기기로 브로드캐스트" else "${targets.size}개 기기로만 전송",
+                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                )
+                roster.forEach { d ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = targets.contains(d.id),
+                            onCheckedChange = { on ->
+                                val s = SyncState.targets.value.toMutableSet()
+                                if (on) s.add(d.id) else s.remove(d.id)
+                                SyncState.targets.value = s
+                            },
+                        )
+                        Text(
+                            "${if (d.online) "● " else "○ "}${d.name.ifEmpty { d.id.take(8) }}",
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+                if (targets.isNotEmpty()) {
+                    TextButton(onClick = { SyncState.targets.value = emptySet() }) { Text("전체로 초기화") }
+                }
+            }
+        }
     }
 }
 

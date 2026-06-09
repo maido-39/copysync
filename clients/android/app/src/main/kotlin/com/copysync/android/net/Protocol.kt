@@ -92,3 +92,6 @@ data class Ack(
 
 @Serializable
 data class Presence(val device: DeviceInfo, val online: Boolean)
+
+@Serializable
+data class Roster(val devices: List<DeviceInfo> = emptyList())

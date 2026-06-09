@@ -19,6 +19,9 @@ import com.copysync.android.net.Ack
 import com.copysync.android.net.BlobClient
 import com.copysync.android.net.BlobRequest
 import com.copysync.android.net.ClipEvent
+import com.copysync.android.net.DeviceInfo
+import com.copysync.android.net.Presence
+import com.copysync.android.net.Roster
 import com.copysync.android.net.E2eCrypto
 import com.copysync.android.net.EncMeta
 import com.copysync.android.net.Envelope
@@ -39,6 +42,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * The specialUse foreground service: it hosts the persistent WebSocket session,
@@ -61,6 +67,13 @@ class SyncService : Service() {
     @Volatile private var keyChecked = false
     @Volatile private var clearJob: Job? = null
     private var seq = 0L
+
+    /** Build the outbound `targets` field from the user's routing selection. */
+    private fun currentTargets(): JsonElement {
+        val sel = SyncState.targets.value
+        return if (sel.isEmpty()) JsonPrimitive("all")
+        else JsonArray(sel.map { JsonPrimitive(it) })
+    }
 
     private fun scheduleAutoClear(sha: String) {
         val sec = settings.autoClearSeconds
@@ -155,6 +168,7 @@ class SyncService : Service() {
                         ClipEvent(
                             id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf("text/plain"),
                             inlineText = inline, size = c.text.toByteArray().size.toLong(), sha256 = wireSha, enc = encMeta,
+                            targets = currentTargets(),
                         ),
                     )
                     SyncState.lastEvent.value = "↑ ${c.text.take(40)}"
@@ -176,10 +190,10 @@ class SyncService : Service() {
                             val em = EncMeta("aes-256-gcm", kid)
                             if (threshold > 0 && c.size > threshold) {
                                 runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             } else {
                                 if (runCatching { blob?.put(ct) }.isFailure) { Log.w("CopySync", "e2e upload failed"); return@launch }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             }
                             c.file.delete()
                             dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, ctSha, kind, blobId, c.name, c.size, c.mime, enc = true))
@@ -188,12 +202,12 @@ class SyncService : Service() {
                         } else {
                             val blobId = "sha256:" + c.sha
                             if (threshold > 0 && c.size > threshold) {
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
                             } else {
                                 if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) { Log.w("CopySync", "file upload failed: ${c.name}"); return@launch }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 c.file.delete()
                                 SyncState.lastEvent.value = "↑ ${c.name} (${c.size / 1024}KB)"
@@ -279,11 +293,24 @@ class SyncService : Service() {
                 val ok = runCatching { env.decodePayload<HelloOk>() }.getOrNull()
                 threshold = ok?.onDemandThreshold ?: 0
                 settings.onDemandThreshold = threshold
+                SyncState.roster.value = ok?.roster ?: emptyList()
                 update("synced with ${ok?.serverName ?: "server"}")
             }
             MsgType.ACK -> {
                 val a = runCatching { env.decodePayload<Ack>() }.getOrNull()
                 Log.i("CopySync", "ack ${a?.id}: status=${a?.status} queuedFor=${a?.queuedFor}")
+            }
+            MsgType.ROSTER -> {
+                val r = runCatching { env.decodePayload<Roster>() }.getOrNull()
+                if (r != null) SyncState.roster.value = r.devices
+            }
+            MsgType.PRESENCE -> {
+                val p = runCatching { env.decodePayload<Presence>() }.getOrNull() ?: return
+                val cur = SyncState.roster.value.toMutableList()
+                val i = cur.indexOfFirst { it.id == p.device.id }
+                val d: DeviceInfo = p.device.copy(online = p.online)
+                if (i >= 0) cur[i] = d else cur.add(d)
+                SyncState.roster.value = cur
             }
             MsgType.BLOB_REQUEST -> {
                 val br = runCatching { env.decodePayload<BlobRequest>() }.getOrNull() ?: return
