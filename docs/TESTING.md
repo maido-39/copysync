@@ -99,9 +99,14 @@ adb shell am force-stop com.copysync.android
 GitHub Actions(위 0번)에서 받은 `.msi` 실행 → 설치. WebView2는 Win10/11에 기본 포함.
 
 ### 방법 B — 단일 exe (빠른 테스트)
-`copysync-desktop-windows-x64.exe` 다운로드 → 실행.
-- "WebView2를 찾을 수 없음" 이 뜨면 **Microsoft Edge WebView2 Runtime** 설치 후 재실행.
+**`copysync-desktop-windows-x64.zip`** 다운로드 → 압축 풀기 → 같은 폴더의 exe 실행.
+- zip 안에 `WebView2Loader.dll`이 함께 들어 있습니다. 이 빠른-테스트 exe는 gnu 크로스
+  빌드라 로더 DLL이 정적 링크되지 않아 **exe 옆에 DLL이 있어야** 합니다(정식 MSI는 불필요).
+- `WebView2Loader.dll이(가) 없어…` 오류가 났다면 → zip을 쓰거나, `WebView2Loader.dll`
+  하나만 받아 exe와 같은 폴더에 두세요.
+- 그 다음 WebView2 *런타임* 관련 오류가 나면 **Edge WebView2 Runtime(Evergreen)** 설치(Win10/11 보통 기본 포함).
 - SmartScreen 경고(미서명) → **추가 정보 → 실행**.
+- gnu 크로스빌드라 미묘한 문제가 있으면, 깔끔한 경로는 **CI의 .msi**(위 0번)입니다.
 
 ### 페어링 + 사용
 앱의 **페어링** 탭에서 서버 주소 + OTP (+선택: 핀, E2E 암호문) 입력. 페어링 후 자동 연결.
