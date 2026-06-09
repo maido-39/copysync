@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Core permissions for the CopySync window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "notification:default"]
+  "permissions": ["core:default", "dialog:default", "notification:default", "autostart:default"]
 }

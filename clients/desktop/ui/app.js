@@ -130,5 +130,19 @@ listen("status", (ev) => renderStatus(ev.payload));
 listen("clip", () => { if ($("#history").classList.contains("active")) loadHistory(); });
 listen("error", (ev) => console.warn("copysync:", ev.payload));
 
+// ---- autostart
+async function loadAutostart() {
+  try { $("#autostart").checked = await invoke("get_autostart"); } catch (e) {}
+}
+$("#autostart").addEventListener("change", async (e) => {
+  try {
+    await invoke("set_autostart", { enabled: e.target.checked });
+  } catch (err) {
+    alert("자동 시작 설정 실패: " + err);
+    e.target.checked = !e.target.checked;
+  }
+});
+loadAutostart();
+
 refreshStatus();
 setInterval(refreshStatus, 4000);

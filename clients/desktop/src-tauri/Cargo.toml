@@ -10,9 +10,10 @@ default-run = "copysync-desktop"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
 copysync-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true

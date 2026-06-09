@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -126,6 +129,25 @@ fn mime_of(path: &str) -> String {
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> Status {
     state.status.lock().unwrap().clone()
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let m = app.autolaunch();
+    (if enabled { m.enable() } else { m.disable() }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -753,6 +775,17 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .on_window_event(|window, event| {
+            // Closing the window hides it to the tray (the sync keeps running).
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
             let dir = app
                 .path()
@@ -777,6 +810,31 @@ fn main() {
             if let Ok(cfg) = Config::load(&cfg_path) {
                 start_sync(app.handle(), cfg);
             }
+
+            // System tray: left-click opens the window; menu has 열기 / 종료.
+            let show_i = MenuItem::with_id(app, "show", "CopySync 열기", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().expect("window icon"))
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                })
+                .build(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -786,6 +844,8 @@ fn main() {
             get_history,
             send_text,
             send_file,
+            get_autostart,
+            set_autostart,
             pair
         ])
         .run(tauri::generate_context!())

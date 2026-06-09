@@ -52,7 +52,11 @@ pin and E2E passphrase). Once paired it auto-connects on launch and:
 - shows an **OS notification** on every incoming clip;
 - supports **per-device routing** — broadcast to all (default) or tick specific
   devices in the 전송 대상 card (roster updates live via presence);
-- keeps a searchable local history and reconnects on drop.
+- keeps a searchable local history and reconnects on drop;
+- lives in the **system tray** (left-click opens; menu has 열기 / 종료) — closing
+  the window hides to tray, sync keeps running — and can **launch on boot** (toggle
+  in 설정). On Linux the tray needs `libayatana-appindicator3` installed at runtime.
+- syncs **rich text (HTML)** too (`arboard` get/set HTML), with a plain-text fallback.
 
 ## Windows
 
