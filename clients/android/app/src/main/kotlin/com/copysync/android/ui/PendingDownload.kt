@@ -8,6 +8,7 @@ data class DownloadReq(
     val name: String,
     val mime: String,
     val rowid: Long = -1,
+    val encrypted: Boolean = false,
 )
 
 /** Bridges a notification tap / history button to the in-app save-location picker. */

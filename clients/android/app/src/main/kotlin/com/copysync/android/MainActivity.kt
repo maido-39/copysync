@@ -15,6 +15,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import com.copysync.android.data.Settings
+import com.copysync.android.data.Secrets
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.SyncService
 import com.copysync.android.ui.AppRoot
@@ -62,7 +63,11 @@ class MainActivity : ComponentActivity() {
             val ctx = applicationContext
             Thread {
                 runCatching { claimAndStore(ctx, server, otp, name, intent.getStringExtra("cs_pin").orEmpty()) }
-                    .onSuccess { Log.i(TAG, "auto-paired as ${it.deviceId}"); SyncService.start(ctx) }
+                    .onSuccess {
+                        intent.getStringExtra("cs_e2e")?.let { p -> Secrets(ctx).e2ePass = p.ifBlank { null } }
+                        Log.i(TAG, "auto-paired as ${it.deviceId}")
+                        SyncService.start(ctx)
+                    }
                     .onFailure { Log.e(TAG, "auto-pair failed: ${it.message}") }
             }.start()
         }
@@ -77,6 +82,7 @@ class MainActivity : ComponentActivity() {
                 blobId = blobId,
                 name = intent.getStringExtra("cs_dl_name") ?: "file",
                 mime = intent.getStringExtra("cs_dl_mime") ?: "*/*",
+                encrypted = intent.getBooleanExtra("cs_dl_enc", false),
             )
         }
     }

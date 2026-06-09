@@ -35,6 +35,8 @@ data class ClaimResult(
     val e2e: Boolean = false,
 )
 
+
+
 /** Handles the HTTP side of device pairing. */
 object PairingClient {
     private val JSON = "application/json".toMediaType()
@@ -76,6 +78,7 @@ fun claimAndStore(ctx: Context, serverUrl: String, otp: String, deviceName: Stri
     Settings(ctx).apply {
         this.serverUrl = serverUrl
         serverName = result.serverName.ifBlank { serverUrl }
+        serverId = result.serverId
         deviceId = result.deviceId
         this.deviceName = deviceName
         spkiPin = pin

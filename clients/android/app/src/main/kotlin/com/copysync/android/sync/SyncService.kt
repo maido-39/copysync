@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import com.copysync.android.capture.Captured
 import com.copysync.android.capture.ClipboardCaptureEngine
@@ -18,6 +19,8 @@ import com.copysync.android.net.Ack
 import com.copysync.android.net.BlobClient
 import com.copysync.android.net.BlobRequest
 import com.copysync.android.net.ClipEvent
+import com.copysync.android.net.E2eCrypto
+import com.copysync.android.net.EncMeta
 import com.copysync.android.net.Envelope
 import com.copysync.android.net.Hello
 import com.copysync.android.net.HelloOk
@@ -52,7 +55,23 @@ class SyncService : Service() {
     @Volatile private var ws: WsClient? = null
     @Volatile private var blob: BlobClient? = null
     @Volatile private var threshold: Long = 0 // bytes; files over this go on demand (from hello_ok)
+    @Volatile private var key: ByteArray? = null // E2E group key (null = off)
+    private var kid: String = ""
+    @Volatile private var keyChecked = false
     private var seq = 0L
+
+    /** Derive the E2E key from the stored passphrase + serverId once (Argon2 is slow). */
+    private fun ensureKey() {
+        if (keyChecked) return
+        keyChecked = true
+        val pass = secrets.e2ePass
+        val sid = settings.serverId
+        if (!pass.isNullOrEmpty() && !sid.isNullOrEmpty()) {
+            key = E2eCrypto.deriveKey(pass, sid)
+            kid = E2eCrypto.keyId(key!!)
+            Log.i("CopySync", "E2E enabled (keyId=$kid)")
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -101,55 +120,71 @@ class SyncService : Service() {
         scope.launch {
             when (c) {
                 is Captured.Text -> {
+                    ensureKey()
                     val sha = sha256Hex(c.text)
                     dao.insert(
                         ClipEntity(
                             clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
                             direction = "out", origin = settings.deviceId.orEmpty(), text = c.text, sha = sha,
+                            enc = key != null,
                         ),
                     )
+                    var inline = c.text
+                    var wireSha = sha
+                    var encMeta: EncMeta? = null
+                    key?.let { k ->
+                        val raw = E2eCrypto.seal(k, c.text.toByteArray())
+                        inline = Base64.encodeToString(raw, Base64.NO_WRAP)
+                        wireSha = sha256Hex(raw)
+                        encMeta = EncMeta("aes-256-gcm", kid)
+                    }
                     val sent = ws?.sendClip(
                         ClipEvent(
                             id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf("text/plain"),
-                            inlineText = c.text, size = c.text.toByteArray().size.toLong(), sha256 = sha,
+                            inlineText = inline, size = c.text.toByteArray().size.toLong(), sha256 = wireSha, enc = encMeta,
                         ),
                     )
                     SyncState.lastEvent.value = "↑ ${c.text.take(40)}"
-                    Log.i("CopySync", "local copy -> sendClip (ws=${ws != null}, sent=$sent, ${c.text.length} chars)")
+                    Log.i("CopySync", "local copy -> sendClip (ws=${ws != null}, sent=$sent, e2e=${key != null})")
                 }
                 is Captured.Binary -> {
+                    ensureKey()
                     if (blob == null) {
                         Log.w("CopySync", "no blob channel; file not sent")
                     } else {
-                        val blobId = "sha256:" + c.sha
                         val kind = if (c.mime.startsWith("image/")) "image" else "file"
-                        if (threshold > 0 && c.size > threshold) {
-                            // Large: hold the bytes locally; advertise on demand (no upload).
-                            ws?.sendClip(
-                                ClipEvent(
-                                    id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime),
-                                    name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha,
-                                ),
-                            )
-                            dao.insert(fileEntity(UUID.randomUUID().toString(), "out", settings.deviceId.orEmpty(), c.sha, kind, blobId, c.name, c.size, c.mime))
-                            SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
-                            Log.i("CopySync", "advertised on-demand ${c.name} ${c.size} bytes ($blobId)")
-                        } else {
-                            // Small: upload eagerly, then drop the local copy.
-                            if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) {
-                                Log.w("CopySync", "file upload failed: ${c.name}")
-                                return@launch
+                        val dev = settings.deviceId.orEmpty()
+                        val k = key
+                        if (k != null) {
+                            // E2E: seal to ciphertext; address + advertise by the ciphertext hash.
+                            val ct = E2eCrypto.seal(k, c.file.readBytes())
+                            val ctSha = sha256Hex(ct)
+                            val blobId = "sha256:$ctSha"
+                            val em = EncMeta("aes-256-gcm", kid)
+                            if (threshold > 0 && c.size > threshold) {
+                                runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em))
+                            } else {
+                                if (runCatching { blob?.put(ct) }.isFailure) { Log.w("CopySync", "e2e upload failed"); return@launch }
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em))
                             }
-                            ws?.sendClip(
-                                ClipEvent(
-                                    id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime),
-                                    name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha,
-                                ),
-                            )
-                            dao.insert(fileEntity(UUID.randomUUID().toString(), "out", settings.deviceId.orEmpty(), c.sha, kind, blobId, c.name, c.size, c.mime))
                             c.file.delete()
-                            SyncState.lastEvent.value = "↑ ${c.name} (${c.size / 1024}KB)"
-                            Log.i("CopySync", "uploaded ${c.name} ${c.size} bytes ($blobId)")
+                            dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, ctSha, kind, blobId, c.name, c.size, c.mime, enc = true))
+                            SyncState.lastEvent.value = "↑ ${c.name} (e2e ${c.size / 1024}KB)"
+                            Log.i("CopySync", "sent e2e ${c.name} ${c.size} bytes ($blobId)")
+                        } else {
+                            val blobId = "sha256:" + c.sha
+                            if (threshold > 0 && c.size > threshold) {
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha))
+                                dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
+                                SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
+                            } else {
+                                if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) { Log.w("CopySync", "file upload failed: ${c.name}"); return@launch }
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha))
+                                dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
+                                c.file.delete()
+                                SyncState.lastEvent.value = "↑ ${c.name} (${c.size / 1024}KB)"
+                            }
                         }
                     }
                 }
@@ -161,10 +196,10 @@ class SyncService : Service() {
 
     private fun fileEntity(
         clipId: String, dir: String, origin: String, sha: String,
-        kind: String, blobId: String, name: String, size: Long, mime: String,
+        kind: String, blobId: String, name: String, size: Long, mime: String, enc: Boolean = false,
     ) = ClipEntity(
         clipId = clipId, ts = System.currentTimeMillis(), direction = dir, origin = origin,
-        text = "($kind) $name", sha = sha, kind = kind, blobId = blobId, name = name, sizeBytes = size, mime = mime,
+        text = "($kind) $name", sha = sha, kind = kind, blobId = blobId, name = name, sizeBytes = size, mime = mime, enc = enc,
     )
 
     private fun startConnectLoop() {
@@ -253,45 +288,56 @@ class SyncService : Service() {
                 val imageMime = ev.mime.firstOrNull { it.startsWith("image/") }
                 when {
                     ev.inlineText != null -> {
-                        val text = ev.inlineText!!
+                        ensureKey()
+                        var text = ev.inlineText!!
+                        var readable = true
+                        if (ev.enc != null) {
+                            val k = key
+                            val dec = if (k != null && (ev.enc!!.keyId.isEmpty() || ev.enc!!.keyId == kid))
+                                runCatching { String(E2eCrypto.open(k, Base64.decode(text, Base64.NO_WRAP))) }.getOrNull() else null
+                            if (dec != null) text = dec else { text = "[encrypted — no matching key]"; readable = false }
+                        }
                         dao.insert(
                             ClipEntity(
                                 clipId = ev.id, ts = System.currentTimeMillis(), direction = "in",
-                                origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) },
+                                origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) }, enc = ev.enc != null,
                             ),
                         )
-                        capture?.applyInbound(text)
+                        if (readable) capture?.applyInbound(text)
                         Notifications.notifyClip(this, ev.originDeviceId, text)
                         SyncState.lastEvent.value = "↓ ${text.take(40)}"
-                        Log.i("CopySync", "received text (${text.length} chars)")
+                        Log.i("CopySync", "received text (e2e=${ev.enc != null}, readable=$readable)")
                     }
                     ev.blobId != null && imageMime != null && !ev.onDemand -> {
-                        // Small eager image → download now and put it on the clipboard.
-                        val data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
+                        ensureKey()
+                        var data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
+                        if (data != null && ev.enc != null) {
+                            val k = key
+                            data = if (k != null) runCatching { E2eCrypto.open(k, data!!) }.getOrNull() else null
+                        }
                         if (data != null) {
                             val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
-                            capture?.applyInboundImage(data, ev.name ?: "in-${ev.id.take(8)}.$ext")
-                            // Cache the bytes (keyed by blob hash) so the history tab can preview them.
-                            runCatching {
+                            capture?.applyInboundImage(data!!, ev.name ?: "in-${ev.id.take(8)}.$ext")
+                            if (ev.enc == null) runCatching { // preview cache (plaintext only)
                                 val dir = File(cacheDir, "clip-src").apply { mkdirs() }
-                                File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data)
+                                File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!)
                             }
-                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data) }, "image", ev.blobId!!, ev.name ?: "image.$ext", data.size.toLong(), imageMime))
+                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data!!) }, "image", ev.blobId!!, ev.name ?: "image.$ext", data!!.size.toLong(), imageMime, enc = ev.enc != null))
                             Notifications.notifyClip(this, ev.originDeviceId, "(image)")
-                            SyncState.lastEvent.value = "↓ image ${data.size / 1024}KB"
-                            Log.i("CopySync", "received image ${data.size} bytes")
+                            SyncState.lastEvent.value = "↓ image ${data!!.size / 1024}KB"
+                            Log.i("CopySync", "received image ${data!!.size} bytes (e2e=${ev.enc != null})")
                         } else {
-                            Log.w("CopySync", "inbound image: blob fetch failed for ${ev.blobId}")
+                            Log.w("CopySync", "inbound image: fetch/decrypt failed for ${ev.blobId}")
                         }
                     }
                     ev.blobId != null -> {
                         // File, or on-demand image → record as downloadable; user taps to fetch.
                         val nm = ev.name ?: "file"
                         val kind = if (imageMime != null) "image" else "file"
-                        dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: ""))
-                        Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*")
+                        dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
+                        Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*", ev.enc != null)
                         SyncState.lastEvent.value = "↓ $nm (download)"
-                        Log.i("CopySync", "received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand})")
+                        Log.i("CopySync", "received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
                     }
                     else -> Log.i("CopySync", "ignoring unsupported clip (mime=${ev.mime})")
                 }

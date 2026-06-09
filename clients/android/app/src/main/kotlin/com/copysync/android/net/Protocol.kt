@@ -75,8 +75,13 @@ data class ClipEvent(
     val onDemand: Boolean = false,
     val size: Long = 0,
     val sha256: String = "",
+    val enc: EncMeta? = null,
     val targets: JsonElement = JsonPrimitive("all"),
 )
+
+/** Marks a clip payload as E2E ciphertext. */
+@Serializable
+data class EncMeta(val alg: String = "", val keyId: String = "", val nonce: String = "")
 
 @Serializable
 data class Ack(

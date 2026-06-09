@@ -140,7 +140,7 @@ private fun MainScaffold(onUnpair: () -> Unit) {
         PendingDownload.req.value = null
         if (uri != null && req != null) {
             scope.launch {
-                withContext(Dispatchers.IO) { runCatching { Downloads.fetchToUri(ctx, req.blobId, uri) } }
+                withContext(Dispatchers.IO) { runCatching { Downloads.fetchToUri(ctx, req.blobId, uri, req.encrypted) } }
                     .onSuccess {
                         if (req.rowid >= 0) dao.setLocalPath(req.rowid, uri.toString())
                         Notifications.notifyInfo(ctx, "CopySync", "다운로드 완료: ${req.name}")
@@ -300,7 +300,7 @@ private fun HistoryCard(e: ClipEntity) {
                 (e.kind == "file" || e.kind == "image") && e.localPath == null
             when {
                 canDownload -> TextButton(onClick = {
-                    PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid)
+                    PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid, e.enc)
                 }) { Text("⬇ 받기") }
                 e.localPath != null -> Text("✓ 저장됨", style = MaterialTheme.typography.bodySmall, color = Color(0xFF16A34A))
             }
@@ -315,12 +315,30 @@ private fun SettingsTab() {
     val ctx = LocalContext.current
     val settings = remember { Settings(ctx) }
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
+    var e2ePass by remember { mutableStateOf(Secrets(ctx).e2ePass ?: "") }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("설정", style = MaterialTheme.typography.headlineSmall)
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("E2E 암호화 (선택)", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "모든 기기에 같은 패스프레이즈를 입력하면 서버가 클립 내용을 볼 수 없습니다(영지식). 비우면 끔.",
+                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                )
+                OutlinedTextField(e2ePass, { e2ePass = it }, label = { Text("패스프레이즈") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = {
+                        Secrets(ctx).e2ePass = e2ePass.ifBlank { null }
+                        SyncService.stop(ctx); SyncService.start(ctx)
+                    }) { Text("적용 후 재시작") }
+                    Text(if (e2ePass.isBlank()) "현재: 꺼짐" else "현재: 켜짐", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("백그라운드 캡처 권한", style = MaterialTheme.typography.titleSmall)

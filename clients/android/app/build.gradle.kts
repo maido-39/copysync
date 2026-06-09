@@ -65,5 +65,6 @@ dependencies {
     ksp(libs.androidx.room.compiler)
 
     implementation(libs.androidx.security.crypto)
+    implementation(libs.bouncycastle)
     implementation(libs.androidx.datastore.preferences)
 }

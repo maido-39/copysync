@@ -58,11 +58,12 @@ object Notifications {
     }
 
     /** A received file: tapping opens the app and triggers the save-location picker. */
-    fun notifyDownloadable(ctx: Context, origin: String, blobId: String, name: String, mime: String) {
+    fun notifyDownloadable(ctx: Context, origin: String, blobId: String, name: String, mime: String, encrypted: Boolean) {
         val intent = Intent(ctx, MainActivity::class.java).apply {
             putExtra("cs_dl_blob", blobId)
             putExtra("cs_dl_name", name)
             putExtra("cs_dl_mime", mime)
+            putExtra("cs_dl_enc", encrypted)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val pi = PendingIntent.getActivity(
