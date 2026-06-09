@@ -35,6 +35,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -316,6 +317,8 @@ private fun SettingsTab() {
     val settings = remember { Settings(ctx) }
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
     var e2ePass by remember { mutableStateOf(Secrets(ctx).e2ePass ?: "") }
+    var sensitive by remember { mutableStateOf(settings.sensitiveMark) }
+    var autoClear by remember { mutableStateOf(settings.autoClearSeconds) }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -358,6 +361,25 @@ private fun SettingsTab() {
                     "백그라운드에서 다른 앱의 복사를 잡으려면 READ_LOGS도 필요합니다 (디버깅 탭의 ADB/Shizuku 명령 참고).",
                     style = MaterialTheme.typography.bodySmall, color = Color.Gray,
                 )
+            }
+        }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("보안", style = MaterialTheme.typography.titleSmall)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("받은 항목 민감 표시", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                    Switch(checked = sensitive, onCheckedChange = { sensitive = it; settings.sensitiveMark = it })
+                }
+                Text("자동 삭제 (받은 뒤 클립보드 비우기)", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(0 to "끔", 30 to "30초", 60 to "1분", 300 to "5분").forEach { (s, label) ->
+                        if (autoClear == s) {
+                            Button(onClick = { autoClear = s; settings.autoClearSeconds = s }) { Text(label) }
+                        } else {
+                            OutlinedButton(onClick = { autoClear = s; settings.autoClearSeconds = s }) { Text(label) }
+                        }
+                    }
+                }
             }
         }
         Card(Modifier.fillMaxWidth()) {

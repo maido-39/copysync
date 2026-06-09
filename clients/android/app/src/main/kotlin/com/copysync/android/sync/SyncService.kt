@@ -31,6 +31,7 @@ import com.copysync.android.net.pinnedClient
 import com.copysync.android.net.sha256Hex
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -58,7 +59,19 @@ class SyncService : Service() {
     @Volatile private var key: ByteArray? = null // E2E group key (null = off)
     private var kid: String = ""
     @Volatile private var keyChecked = false
+    @Volatile private var clearJob: Job? = null
     private var seq = 0L
+
+    private fun scheduleAutoClear(sha: String) {
+        val sec = settings.autoClearSeconds
+        if (sec <= 0) return
+        clearJob?.cancel()
+        clearJob = scope.launch {
+            delay(sec * 1000L)
+            capture?.clearIfStill(sha)
+            Log.i("CopySync", "auto-clear fired (${sec}s)")
+        }
+    }
 
     /** Derive the E2E key from the stored passphrase + serverId once (Argon2 is slow). */
     private fun ensureKey() {
@@ -303,7 +316,10 @@ class SyncService : Service() {
                                 origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) }, enc = ev.enc != null,
                             ),
                         )
-                        if (readable) capture?.applyInbound(text)
+                        if (readable) {
+                            capture?.applyInbound(text, settings.sensitiveMark)
+                            scheduleAutoClear(sha256Hex(text))
+                        }
                         Notifications.notifyClip(this, ev.originDeviceId, text)
                         SyncState.lastEvent.value = "↓ ${text.take(40)}"
                         Log.i("CopySync", "received text (e2e=${ev.enc != null}, readable=$readable)")
@@ -317,7 +333,8 @@ class SyncService : Service() {
                         }
                         if (data != null) {
                             val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
-                            capture?.applyInboundImage(data!!, ev.name ?: "in-${ev.id.take(8)}.$ext")
+                            capture?.applyInboundImage(data!!, ev.name ?: "in-${ev.id.take(8)}.$ext", settings.sensitiveMark)
+                            scheduleAutoClear(sha256Hex(data!!))
                             if (ev.enc == null) runCatching { // preview cache (plaintext only)
                                 val dir = File(cacheDir, "clip-src").apply { mkdirs() }
                                 File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!)

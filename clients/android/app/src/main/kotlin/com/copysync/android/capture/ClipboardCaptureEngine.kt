@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.os.PersistableBundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
@@ -44,6 +45,9 @@ class ClipboardCaptureEngine(
         private set
 
     @Volatile private var lastTriggerAt = 0L
+
+    @Volatile var lastActivitySha: String = "" // last captured/applied content hash
+        private set
 
     private val srcDir: File get() = File(context.cacheDir, "clip-src").apply { mkdirs() }
 
@@ -89,6 +93,7 @@ class ClipboardCaptureEngine(
                 return@execute
             }
             guard.mark(key)
+            lastActivitySha = key
             lastStatus = "captured"
             Log.i("CopySync", "capture: emitting ${captured.describe()}")
             onCaptured(captured)
@@ -170,17 +175,40 @@ class ClipboardCaptureEngine(
     }
 
     /** Write inbound text to the clipboard (echo-suppressed). */
-    fun applyInbound(text: String) {
-        guard.mark(sha256Hex(text))
+    fun applyInbound(text: String, sensitive: Boolean = false) {
+        val sha = sha256Hex(text)
+        guard.mark(sha)
+        lastActivitySha = sha
         val clip = ClipData.newPlainText("CopySync", text)
+        if (sensitive) markSensitive(clip)
         if (!overlay.writeWithFocus(clip)) runCatching { clipboard.setPrimaryClip(clip) }
     }
 
     /** Write an inbound image to the clipboard via a FileProvider URI. */
-    fun applyInboundImage(bytes: ByteArray, name: String) {
-        guard.mark(sha256Hex(bytes))
+    fun applyInboundImage(bytes: ByteArray, name: String, sensitive: Boolean = false) {
+        val sha = sha256Hex(bytes)
+        guard.mark(sha)
+        lastActivitySha = sha
         val clip = imageClip(bytes, name) ?: return
+        if (sensitive) markSensitive(clip)
         if (!overlay.writeWithFocus(clip)) runCatching { clipboard.setPrimaryClip(clip) }
+    }
+
+    /** Flag a clip so keyboards/UI obfuscate its preview (password-like content). */
+    private fun markSensitive(clip: ClipData) {
+        runCatching {
+            clip.description.extras = PersistableBundle().apply {
+                putBoolean("android.content.extra.IS_SENSITIVE", true)
+            }
+        }
+    }
+
+    /** Clear the OS clipboard if nothing newer was copied since [sha] was written
+     *  (writing/clearing the clipboard is allowed from the background). */
+    fun clearIfStill(sha: String) {
+        if (lastActivitySha != sha) return
+        runCatching { clipboard.clearPrimaryClip() }
+        lastActivitySha = ""
     }
 
     private fun imageClip(bytes: ByteArray, name: String): ClipData? = runCatching {
