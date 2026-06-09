@@ -140,11 +140,13 @@ it (later requesters are served directly). If the origin is offline, `GET` retur
 When devices share a passphrase, each derives a 32-byte group key with
 **Argon2id(passphrase, salt = sha256("copysync-e2e|" + serverId))** — the server
 never sees the passphrase, so it cannot derive the key. Before sending, a client
-seals the payload with **XChaCha20-Poly1305** as `nonce ‖ ciphertext‖tag`:
+seals the payload with **AES-256-GCM** as `nonce(12) ‖ ciphertext‖tag` (AES-GCM
+is native on both the Go stdlib and the Android JDK, so clients interoperate
+without a third-party AEAD library):
 - text → `inlineText` = base64(nonce‖ct), and `sha256` = sha256(ciphertext);
 - files → the blob bytes ARE the sealed blob and `blobId = sha256(ciphertext)`.
 
-`enc = { alg: "xchacha20poly1305", keyId }` marks the clip (`keyId` = truncated
+`enc = { alg: "aes-256-gcm", keyId }` marks the clip (`keyId` = truncated
 sha256 of the key, for fast mismatch detection). Because the server already never
 inspects payloads, it relays and stores **only ciphertext** — it is
 zero-knowledge. Receivers with the matching key decrypt; others see only

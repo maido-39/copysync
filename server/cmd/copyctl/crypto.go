@@ -1,17 +1,20 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// e2eAlg is the AEAD label carried in ClipEvent.Enc.Alg.
-const e2eAlg = "xchacha20poly1305"
+// e2eAlg is the AEAD label carried in ClipEvent.Enc.Alg. AES-256-GCM is used
+// because it is native on both the Go stdlib and the Android JDK, so the Go and
+// Kotlin clients interoperate without a third-party AEAD library.
+const e2eAlg = "aes-256-gcm"
 
 // deriveKey turns a user passphrase into the 32-byte group key. The salt is
 // derived from the server id so every device on the same server derives the
@@ -28,10 +31,18 @@ func keyID(key []byte) string {
 	return hex.EncodeToString(s[:])[:16]
 }
 
-// seal returns nonce || AEAD(ciphertext+tag) — a self-describing blob that open
-// can reverse with the same key.
+func gcmOf(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block) // 12-byte nonce, 16-byte tag
+}
+
+// seal returns nonce || AES-GCM(ciphertext+tag) — a self-describing blob that
+// open reverses with the same key.
 func seal(key, plaintext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
+	aead, err := gcmOf(key)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +54,7 @@ func seal(key, plaintext []byte) ([]byte, error) {
 }
 
 func open(key, raw []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
+	aead, err := gcmOf(key)
 	if err != nil {
 		return nil, err
 	}
