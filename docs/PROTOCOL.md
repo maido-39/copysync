@@ -71,7 +71,7 @@ After `hello_ok`, the server immediately replays any **queued** clips (see
 | `size` | int | payload size in bytes |
 | `sha256` | string | hash of the payload (plaintext if E2E off, ciphertext if on) |
 | `targets` | `"all"` \| string[] | recipients: all paired devices, or explicit ids |
-| `enc` | object? | present ⇒ E2E ciphertext (`{alg,keyId,nonce}`) |
+| `enc` | object? | present ⇒ payload is E2E ciphertext `{alg,keyId}`; nonce is prepended to the ciphertext and `sha256`/`blobId` are over the ciphertext |
 
 The server relays a `clip` to its targets (excluding the origin) and **queues**
 it for any offline targets.
@@ -134,6 +134,25 @@ server, which then sends a `blob_request` to the origin and **long-polls** (up t
 60s) until the origin `PUT`s the blob, then streams it to the requester and caches
 it (later requesters are served directly). If the origin is offline, `GET` returns
 `404`; if it doesn't deliver in time, `504`.
+
+## End-to-end encryption (optional, client-side)
+
+When devices share a passphrase, each derives a 32-byte group key with
+**Argon2id(passphrase, salt = sha256("copysync-e2e|" + serverId))** — the server
+never sees the passphrase, so it cannot derive the key. Before sending, a client
+seals the payload with **XChaCha20-Poly1305** as `nonce ‖ ciphertext‖tag`:
+- text → `inlineText` = base64(nonce‖ct), and `sha256` = sha256(ciphertext);
+- files → the blob bytes ARE the sealed blob and `blobId = sha256(ciphertext)`.
+
+`enc = { alg: "xchacha20poly1305", keyId }` marks the clip (`keyId` = truncated
+sha256 of the key, for fast mismatch detection). Because the server already never
+inspects payloads, it relays and stores **only ciphertext** — it is
+zero-knowledge. Receivers with the matching key decrypt; others see only
+ciphertext. Server-originated admin broadcast is disabled while E2E is on.
+
+(Implemented and verified in `copyctl`: text, eager files, and on-demand large
+files all round-trip; the on-disk blob store holds only ciphertext. The Android
+client port is next.)
 
 ## Pairing
 

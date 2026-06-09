@@ -82,6 +82,7 @@ func cmdPair(args []string) error {
 	otp := fs.String("otp", "", "one-time pairing code")
 	name := fs.String("name", "", "this device's unique name")
 	pin := fs.String("pin", "", "server SPKI pin (base64); empty = trust on first use")
+	e2ePass := fs.String("e2e-pass", "", "optional E2E passphrase; enables client-side encryption")
 	cfgPath := fs.String("config", defaultConfigPath(), "config file path")
 	_ = fs.Parse(args)
 	if *server == "" || *otp == "" || *name == "" {
@@ -105,6 +106,7 @@ func cmdPair(args []string) error {
 		return err
 	}
 	cfg.Pin = usedPin
+	cfg.E2EPass = *e2ePass
 	if err := saveConfig(*cfgPath, cfg); err != nil {
 		return err
 	}
@@ -211,6 +213,13 @@ func cmdPull(args []string) error {
 	data, code, err := cl.pinnedFetch(model.BlobID(*id), 120*time.Second)
 	if err != nil {
 		return fmt.Errorf("pull failed (HTTP %d): %w", code, err)
+	}
+	if cl.key != nil {
+		pt, derr := open(cl.key, data)
+		if derr != nil {
+			return fmt.Errorf("decrypt failed (wrong passphrase?): %w", derr)
+		}
+		data = pt
 	}
 	if err := os.WriteFile(*out, data, 0o644); err != nil {
 		return err
@@ -374,8 +383,16 @@ func historyPathFor(cfgPath string) string {
 // handleIncoming records a received clip in history and returns a printable line.
 func (c *Client) handleIncoming(ev model.ClipEvent, saveDir string) string {
 	if ev.InlineText != "" {
-		c.hist.append("in", string(ev.OriginDevice), ev.InlineText, "")
-		return fmt.Sprintf("[%s] text: %s", ev.OriginDevice, ev.InlineText)
+		text := ev.InlineText
+		if ev.Enc != nil {
+			pt, ok := c.decryptText(ev)
+			if !ok {
+				return fmt.Sprintf("[%s] [e2e ciphertext — %s]", ev.OriginDevice, c.e2eWhy(ev))
+			}
+			text = pt
+		}
+		c.hist.append("in", string(ev.OriginDevice), text, "")
+		return fmt.Sprintf("[%s] text: %s", ev.OriginDevice, text)
 	}
 	if ev.BlobID != "" {
 		data, err := c.getBlob(ev.BlobID)
@@ -385,15 +402,24 @@ func (c *Client) handleIncoming(ev model.ClipEvent, saveDir string) string {
 		sum := sha256.Sum256(data)
 		gotHex := hex.EncodeToString(sum[:])
 		wantHex := strings.TrimPrefix(string(ev.BlobID), "sha256:")
-		_ = os.MkdirAll(saveDir, 0o755)
-		path := filepath.Join(saveDir, wantHex+".blob")
-		_ = os.WriteFile(path, data, 0o644)
-		c.hist.append("in", string(ev.OriginDevice), "(blob) "+path, string(ev.BlobID))
 		integrity := "ok"
 		if gotHex != wantHex {
 			integrity = "HASH MISMATCH"
 		}
-		return fmt.Sprintf("[%s] blob %d bytes → %s (%s)", ev.OriginDevice, len(data), path, integrity)
+		dec := ""
+		if ev.Enc != nil {
+			pt, ok := c.decryptBytes(ev, data)
+			if !ok {
+				return fmt.Sprintf("[%s] blob %d bytes [e2e — %s]", ev.OriginDevice, len(data), c.e2eWhy(ev))
+			}
+			data = pt
+			dec = " (decrypted)"
+		}
+		_ = os.MkdirAll(saveDir, 0o755)
+		path := filepath.Join(saveDir, wantHex+".blob")
+		_ = os.WriteFile(path, data, 0o644)
+		c.hist.append("in", string(ev.OriginDevice), "(blob) "+path, string(ev.BlobID))
+		return fmt.Sprintf("[%s] blob %d bytes → %s (%s)%s", ev.OriginDevice, len(data), path, integrity, dec)
 	}
 	return fmt.Sprintf("[%s] (empty clip)", ev.OriginDevice)
 }

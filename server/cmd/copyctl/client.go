@@ -104,7 +104,7 @@ func claimPairing(httpc *http.Client, serverURL, otp, name string) (Config, erro
 	if err := json.Unmarshal(data, &r); err != nil {
 		return Config{}, err
 	}
-	return Config{ServerURL: serverURL, ServerName: r.ServerName, DeviceID: r.DeviceID, DeviceName: name, Token: r.Token}, nil
+	return Config{ServerURL: serverURL, ServerName: r.ServerName, ServerID: r.ServerID, DeviceID: r.DeviceID, DeviceName: name, Token: r.Token}, nil
 }
 
 // Client is a paired copyctl device.
@@ -117,6 +117,9 @@ type Client struct {
 	mu     sync.Mutex
 	seq    uint64
 	served map[model.BlobID]string // on-demand blobs this client holds: id -> file path
+
+	key []byte // E2E group key (nil = E2E off)
+	kid string // key fingerprint
 }
 
 func newClient(cfg Config, hist *History) (*Client, error) {
@@ -124,7 +127,43 @@ func newClient(cfg Config, hist *History) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cfg: cfg, httpc: hc, echo: newEchoGuard(), hist: hist, served: make(map[model.BlobID]string)}, nil
+	c := &Client{cfg: cfg, httpc: hc, echo: newEchoGuard(), hist: hist, served: make(map[model.BlobID]string)}
+	if cfg.E2EPass != "" && cfg.ServerID != "" {
+		c.key = deriveKey(cfg.E2EPass, cfg.ServerID)
+		c.kid = keyID(c.key)
+	}
+	return c, nil
+}
+
+// decryptText returns the plaintext of an encrypted clip, or ok=false.
+func (c *Client) decryptText(ev model.ClipEvent) (string, bool) {
+	if c.key == nil || (ev.Enc.KeyID != "" && ev.Enc.KeyID != c.kid) {
+		return "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(ev.InlineText)
+	if err != nil {
+		return "", false
+	}
+	pt, err := open(c.key, raw)
+	return string(pt), err == nil
+}
+
+func (c *Client) decryptBytes(ev model.ClipEvent, data []byte) ([]byte, bool) {
+	if c.key == nil || (ev.Enc.KeyID != "" && ev.Enc.KeyID != c.kid) {
+		return nil, false
+	}
+	pt, err := open(c.key, data)
+	return pt, err == nil
+}
+
+func (c *Client) e2eWhy(ev model.ClipEvent) string {
+	if c.key == nil {
+		return "no passphrase"
+	}
+	if ev.Enc != nil && ev.Enc.KeyID != "" && ev.Enc.KeyID != c.kid {
+		return "key mismatch"
+	}
+	return "cannot decrypt"
 }
 
 func (c *Client) wsURL() string {
@@ -177,26 +216,48 @@ func (c *Client) nextSeq() uint64 {
 }
 
 func (c *Client) sendText(ctx context.Context, conn *websocket.Conn, text string, targets model.Targets) (string, error) {
-	sum := sha256.Sum256([]byte(text))
 	ev := model.ClipEvent{
 		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{"text/plain"},
-		InlineText: text, Size: int64(len(text)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
+		InlineText: text, Size: int64(len(text)), Targets: targets,
+	}
+	if c.key != nil {
+		raw, err := seal(c.key, []byte(text))
+		if err != nil {
+			return "", err
+		}
+		ev.InlineText = base64.StdEncoding.EncodeToString(raw)
+		sum := sha256.Sum256(raw)
+		ev.Sha256 = hex.EncodeToString(sum[:])
+		ev.Enc = &model.EncMeta{Alg: e2eAlg, KeyID: c.kid}
+	} else {
+		sum := sha256.Sum256([]byte(text))
+		ev.Sha256 = hex.EncodeToString(sum[:])
 	}
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
 }
 
 func (c *Client) sendBlob(ctx context.Context, conn *websocket.Conn, content []byte, mimeType, name string, targets model.Targets) (string, error) {
-	bid, err := c.putBlob(content)
+	payload := content
+	var enc *model.EncMeta
+	if c.key != nil {
+		raw, err := seal(c.key, content)
+		if err != nil {
+			return "", err
+		}
+		payload = raw
+		enc = &model.EncMeta{Alg: e2eAlg, KeyID: c.kid}
+	}
+	bid, err := c.putBlob(payload)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(content)
+	sum := sha256.Sum256(payload)
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
 	ev := model.ClipEvent{
 		ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339), Mime: []string{mimeType},
-		Name: name, BlobID: bid, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]), Targets: targets,
+		Name: name, BlobID: bid, Size: int64(len(content)), Sha256: hex.EncodeToString(sum[:]), Enc: enc, Targets: targets,
 	}
 	return ev.ID, writeMsg(ctx, conn, protocol.TypeClip, ev)
 }
@@ -345,6 +406,30 @@ func mimeOf(path string) string {
 // sendLazyClip advertises a file as on-demand (no upload) and remembers it so a
 // later blob_request from the server can be served.
 func (c *Client) sendLazyClip(ctx context.Context, conn *websocket.Conn, path string, size int64, targets model.Targets) (model.BlobID, error) {
+	if c.key != nil {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		raw, err := seal(c.key, data)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(raw)
+		hexsum := hex.EncodeToString(sum[:])
+		bid := model.BlobID("sha256:" + hexsum)
+		ctPath := filepath.Join(os.TempDir(), "copyctl-e2e-"+hexsum)
+		if err := os.WriteFile(ctPath, raw, 0o600); err != nil {
+			return "", err
+		}
+		c.holdFile(bid, ctPath)
+		ev := model.ClipEvent{
+			ID: newID(), Seq: c.nextSeq(), TS: time.Now().Format(time.RFC3339),
+			Mime: []string{mimeOf(path)}, Name: filepath.Base(path), BlobID: bid,
+			Size: size, Sha256: hexsum, OnDemand: true, Enc: &model.EncMeta{Alg: e2eAlg, KeyID: c.kid}, Targets: targets,
+		}
+		return bid, writeMsg(ctx, conn, protocol.TypeClip, ev)
+	}
 	sum, err := fileSHA256(path)
 	if err != nil {
 		return "", err

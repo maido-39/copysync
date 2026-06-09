@@ -10,10 +10,12 @@ import (
 type Config struct {
 	ServerURL  string `json:"serverUrl"`
 	ServerName string `json:"serverName"`
+	ServerID   string `json:"serverId"` // used as the E2E key-derivation salt
 	DeviceID   string `json:"deviceId"`
 	DeviceName string `json:"deviceName"`
 	Token      string `json:"token"`   // bearer token (secret)
 	Pin        string `json:"spkiPin"` // server SPKI SHA-256, base64
+	E2EPass    string `json:"e2ePass"` // optional E2E passphrase (secret); empty = no E2E
 }
 
 func defaultConfigPath() string {
