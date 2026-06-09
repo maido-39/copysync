@@ -1,0 +1,23 @@
+[package]
+name = "copysync-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CopySync desktop client (Tauri + webkit)."
+default-run = "copysync-desktop"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+copysync-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

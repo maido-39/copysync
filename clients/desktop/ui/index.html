@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CopySync</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">CopySync</div>
+      <div id="conn" class="pill off">연결 끊김</div>
+    </header>
+
+    <nav id="tabs">
+      <button data-tab="status" class="active">상태</button>
+      <button data-tab="history">기록</button>
+      <button data-tab="pair">페어링</button>
+      <button data-tab="settings">설정</button>
+    </nav>
+
+    <main>
+      <!-- 상태 -->
+      <section id="status" class="tab active">
+        <div class="card">
+          <h2>상태</h2>
+          <dl class="kv">
+            <dt>서버</dt><dd id="s-server">—</dd>
+            <dt>이 기기</dt><dd id="s-device">—</dd>
+            <dt>연결</dt><dd id="s-conn">—</dd>
+            <dt>E2E 암호화</dt><dd id="s-e2e">—</dd>
+          </dl>
+        </div>
+        <div class="card">
+          <h2>보내기</h2>
+          <textarea id="send-text" rows="3" placeholder="동기화할 텍스트를 입력하거나 그냥 어디서든 복사하세요"></textarea>
+          <div class="row">
+            <button id="send-btn" class="primary">텍스트 보내기</button>
+            <button id="file-btn">파일 보내기…</button>
+          </div>
+          <p class="hint">아무 앱에서나 텍스트·이미지를 복사하면 자동으로 동기화됩니다. 큰 파일은 받는 쪽이 요청할 때 전송됩니다.</p>
+        </div>
+
+        <div class="card">
+          <h2>전송 대상</h2>
+          <label class="radio"><input type="radio" name="route" value="all" checked /> 모든 기기 (브로드캐스트)</label>
+          <label class="radio"><input type="radio" name="route" value="some" /> 선택한 기기만</label>
+          <div id="dev-list" class="devlist" hidden></div>
+          <p class="hint">기본은 전체 브로드캐스트입니다. 특정 기기를 선택하면 그 기기에만 전송합니다.</p>
+        </div>
+      </section>
+
+      <!-- 기록 -->
+      <section id="history" class="tab">
+        <div class="searchbar">
+          <input id="search" type="search" placeholder="기록 검색…" />
+          <button id="refresh">새로고침</button>
+        </div>
+        <div id="hist-list" class="list"></div>
+      </section>
+
+      <!-- 페어링 -->
+      <section id="pair" class="tab">
+        <div class="card">
+          <h2>기기 페어링</h2>
+          <p class="hint">서버 관리자 화면에서 OTP를 만들어 입력하세요. 핀을 비우면 최초 접속 시 자동 신뢰합니다.</p>
+          <label>서버 주소<input id="p-server" placeholder="https://192.168.0.10:8443" /></label>
+          <label>OTP<input id="p-otp" placeholder="8자리 코드" /></label>
+          <label>기기 이름<input id="p-name" value="desktop" /></label>
+          <label>SPKI 핀 (선택)<input id="p-pin" placeholder="base64" /></label>
+          <label>E2E 암호문 (선택)<input id="p-e2e" type="password" placeholder="모든 기기에서 동일하게" /></label>
+          <button id="pair-btn" class="primary">페어링</button>
+          <p id="pair-msg" class="msg"></p>
+        </div>
+      </section>
+
+      <!-- 설정 -->
+      <section id="settings" class="tab">
+        <div class="card">
+          <h2>설정</h2>
+          <dl class="kv">
+            <dt>서버 ID</dt><dd id="set-sid">—</dd>
+          </dl>
+          <p class="hint">설정은 페어링 시 저장됩니다. E2E 암호문을 바꾸려면 다시 페어링하세요.</p>
+        </div>
+        <div class="card">
+          <h2>정보</h2>
+          <p class="hint">CopySync 데스크톱 · Tauri + webkit · 프로토콜 v1<br/>
+          클립보드는 종단간(E2E) 암호화로 동기화되며 서버는 내용을 볼 수 없습니다.</p>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

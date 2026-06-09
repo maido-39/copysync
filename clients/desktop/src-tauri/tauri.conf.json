@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CopySync",
+  "version": "0.1.0",
+  "identifier": "com.copysync.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "CopySync",
+        "width": 920,
+        "height": 660,
+        "minWidth": 720,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "publisher": "CopySync",
+    "category": "Utility",
+    "shortDescription": "Real-time LAN clipboard sync",
+    "longDescription": "CopySync keeps your clipboard in sync across your devices on the LAN, end-to-end encrypted. The server never sees your content.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

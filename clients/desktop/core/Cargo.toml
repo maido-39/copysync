@@ -1,0 +1,37 @@
+[package]
+name = "copysync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared CopySync client logic: protocol, pinned TLS, WS, blob, E2E, history."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+futures-util = "0.3"
+rustls = "0.23"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+x509-parser = "0.16"
+
+argon2 = "0.5"
+aes-gcm = { version = "0.10", features = ["aes", "std"] }
+rand = "0.8"
+time = { version = "0.3", features = ["formatting"] }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "interop"

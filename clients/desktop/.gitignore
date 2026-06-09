@@ -1,0 +1,9 @@
+# Rust build output (hundreds of MB — never commit)
+/target
+
+# Tauri codegen output
+/src-tauri/gen
+
+# Local runtime state
+*.db
+config.json

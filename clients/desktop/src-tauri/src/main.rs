@@ -1,0 +1,770 @@
+// CopySync desktop client (Tauri + webkit/WebView2). The UI is a thin
+// no-framework SPA; all protocol/crypto/networking lives in copysync-core, the
+// same crate that is headlessly interop-tested against the Go server and copyctl.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use copysync_core::clipboard::{self, Image};
+use copysync_core::history::{Entry, History};
+use copysync_core::protocol::{
+    self, BlobRequest, ClipEvent, DeviceInfo, EncMeta, Presence, Roster, Targets,
+};
+use copysync_core::{blob, e2e, pairing, pinning, ws, Config};
+
+/// Commands flowing into the sync actor.
+enum Cmd {
+    LocalText(String),   // OS-clipboard text change (echo-guarded)
+    LocalImage(Image),   // OS-clipboard image change (echo-guarded)
+    SendText(String),    // explicit text send from the UI
+    SendFile(String),    // explicit file send from the UI (path)
+}
+
+/// A blob held for on-demand upload when the server asks (`blob_request`).
+enum Hold {
+    Sealed(Vec<u8>), // E2E: exact ciphertext (sha must match what was advertised)
+    Plain(PathBuf),  // plaintext: re-read on demand
+}
+
+#[derive(Clone, Serialize, Default)]
+struct Status {
+    paired: bool,
+    connected: bool,
+    server_name: String,
+    device_name: String,
+    server_id: String,
+    e2e: bool,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct RosterDevice {
+    id: String,
+    name: String,
+    online: bool,
+}
+
+struct AppState {
+    tx: Mutex<Option<UnboundedSender<Cmd>>>,
+    hist: Arc<Mutex<History>>,
+    status: Arc<Mutex<Status>>,
+    roster: Arc<Mutex<Vec<RosterDevice>>>,
+    targets: Arc<Mutex<Targets>>,
+    cfg_path: PathBuf,
+    downloads: PathBuf,
+}
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+fn remember(q: &mut VecDeque<String>, sha: String) {
+    if q.iter().any(|x| x == &sha) {
+        return;
+    }
+    if q.len() >= 64 {
+        q.pop_front();
+    }
+    q.push_back(sha);
+}
+
+fn seen(q: &VecDeque<String>, sha: &str) -> bool {
+    q.iter().any(|x| x == sha)
+}
+
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+fn preview(s: &str) -> String {
+    let t: String = s.chars().take(80).collect();
+    if s.chars().count() > 80 {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn mime_of(path: &str) -> String {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+// ----------------------------------------------------------------- commands
+
+#[tauri::command]
+fn get_status(state: State<'_, AppState>) -> Status {
+    state.status.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_roster(state: State<'_, AppState>) -> Vec<RosterDevice> {
+    state.roster.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn set_targets(state: State<'_, AppState>, ids: Vec<String>) {
+    let t = if ids.is_empty() {
+        Targets::All
+    } else {
+        Targets::Devices(ids)
+    };
+    *state.targets.lock().unwrap() = t;
+}
+
+#[tauri::command]
+fn get_history(state: State<'_, AppState>, query: Option<String>) -> Result<Vec<Entry>, String> {
+    let h = state.hist.lock().unwrap();
+    match query {
+        Some(q) if !q.trim().is_empty() => h.search(q.trim(), 200),
+        _ => h.recent(200),
+    }
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn send_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    enqueue(&state, Cmd::SendText(text))
+}
+
+#[tauri::command]
+fn send_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    enqueue(&state, Cmd::SendFile(path))
+}
+
+fn enqueue(state: &State<'_, AppState>, cmd: Cmd) -> Result<(), String> {
+    match state.tx.lock().unwrap().as_ref() {
+        Some(tx) => tx.send(cmd).map_err(|_| "sync not running".into()),
+        None => Err("not paired".into()),
+    }
+}
+
+#[tauri::command]
+async fn pair(
+    app: AppHandle,
+    server: String,
+    otp: String,
+    name: String,
+    pin: String,
+    e2e_pass: String,
+) -> Result<Status, String> {
+    let cfg = pairing::claim(&server, &pin, &otp, &name, &e2e_pass)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = app.state::<AppState>().cfg_path.clone();
+    cfg.save(&path).map_err(|e| e.to_string())?;
+    start_sync(&app, cfg);
+    Ok(app.state::<AppState>().status.lock().unwrap().clone())
+}
+
+// ----------------------------------------------------------------- sync wiring
+
+fn start_sync(app: &AppHandle, cfg: Config) {
+    let state = app.state::<AppState>();
+    {
+        let mut s = state.status.lock().unwrap();
+        s.paired = true;
+        s.server_name = cfg.server_name.clone();
+        s.device_name = cfg.device_name.clone();
+        s.server_id = cfg.server_id.clone();
+        s.e2e = !cfg.e2e_pass.is_empty();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+    *state.tx.lock().unwrap() = Some(tx.clone());
+
+    std::thread::spawn(move || clipboard_loop(tx));
+
+    let app2 = app.clone();
+    let hist = state.hist.clone();
+    let status = state.status.clone();
+    let roster = state.roster.clone();
+    let targets = state.targets.clone();
+    let downloads = state.downloads.clone();
+    tauri::async_runtime::spawn(async move {
+        sync_actor(app2, cfg, rx, hist, status, roster, targets, downloads).await;
+    });
+}
+
+fn clipboard_loop(tx: UnboundedSender<Cmd>) {
+    let mut last_text = String::new();
+    let mut last_img = String::new();
+    loop {
+        match clipboard::get_text() {
+            Ok(t) if !t.is_empty() => {
+                if t != last_text {
+                    last_text = t.clone();
+                    last_img.clear();
+                    let _ = tx.send(Cmd::LocalText(t));
+                }
+            }
+            _ => {
+                if let Ok(img) = clipboard::get_image() {
+                    let h = sha_hex(&img.rgba);
+                    if h != last_img {
+                        last_img = h;
+                        last_text.clear();
+                        let _ = tx.send(Cmd::LocalImage(img));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        if tx.is_closed() {
+            return;
+        }
+    }
+}
+
+fn current_targets(t: &Arc<Mutex<Targets>>) -> Targets {
+    t.lock().unwrap().clone()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_actor(
+    app: AppHandle,
+    cfg: Config,
+    mut rx: UnboundedReceiver<Cmd>,
+    hist: Arc<Mutex<History>>,
+    status: Arc<Mutex<Status>>,
+    roster: Arc<Mutex<Vec<RosterDevice>>>,
+    targets: Arc<Mutex<Targets>>,
+    downloads: PathBuf,
+) {
+    let pin = match cfg.pin_bytes() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad pin: {e}");
+            return;
+        }
+    };
+    let key = cfg.e2e_key();
+    let http = pinning::http_client(pin);
+    let pull = blob::pull_client(pin);
+    let mut seq: u64 = 0;
+    let mut recent_text: VecDeque<String> = VecDeque::new();
+    let mut recent_img: VecDeque<String> = VecDeque::new();
+    let mut on_demand: HashMap<String, Hold> = HashMap::new();
+
+    loop {
+        match ws::connect(&cfg.server_url, pin, &cfg.device_id, &cfg.device_name, &cfg.token).await {
+            Ok((mut sock, hello)) => {
+                let threshold = hello.on_demand_threshold;
+                set_roster(&app, &roster, hello.roster.clone());
+                set_connected(&app, &status, true);
+                loop {
+                    tokio::select! {
+                        cmd = rx.recv() => match cmd {
+                            None => return,
+                            Some(Cmd::LocalText(t)) => {
+                                let sha = sha_hex(t.as_bytes());
+                                if seen(&recent_text, &sha) { continue; }
+                                remember(&mut recent_text, sha);
+                                if !send_text_clip(&mut sock, &mut seq, &t, &key, current_targets(&targets), &app, &hist).await { break; }
+                            }
+                            Some(Cmd::SendText(t)) => {
+                                remember(&mut recent_text, sha_hex(t.as_bytes()));
+                                if !send_text_clip(&mut sock, &mut seq, &t, &key, current_targets(&targets), &app, &hist).await { break; }
+                            }
+                            Some(Cmd::LocalImage(img)) => {
+                                let sha = sha_hex(&img.rgba);
+                                if seen(&recent_img, &sha) { continue; }
+                                remember(&mut recent_img, sha);
+                                if !send_image_clip(&mut sock, &mut seq, &img, &key, current_targets(&targets), &app, &hist, &http, &cfg).await { break; }
+                            }
+                            Some(Cmd::SendFile(p)) => {
+                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
+                            }
+                        },
+                        frame = ws::recv(&mut sock) => match frame {
+                            Ok(Some((t, d))) => {
+                                handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &on_demand).await;
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                set_connected(&app, &status, false);
+            }
+            Err(e) => eprintln!("connect failed: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn set_connected(app: &AppHandle, status: &Arc<Mutex<Status>>, on: bool) {
+    let snapshot = {
+        let mut s = status.lock().unwrap();
+        s.connected = on;
+        s.clone()
+    };
+    let _ = app.emit("status", snapshot);
+}
+
+fn set_roster(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, devices: Vec<DeviceInfo>) {
+    let list: Vec<RosterDevice> = devices
+        .iter()
+        .map(|d| RosterDevice {
+            id: d.device.id.clone(),
+            name: d.device.name.clone(),
+            online: d.online,
+        })
+        .collect();
+    *roster.lock().unwrap() = list.clone();
+    let _ = app.emit("roster", list);
+}
+
+fn apply_presence(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, p: Presence) {
+    let snapshot = {
+        let mut r = roster.lock().unwrap();
+        if let Some(d) = r.iter_mut().find(|x| x.id == p.device.id) {
+            d.online = p.online;
+            d.name = p.device.name.clone();
+        } else {
+            r.push(RosterDevice {
+                id: p.device.id.clone(),
+                name: p.device.name.clone(),
+                online: p.online,
+            });
+        }
+        r.clone()
+    };
+    let _ = app.emit("roster", snapshot);
+}
+
+// ----------------------------------------------------------------- outbound
+
+async fn send_text_clip(
+    sock: &mut ws::Ws,
+    seq: &mut u64,
+    text: &str,
+    key: &Option<(Vec<u8>, String)>,
+    targets: Targets,
+    app: &AppHandle,
+    hist: &Arc<Mutex<History>>,
+) -> bool {
+    *seq += 1;
+    let ev = match ClipEvent::new_text(
+        *seq,
+        text,
+        key.as_ref().map(|(k, i)| (k.as_slice(), i.as_str())),
+        targets,
+    ) {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
+        return false;
+    }
+    add_history(hist, &ev.ts, "text", "me", "out", text, "text/plain", text.len() as i64, "", "");
+    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"text","text":text}));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_image_clip(
+    sock: &mut ws::Ws,
+    seq: &mut u64,
+    img: &Image,
+    key: &Option<(Vec<u8>, String)>,
+    targets: Targets,
+    app: &AppHandle,
+    hist: &Arc<Mutex<History>>,
+    http: &reqwest::Client,
+    cfg: &Config,
+) -> bool {
+    let png = match clipboard::encode_png(img) {
+        Ok(p) => p,
+        Err(_) => return true,
+    };
+    let payload = match key {
+        Some((k, _)) => match e2e::seal(k, &png) {
+            Ok(c) => c,
+            Err(_) => return true,
+        },
+        None => png.clone(),
+    };
+    let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("image blob upload failed: {e}");
+            return true; // blob channel issue, not the control channel
+        }
+    };
+    *seq += 1;
+    let ev = ClipEvent {
+        id: protocol::new_id(),
+        seq: *seq,
+        ts: protocol::now_ts(),
+        mime: vec!["image/png".into()],
+        name: "clipboard.png".into(),
+        blob_id: bid,
+        size: png.len() as i64,
+        sha256: sha_hex(&payload),
+        targets,
+        enc: key.as_ref().map(|(_, kid)| EncMeta {
+            alg: e2e::ALG.into(),
+            key_id: kid.clone(),
+            nonce: String::new(),
+        }),
+        ..Default::default()
+    };
+    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
+        return false;
+    }
+    add_history(hist, &ev.ts, "image", "me", "out", "(클립보드 이미지)", "image/png", png.len() as i64, &ev.blob_id, "clipboard.png");
+    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"image","name":"clipboard.png","size":png.len()}));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_file_clip(
+    sock: &mut ws::Ws,
+    seq: &mut u64,
+    path: &str,
+    key: &Option<(Vec<u8>, String)>,
+    targets: Targets,
+    threshold: i64,
+    on_demand: &mut HashMap<String, Hold>,
+    app: &AppHandle,
+    hist: &Arc<Mutex<History>>,
+    http: &reqwest::Client,
+    cfg: &Config,
+) -> bool {
+    let p = Path::new(path);
+    let meta = match std::fs::metadata(p) {
+        Ok(m) => m,
+        Err(e) => {
+            notify(app, "CopySync", &format!("파일을 열 수 없습니다: {e}"));
+            return true;
+        }
+    };
+    let size = meta.len() as i64;
+    let name = file_name(path);
+    let mime = mime_of(path);
+    let kind = if mime.starts_with("image/") { "image" } else { "file" };
+
+    *seq += 1;
+    let ev = if threshold > 0 && size > threshold {
+        // On-demand: advertise now, upload when the server asks.
+        let (bid, sha) = match key {
+            Some((k, _)) => {
+                let data = match std::fs::read(p) {
+                    Ok(d) => d,
+                    Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
+                };
+                let ct = match e2e::seal(k, &data) { Ok(c) => c, Err(_) => return true };
+                let sha = sha_hex(&ct);
+                let bid = format!("sha256:{sha}");
+                on_demand.insert(bid.clone(), Hold::Sealed(ct));
+                (bid, sha)
+            }
+            None => {
+                let sha = match file_sha_hex(p) { Ok(s) => s, Err(e) => { notify(app,"CopySync",&format!("읽기 실패: {e}")); return true; } };
+                let bid = format!("sha256:{sha}");
+                on_demand.insert(bid.clone(), Hold::Plain(p.to_path_buf()));
+                (bid, sha)
+            }
+        };
+        ClipEvent {
+            id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
+            mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
+            sha256: sha, on_demand: true, targets,
+            enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
+            ..Default::default()
+        }
+    } else {
+        // Eager: upload the (encrypted) bytes immediately.
+        let data = match std::fs::read(p) {
+            Ok(d) => d,
+            Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
+        };
+        let payload = match key {
+            Some((k, _)) => match e2e::seal(k, &data) { Ok(c) => c, Err(_) => return true },
+            None => data,
+        };
+        let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
+            Ok(b) => b,
+            Err(e) => { notify(app, "CopySync", &format!("업로드 실패: {e}")); return true; }
+        };
+        ClipEvent {
+            id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
+            mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
+            sha256: sha_hex(&payload), targets,
+            enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
+            ..Default::default()
+        }
+    };
+    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
+        return false;
+    }
+    add_history(hist, &ev.ts, kind, "me", "out", &name, &mime, size, &ev.blob_id, &name);
+    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":kind,"name":name,"size":size,"onDemand":ev.on_demand}));
+    true
+}
+
+fn file_sha_hex(p: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+// ----------------------------------------------------------------- inbound
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_frame(
+    t: String,
+    d: serde_json::Value,
+    key: &Option<(Vec<u8>, String)>,
+    pull: &reqwest::Client,
+    http: &reqwest::Client,
+    cfg: &Config,
+    app: &AppHandle,
+    hist: &Arc<Mutex<History>>,
+    downloads: &Path,
+    roster: &Arc<Mutex<Vec<RosterDevice>>>,
+    recent_text: &mut VecDeque<String>,
+    recent_img: &mut VecDeque<String>,
+    on_demand: &HashMap<String, Hold>,
+) {
+    match t.as_str() {
+        protocol::T_CLIP => {
+            if let Ok(ev) = serde_json::from_value::<ClipEvent>(d) {
+                handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img).await;
+            }
+        }
+        protocol::T_BLOB_REQUEST => {
+            if let Ok(br) = serde_json::from_value::<BlobRequest>(d) {
+                if let Some(hold) = on_demand.get(&br.id) {
+                    let bytes = match hold {
+                        Hold::Sealed(b) => b.clone(),
+                        Hold::Plain(p) => match std::fs::read(p) {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        },
+                    };
+                    let _ = blob::put_blob(http, &cfg.server_url, &cfg.token, bytes).await;
+                }
+            }
+        }
+        protocol::T_ROSTER => {
+            if let Ok(r) = serde_json::from_value::<Roster>(d) {
+                set_roster(app, roster, r.devices);
+            }
+        }
+        protocol::T_PRESENCE => {
+            if let Ok(p) = serde_json::from_value::<Presence>(d) {
+                apply_presence(app, roster, p);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming(
+    ev: ClipEvent,
+    key: &Option<(Vec<u8>, String)>,
+    pull: &reqwest::Client,
+    cfg: &Config,
+    app: &AppHandle,
+    hist: &Arc<Mutex<History>>,
+    downloads: &Path,
+    recent_text: &mut VecDeque<String>,
+    recent_img: &mut VecDeque<String>,
+) {
+    if ev.is_blob() {
+        let data = match blob::get_blob(pull, &cfg.server_url, &cfg.token, &ev.blob_id).await {
+            Ok(d) => d,
+            Err(e) => {
+                notify(app, "CopySync", &format!("파일 받기 실패: {e}"));
+                return;
+            }
+        };
+        let plain = match (&ev.enc, key) {
+            (Some(_), Some((k, _))) => match e2e::open(k, &data) {
+                Ok(p) => p,
+                Err(_) => {
+                    notify(app, "CopySync", "받은 파일을 복호화할 수 없습니다 (암호문?)");
+                    return;
+                }
+            },
+            (Some(_), None) => {
+                notify(app, "CopySync", "암호화된 파일을 받았지만 암호문이 설정되지 않았습니다");
+                return;
+            }
+            (None, _) => data,
+        };
+        let _ = std::fs::create_dir_all(downloads);
+        let name = if ev.name.is_empty() {
+            ev.blob_id.trim_start_matches("sha256:").to_string()
+        } else {
+            ev.name.clone()
+        };
+        let path = downloads.join(&name);
+        let _ = std::fs::write(&path, &plain);
+        let is_image = ev.mime.first().map(|m| m.starts_with("image/")).unwrap_or(false);
+        if is_image {
+            if let Ok(img) = clipboard::decode_image(&plain) {
+                remember(recent_img, sha_hex(&img.rgba));
+                let _ = clipboard::set_image(&img);
+            }
+            notify(app, "CopySync", &format!("이미지를 받았습니다 · {}", human(plain.len())));
+        } else {
+            notify(app, "CopySync", &format!("파일: {name} · {}", human(plain.len())));
+        }
+        add_history(hist, &ev.ts, ev.kind(), &ev.origin_device, "in", &path.to_string_lossy(),
+            ev.mime.first().map(|s| s.as_str()).unwrap_or(""), plain.len() as i64, &ev.blob_id, &name);
+        let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":ev.kind(),"name":name,"size":plain.len(),"path":path.to_string_lossy()}));
+        return;
+    }
+
+    // Text.
+    let text = match (&ev.enc, key) {
+        (Some(_), Some((k, _))) => {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let raw = match STANDARD.decode(&ev.inline_text) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            match e2e::open(k, &raw) {
+                Ok(p) => String::from_utf8_lossy(&p).to_string(),
+                Err(_) => {
+                    notify(app, "CopySync", "받은 텍스트를 복호화할 수 없습니다 (암호문?)");
+                    return;
+                }
+            }
+        }
+        (Some(_), None) => {
+            notify(app, "CopySync", "암호화된 텍스트를 받았지만 암호문이 설정되지 않았습니다");
+            return;
+        }
+        (None, _) => ev.inline_text.clone(),
+    };
+    remember(recent_text, sha_hex(text.as_bytes()));
+    let _ = clipboard::set_text(&text);
+    add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
+    notify(app, "CopySync", &preview(&text));
+    let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":"text","text":text,"origin":ev.origin_device}));
+}
+
+fn human(n: usize) -> String {
+    let units = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", units[i])
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_history(
+    hist: &Arc<Mutex<History>>,
+    ts: &str,
+    kind: &str,
+    origin: &str,
+    dir: &str,
+    preview: &str,
+    mime: &str,
+    size: i64,
+    blob_id: &str,
+    name: &str,
+) {
+    if let Ok(h) = hist.lock() {
+        let _ = h.add(ts, kind, origin, dir, preview, mime, size, blob_id, name);
+    }
+}
+
+// ----------------------------------------------------------------- entrypoint
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            let dir = app
+                .path()
+                .app_config_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("copysync"));
+            let data = app.path().app_data_dir().unwrap_or_else(|_| dir.clone());
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&data);
+            let hist = History::open(data.join("history.db"))
+                .map_err(|e| format!("open history: {e}"))?;
+            let state = AppState {
+                tx: Mutex::new(None),
+                hist: Arc::new(Mutex::new(hist)),
+                status: Arc::new(Mutex::new(Status::default())),
+                roster: Arc::new(Mutex::new(Vec::new())),
+                targets: Arc::new(Mutex::new(Targets::All)),
+                cfg_path: dir.join("config.json"),
+                downloads: data.join("downloads"),
+            };
+            let cfg_path = state.cfg_path.clone();
+            app.manage(state);
+            if let Ok(cfg) = Config::load(&cfg_path) {
+                start_sync(app.handle(), cfg);
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            get_roster,
+            set_targets,
+            get_history,
+            send_text,
+            send_file,
+            pair
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running CopySync");
+}
