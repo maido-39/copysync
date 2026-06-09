@@ -624,12 +624,17 @@ private fun relTime(ts: Long): String {
 private fun rememberThumb(ctx: Context, e: ClipEntity): ImageBitmap? {
     val isVideo = e.mime.startsWith("video/")
     val sha = e.blobId.removePrefix("sha256:")
+    val thumbPath = if (sha.isNotEmpty()) File(File(ctx.cacheDir, "clip-thumb"), sha).absolutePath else null
     val cachePath = if (sha.isNotEmpty()) File(File(ctx.cacheDir, "clip-src"), sha).absolutePath else null
     val state = produceState<ImageBitmap?>(initialValue = null, key1 = sha, key2 = e.localPath ?: "") {
         value = withContext(Dispatchers.IO) {
-            if (isVideo) e.localPath?.let { videoFrameUri(ctx, it) }
-            // Prefer the local decrypted cache; fall back to the downloaded file (SAF URI).
-            else cachePath?.let { decodeThumb(it) } ?: e.localPath?.let { decodeThumbUri(ctx, it) }
+            // 1) dedicated preview cache (items we sent + decoded video frames),
+            // 2) decrypted on-demand cache (items we received),
+            // 3) the downloaded SAF file.
+            thumbPath?.let { decodeThumb(it) }
+                ?: cachePath?.let { decodeThumb(it) }
+                ?: if (isVideo) e.localPath?.let { videoFrameUri(ctx, it) }
+                else e.localPath?.let { decodeThumbUri(ctx, it) }
         }
     }
     return state.value

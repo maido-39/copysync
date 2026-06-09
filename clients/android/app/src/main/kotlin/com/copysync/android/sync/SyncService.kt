@@ -196,11 +196,42 @@ class SyncService : Service() {
                         val kind = if (c.mime.startsWith("image/")) "image" else "file"
                         val dev = settings.deviceId.orEmpty()
                         val k = key
+                        // Keep a local PLAINTEXT preview for the history thumbnail, addressed by the
+                        // advertised blobId. clip-src can't serve this: it holds ciphertext (E2E
+                        // on-demand) or is deleted right after upload, so previews of what we just
+                        // sent would always come up empty.
+                        fun stashThumb(blobId: String) {
+                            runCatching {
+                                val td = File(cacheDir, "clip-thumb").apply { mkdirs() }
+                                val dst = File(td, blobId.removePrefix("sha256:"))
+                                when {
+                                    kind == "image" -> c.file.copyTo(dst, overwrite = true)
+                                    c.mime.startsWith("video/") -> {
+                                        val mmr = android.media.MediaMetadataRetriever()
+                                        try {
+                                            mmr.setDataSource(c.file.absolutePath)
+                                            mmr.getFrameAtTime(0)?.let { bmp ->
+                                                java.io.FileOutputStream(dst).use {
+                                                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, it)
+                                                }
+                                            }
+                                        } finally { mmr.release() }
+                                    }
+                                    else -> return@runCatching
+                                }
+                                val files = td.listFiles()?.sortedBy { it.lastModified() } ?: return@runCatching
+                                var total = files.sumOf { it.length() }; var i = 0
+                                while (total > 120L * 1024 * 1024 && i < files.size) {
+                                    total -= files[i].length(); files[i].delete(); i++
+                                }
+                            }
+                        }
                         if (k != null) {
                             // E2E: seal to ciphertext; address + advertise by the ciphertext hash.
                             val ct = E2eCrypto.seal(k, c.file.readBytes())
                             val ctSha = sha256Hex(ct)
                             val blobId = "sha256:$ctSha"
+                            stashThumb(blobId)
                             val em = EncMeta("aes-256-gcm", kid)
                             if (threshold > 0 && c.size > threshold) {
                                 runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
@@ -215,6 +246,7 @@ class SyncService : Service() {
                             DebugLog.i("sent e2e ${c.name} ${c.size} bytes ($blobId)")
                         } else {
                             val blobId = "sha256:" + c.sha
+                            stashThumb(blobId)
                             if (threshold > 0 && c.size > threshold) {
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
