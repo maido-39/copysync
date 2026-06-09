@@ -15,9 +15,11 @@ var (
 	bucketSettings    = []byte("settings")
 	bucketQueues      = []byte("queues")
 	bucketBlobs       = []byte("blobs")
+	bucketActivity    = []byte("activity") // per-day copy-activity stats (count + bytes)
 )
 
 var allBuckets = [][]byte{
 	bucketMeta, bucketAdmin, bucketSessions, bucketDevices, bucketDeviceNames,
 	bucketTokens, bucketTokenIndex, bucketPairing, bucketSettings, bucketQueues, bucketBlobs,
+	bucketActivity,
 }

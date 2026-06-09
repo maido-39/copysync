@@ -406,6 +406,22 @@
   function sectionMonitor() {
     var m = state.main;
     m.appendChild(pageHead("모니터링", "들어오는 클립 실시간 — E2E 클립은 내용이 보이지 않습니다."));
+    var heat = el("div", { class: "card" }, el("h2", null, "복사 잔디 (최근 17주)"));
+    m.appendChild(heat);
+    api("GET", "/admin/monitor/activity").then(function (a) {
+      var grid = el("div", { class: "heat" });
+      (a.days || []).forEach(function (d) {
+        var fc = a.maxCount ? d.count / a.maxCount : 0; // frequency
+        var fb = a.maxBytes ? d.bytes / a.maxBytes : 0; // volume
+        var cell = el("div", { class: "heat-cell", title: d.date + " · " + d.count + "회 · " + fmtBytes(d.bytes) });
+        cell.style.background = d.count
+          ? "rgb(" + Math.round(18 + fb * 40) + "," + Math.round(55 + fc * 175) + "," + Math.round(55 + fb * 175) + ")"
+          : "var(--border)";
+        grid.appendChild(cell);
+      });
+      heat.appendChild(grid);
+      heat.appendChild(el("p", { class: "muted small" }, "🟩 초록 = 빈도 · 🟦 파랑 = 용량 (블렌드)"));
+    }).catch(function () {});
     var card = el("div", { class: "card" });
     var listEl = el("div", { class: "mon-list" }, el("p", { class: "muted" }, "대기 중… 클립이 들어오면 여기에 표시됩니다."));
     card.appendChild(listEl);

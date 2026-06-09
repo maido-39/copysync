@@ -25,6 +25,7 @@ type Store interface {
 	Enqueue(model.DeviceID, model.QueueItem, int) (int, error)
 	DrainQueue(model.DeviceID) ([]model.QueueItem, error)
 	GetSettings() (config.RuntimeSettings, error)
+	RecordActivity(time.Time, int64) error
 }
 
 // Clock returns the current time (overridable in tests).
@@ -236,6 +237,7 @@ func (h *Hub) handleUnregister(c *Client) {
 func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	settings, _ := h.store.GetSettings()
 	h.publishMonitor(ev)
+	_ = h.store.RecordActivity(h.now(), ev.Size)
 	targets := h.resolveTargets(ev)
 	// Remember who holds an on-demand blob so a later GET can pull it from them.
 	if ev.OnDemand && ev.BlobID != "" {

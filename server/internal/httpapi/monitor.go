@@ -56,3 +56,20 @@ func (s *Server) handleMonitorStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// handleActivity returns ~17 weeks of daily clip activity for the admin "잔디"
+// (contribution-graph) heatmap: per-day count + byte totals, plus the maxima for
+// color scaling.
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	days, _ := s.store.ActivitySince(s.now(), 119)
+	var maxC, maxB int64
+	for _, d := range days {
+		if d.Count > maxC {
+			maxC = d.Count
+		}
+		if d.Bytes > maxB {
+			maxB = d.Bytes
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"days": days, "maxCount": maxC, "maxBytes": maxB})
+}
