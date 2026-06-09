@@ -323,6 +323,9 @@
       ["onDemandThresholdBytes", "온디맨드 임계값 (KB)", "kb", "이 크기 이하 파일은 즉시 업로드, 초과 시 요청할 때만 전송."],
       ["blobStoreCapBytes", "블롭 저장소 상한 (KB)", "kb", "총 디스크 예산 초과 시 LRU로 삭제."],
     ] },
+    { title: "공유 풀", fields: [
+      ["pools", "풀 목록 (쉼표 구분)", "list", "기기는 이 풀들 중 하나에 속하며 같은 풀끼리만 동기화됩니다. 'default'는 항상 포함됩니다."],
+    ] },
     { title: "보존", fields: [
       ["queueDepthPerDevice", "오프라인 큐 깊이", "int", "오프라인 기기당 최대 보관 클립 수."],
       ["queueItemTtlSeconds", "큐 항목 TTL(초)", "int", "이보다 오래된 큐 항목은 폐기."],
@@ -357,6 +360,11 @@
             boolBox.appendChild(el("div", { class: "switch-row" },
               el("div", { class: "lbl" }, el("b", null, label), el("span", null, help)),
               el("label", { class: "toggle" }, cb, el("span", { class: "track" }))));
+          } else if (type === "list") {
+            var lhint = el("div", { class: "help" }); lhint.textContent = help;
+            var linp = el("input", { type: "text", value: (s[key] || []).join(", ") });
+            inputs[key] = { el: linp, type: type };
+            fg.appendChild(el("div", null, el("label", null, label), linp, lhint));
           } else {
             var hint = el("div", { class: "help" });
             var initVal = type === "kb" ? Math.round((s[key] || 0) / 1024) : s[key];
@@ -380,6 +388,7 @@
           var it = inputs[k];
           payload[k] = it.type === "bool" ? it.el.checked
             : it.type === "kb" ? Math.round(Number(it.el.value) * 1024)
+            : it.type === "list" ? it.el.value.split(",").map(function (x) { return x.trim(); }).filter(Boolean)
             : Number(it.el.value);
         }
         save.disabled = true;
