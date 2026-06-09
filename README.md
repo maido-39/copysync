@@ -1,25 +1,36 @@
 # CopySync
 
 Self-hosted, cross-platform **real-time clipboard sync** over your LAN through a
-central server. Copy on one device, paste on another — text now, images/files
-next. Built for Android, Windows, and Linux.
+central server. Copy on one device, paste on another — text, images, and files,
+end-to-end encrypted. Built for Android, Windows, and Linux.
 
-> **Status:** The **server**, a headless **`copyctl`** reference client, and the
-> **Android** client (text sync) are implemented and verified — the Android app
-> was tested end-to-end against the server on an Android 16 emulator. The desktop
-> (Tauri) client and image/file sync are next — see [Roadmap](#roadmap).
+> **Status:** The **server**, the headless **`copyctl`** client, the **Android**
+> client, and the **desktop** (Tauri) client are all implemented and verified.
+> Text + images + large files (on-demand), optional **end-to-end encryption**
+> (zero-knowledge server), and **mDNS server discovery** all work and are
+> cross-checked between implementations. Android was tested end-to-end on an
+> Android 16 emulator; the desktop core is interop-tested against the server and
+> `copyctl` (E2E both ways, byte-identical file transfer, zero-knowledge relay).
+> Remaining work is Stage-3 hardening (SPAKE2 pairing, token rotation) — see
+> [Roadmap](#roadmap).
 
 ## Why
 
 - **Real-time sync** across all your devices on the local network.
 - **Clipboard queuing** — items for an offline device are held and delivered when
   it reconnects.
-- **All clipboard types** — text now; images/files (as references) next.
-- **Offline history + search** — kept locally on each client (planned).
-- **Push notifications** for clips copied on other devices (planned, client-side).
+- **All clipboard types** — text, images, and files. Files over a server-set
+  threshold are advertised **on demand**: bytes transfer only when another device
+  actually pastes/downloads them.
+- **Offline history + search** — kept locally on each client (Android, desktop,
+  and `copyctl`).
+- **Push notifications** for clips copied on other devices (client-side).
 - **Routing** — broadcast to all devices by default, or pick specific targets.
-- **Private** — self-signed TLS with certificate pinning; OTP pairing; the server
-  can be made zero-knowledge with end-to-end encryption (Stage 3).
+- **Discovery** — servers advertise over **mDNS** (`_copysync._tcp`) so clients
+  find them on the LAN without a typed IP.
+- **Private** — self-signed TLS with SPKI certificate pinning; OTP pairing; and
+  optional **end-to-end encryption** (Argon2id + AES-256-GCM) that makes the
+  server zero-knowledge — it relays ciphertext it cannot read.
 
 ## Architecture
 
@@ -38,10 +49,10 @@ search live on each client. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the
 wire contract.
 
 ```
-server/             Go relay server (this milestone)
+server/             Go relay server (WebSocket relay, blob channel, admin, mDNS)
 server/cmd/copyctl  Reference CLI client + protocol conformance harness
-clients/android/    Kotlin + Jetpack Compose client (text sync — implemented)
-clients/desktop/    Tauri v2 + Svelte desktop client (planned)
+clients/android/    Kotlin + Jetpack Compose client (implemented)
+clients/desktop/    Tauri v2 + Rust desktop client (implemented)
 docs/PROTOCOL.md    wire protocol — source of truth for all clients
 ```
 
@@ -89,12 +100,16 @@ cd server && go build -o copyctl ./cmd/copyctl
 # Pair (omit --pin to trust-on-first-use; otherwise pass the server's SPKI pin):
 ./copyctl pair --server https://192.168.1.10:8443 --otp 12345678 --name laptop-a
 
+./copyctl discover                    # find servers on the LAN via mDNS
 ./copyctl send  --text "hello"        # send one text clip
 ./copyctl send  --file ./photo.png    # send a file via the blob channel
 ./copyctl watch                       # print/save incoming clips (no clipboard needed)
 ./copyctl run                         # two-way OS clipboard sync (Wayland/X11)
 ./copyctl history --search token      # search the local clipboard log
 ```
+
+Add `--e2e-pass <phrase>` at pairing time to enable end-to-end encryption; use the
+same phrase on every device so they share the key (the server never sees it).
 
 On a desktop with `wl-clipboard` or `xclip`, `run` syncs the real OS clipboard;
 on a headless host it runs receive-only.
@@ -122,6 +137,30 @@ adb shell appops set com.copysync.android SYSTEM_ALERT_WINDOW allow
 background via a foreground service. Verified end-to-end on an Android 16 emulator:
 ADB grant works, pairing over pinned TLS succeeds, and text syncs both ways with
 on-device history. Images/files are a later stage.
+
+## Desktop client (Windows / Linux)
+
+`clients/desktop` is a Tauri v2 + Rust app. The protocol/crypto/networking live in
+the `copysync-core` library (the same logic the headless tests exercise); the
+Tauri shell adds a small GUI, a reconnecting background sync actor, and OS
+clipboard mirroring.
+
+```bash
+cd clients/desktop
+cargo build -p copysync-desktop      # Linux needs webkit2gtk-4.1 + libsoup-3.0
+cargo run   -p copysync-desktop      # pair from the 페어링 tab, then it auto-syncs
+```
+
+**Windows** uses the same crate (WebView2 + the Windows clipboard — no GTK). Build
+native installers with `cargo tauri build` (→ `.msi` + NSIS `.exe`); CI does this
+on a `v*` tag (`.github/workflows/desktop.yml`). The whole client (core + GUI)
+also cross-compiles from Linux to `x86_64-pc-windows-gnu` as a portability check
+(`clients/desktop/cross-windows.sh`).
+
+The core is interop-tested headlessly against the live server and `copyctl` — E2E
+text both directions, byte-identical encrypted file transfer, and a zero-knowledge
+server that stores only ciphertext (`clients/desktop/verify_interop.sh`). See
+[`clients/desktop/README.md`](clients/desktop/README.md) for the toolchain.
 
 ## Pairing a device
 
@@ -157,16 +196,20 @@ caps, offline queue depth & TTL, blob TTL, session/OTP TTLs, and the E2E toggle.
 - Device auth via bearer tokens (only the HMAC is stored server-side).
 - Admin: bcrypt password, forced first-run change, HttpOnly/Secure/SameSite
   cookies, CSRF header on mutations, rate-limited login & pairing.
-- End-to-end encryption (zero-knowledge server) and SPAKE2 pairing are planned
-  for Stage 3.
+- **End-to-end encryption** (optional, opt-in per device-group via a shared
+  passphrase): Argon2id KDF + AES-256-GCM, applied client-side so the server sees
+  only ciphertext and metadata — a zero-knowledge relay. Implemented and verified
+  byte-for-byte across the Go, Android, and Rust clients.
+- SPAKE2 pairing (removing trust-on-first-use) and token rotation are planned for
+  Stage 3.
 
 ## Roadmap
 
 | Stage | Server | Desktop | Android |
 |---|---|---|---|
-| **S1 (now)** | TLS+pin, admin, OTP pairing, registry, **text relay**, presence, offline queue, Docker | text sync, history, pairing | background capture, text sync, FGS |
-| **S2** | **blob channel** (images/files), GC/retention | images/files, routing UI | images/files, QR, Shizuku |
-| **S3** | E2E, SPAKE2 pairing | E2E, keyring | E2E, Keystore |
+| **S1** ✅ | TLS+pin, admin, OTP pairing, registry, text relay, presence, offline queue, Docker | text sync, history, pairing | background capture, text sync, FGS |
+| **S2** ✅ | blob channel (images/files), on-demand pull, GC/retention, mDNS | images/files, history search, mirroring | images/files, on-demand, share-target, history UI, mDNS |
+| **S3** | E2E ✅ · SPAKE2 pairing · token rotation | E2E ✅ · keyring | E2E ✅ · Keystore · sensitive-content + auto-clear ✅ |
 
 ## License
 
