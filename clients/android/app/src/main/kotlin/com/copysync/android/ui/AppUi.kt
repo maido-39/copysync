@@ -329,7 +329,7 @@ private fun HistoryCard(e: ClipEntity) {
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
-                val thumb = if (e.kind == "image") rememberThumb(ctx, e) else null
+                val thumb = if (e.kind == "image" || e.mime.startsWith("video/")) rememberThumb(ctx, e) else null
                 if (thumb != null) {
                     Image(
                         thumb, contentDescription = null,
@@ -555,12 +555,14 @@ private fun relTime(ts: Long): String {
 
 @Composable
 private fun rememberThumb(ctx: Context, e: ClipEntity): ImageBitmap? {
+    val isVideo = e.mime.startsWith("video/")
     val sha = e.blobId.removePrefix("sha256:")
     val cachePath = if (sha.isNotEmpty()) File(File(ctx.cacheDir, "clip-src"), sha).absolutePath else null
     val state = produceState<ImageBitmap?>(initialValue = null, key1 = sha, key2 = e.localPath ?: "") {
         value = withContext(Dispatchers.IO) {
+            if (isVideo) e.localPath?.let { videoFrameUri(ctx, it) }
             // Prefer the local decrypted cache; fall back to the downloaded file (SAF URI).
-            cachePath?.let { decodeThumb(it) } ?: e.localPath?.let { decodeThumbUri(ctx, it) }
+            else cachePath?.let { decodeThumb(it) } ?: e.localPath?.let { decodeThumbUri(ctx, it) }
         }
     }
     return state.value
@@ -588,6 +590,17 @@ private fun decodeThumbUri(ctx: Context, uriStr: String, maxPx: Int = 256): Imag
     while (bounds.outWidth / sample > maxPx || bounds.outHeight / sample > maxPx) sample *= 2
     val opts = BitmapFactory.Options().apply { inSampleSize = sample }
     ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }?.asImageBitmap()
+}.getOrNull()
+
+/** A representative frame from a downloaded video, for history previews. */
+private fun videoFrameUri(ctx: Context, uriStr: String): ImageBitmap? = runCatching {
+    val mmr = android.media.MediaMetadataRetriever()
+    try {
+        mmr.setDataSource(ctx, Uri.parse(uriStr))
+        mmr.getFrameAtTime(0)?.asImageBitmap()
+    } finally {
+        mmr.release()
+    }
 }.getOrNull()
 
 /** First ~400 chars of a downloaded text file, for history previews. */

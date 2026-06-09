@@ -66,6 +66,7 @@ class SyncService : Service() {
     private var kid: String = ""
     @Volatile private var keyChecked = false
     @Volatile private var clearJob: Job? = null
+    private val PREVIEW_CAP_BYTES = 25L * 1024 * 1024 // images up to this are fetched to show a history thumbnail
     private var seq = 0L
 
     /** Build the outbound `targets` field from the user's routing selection. */
@@ -361,31 +362,41 @@ class SyncService : Service() {
                         SyncState.lastEvent.value = "↓ ${text.take(40)}"
                         Log.i("CopySync", "received text (e2e=${ev.enc != null}, readable=$readable)")
                     }
-                    ev.blobId != null && imageMime != null && !ev.onDemand -> {
+                    ev.blobId != null && imageMime != null && (!ev.onDemand || ev.size in 1L..PREVIEW_CAP_BYTES) -> {
+                        // Any image (eager, or on-demand within the cap) is fetched + decrypted +
+                        // cached locally so the history list can render a real thumbnail.
                         ensureKey()
                         var data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
                         if (data != null && ev.enc != null) {
                             val k = key
                             data = if (k != null) runCatching { E2eCrypto.open(k, data!!) }.getOrNull() else null
                         }
+                        val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
+                        val nm = ev.name ?: "image.$ext"
                         if (data != null) {
-                            val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
-                            capture?.applyInboundImage(data!!, ev.name ?: "in-${ev.id.take(8)}.$ext", settings.sensitiveMark)
-                            scheduleAutoClear(sha256Hex(data!!))
-                            runCatching { // local preview cache (decrypted bytes; device-only, for thumbnails)
-                                val dir = File(cacheDir, "clip-src").apply { mkdirs() }
-                                File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!)
+                            runCatching { // decrypted preview cache (device-only), keyed by blob sha
+                                File(File(cacheDir, "clip-src").apply { mkdirs() }, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!)
                             }
-                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data!!) }, "image", ev.blobId!!, ev.name ?: "image.$ext", data!!.size.toLong(), imageMime, enc = ev.enc != null))
-                            Notifications.notifyClip(this, ev.originDeviceId, "(image)")
+                            if (!ev.onDemand) {
+                                capture?.applyInboundImage(data!!, nm, settings.sensitiveMark)
+                                scheduleAutoClear(sha256Hex(data!!))
+                                dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data!!) }, "image", ev.blobId!!, nm, data!!.size.toLong(), imageMime, enc = ev.enc != null))
+                                Notifications.notifyClip(this, ev.originDeviceId, "(image)")
+                            } else {
+                                // on-demand: thumbnail is cached, but let the user save it explicitly
+                                dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, "image", ev.blobId!!, nm, ev.size, imageMime, enc = ev.enc != null))
+                                Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null)
+                            }
                             SyncState.lastEvent.value = "↓ image ${data!!.size / 1024}KB"
-                            Log.i("CopySync", "received image ${data!!.size} bytes (e2e=${ev.enc != null})")
+                            Log.i("CopySync", "received image ${data!!.size} bytes (onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
                         } else {
+                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, "image", ev.blobId!!, nm, ev.size, imageMime, enc = ev.enc != null))
+                            Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null)
                             Log.w("CopySync", "inbound image: fetch/decrypt failed for ${ev.blobId}")
                         }
                     }
                     ev.blobId != null -> {
-                        // File, or on-demand image → record as downloadable; user taps to fetch.
+                        // Non-image file, or a large on-demand image → record as downloadable.
                         val nm = ev.name ?: "file"
                         val kind = if (imageMime != null) "image" else "file"
                         dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
