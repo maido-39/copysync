@@ -70,6 +70,7 @@ import com.copysync.android.data.Settings
 import com.copysync.android.net.MdnsDiscovery
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.Notifications
+import com.copysync.android.sync.DebugLog
 import com.copysync.android.sync.SyncService
 import com.copysync.android.sync.SyncState
 import kotlinx.coroutines.Dispatchers
@@ -486,6 +487,43 @@ private fun DebugTab() {
             ctx.getSystemService(ClipboardManager::class.java)
                 .setPrimaryClip(ClipData.newPlainText("CopySync", "test ${System.currentTimeMillis()}"))
         }) { Text("클립보드 테스트 복사") }
+
+        val dbgOn by DebugLog.enabled.collectAsState()
+        val dbgLines by DebugLog.lines.collectAsState()
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("이벤트 기록", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    Switch(checked = dbgOn, onCheckedChange = { DebugLog.enabled.value = it })
+                }
+                Text(
+                    if (dbgOn) "모든 동기화·캡처 이벤트 기록 중 (${dbgLines.size}줄). 문제를 재현한 뒤 공유하세요."
+                    else "켜면 모든 이벤트를 기록합니다 (개발/디버깅용).",
+                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = dbgLines.isNotEmpty(), onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, dbgLines.joinToString("\n"))
+                        }
+                        ctx.startActivity(
+                            Intent.createChooser(send, "CopySync 로그 공유").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }) { Text("로그 공유") }
+                    OutlinedButton(onClick = { DebugLog.clear() }) { Text("지우기") }
+                }
+                if (dbgLines.isNotEmpty()) {
+                    SelectionContainer {
+                        Text(
+                            dbgLines.takeLast(60).joinToString("\n"),
+                            fontFamily = FontFamily.Monospace, fontSize = 10.sp,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("1회 권한 부여 (ADB 또는 Shizuku rish)", style = MaterialTheme.typography.titleSmall)

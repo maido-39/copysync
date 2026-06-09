@@ -8,6 +8,7 @@ import android.os.PersistableBundle
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
+import com.copysync.android.sync.DebugLog
 import androidx.core.content.FileProvider
 import com.copysync.android.net.sha256Hex
 import java.io.File
@@ -78,24 +79,24 @@ class ClipboardCaptureEngine(
         val now = SystemClock.elapsedRealtime()
         if (now - lastTriggerAt < DEBOUNCE_MS) return
         lastTriggerAt = now
-        Log.i("CopySync", "clipboard change trigger")
+        DebugLog.i("clipboard change trigger")
         worker.execute {
             val captured = readClip()
             if (captured == null) {
                 lastStatus = "read blocked/empty"
-                Log.i("CopySync", "capture: read blocked/empty")
+                DebugLog.i("capture: read blocked/empty")
                 return@execute
             }
             val key = captured.dedupKey()
             if (guard.seenRecently(key)) {
                 lastStatus = "echo-suppressed"
-                Log.i("CopySync", "capture: echo-suppressed")
+                DebugLog.i("capture: echo-suppressed")
                 return@execute
             }
             guard.mark(key)
             lastActivitySha = key
             lastStatus = "captured"
-            Log.i("CopySync", "capture: emitting ${captured.describe()}")
+            DebugLog.i("capture: emitting ${captured.describe()}")
             onCaptured(captured)
         }
     }
@@ -141,7 +142,7 @@ class ClipboardCaptureEngine(
             }
         }.getOrElse {
             tmp.delete()
-            Log.w("CopySync", "capture: could not read uri: ${it.message}")
+            DebugLog.w("capture: could not read uri: ${it.message}")
             return null
         }
         if (size == 0L) {

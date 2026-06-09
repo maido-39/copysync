@@ -83,7 +83,7 @@ class SyncService : Service() {
         clearJob = scope.launch {
             delay(sec * 1000L)
             capture?.clearIfStill(sha)
-            Log.i("CopySync", "auto-clear fired (${sec}s)")
+            DebugLog.i("auto-clear fired (${sec}s)")
         }
     }
 
@@ -96,7 +96,7 @@ class SyncService : Service() {
         if (!pass.isNullOrEmpty() && !sid.isNullOrEmpty()) {
             key = E2eCrypto.deriveKey(pass, sid)
             kid = E2eCrypto.keyId(key!!)
-            Log.i("CopySync", "E2E enabled (keyId=$kid)")
+            DebugLog.i("E2E enabled (keyId=$kid)")
         }
     }
 
@@ -131,10 +131,10 @@ class SyncService : Service() {
         val size = intent.getLongExtra("size", 0)
         val file = File(File(cacheDir, "clip-src"), sha)
         if (!file.exists()) {
-            Log.w("CopySync", "shared file missing: $sha")
+            DebugLog.w("shared file missing: $sha")
             return
         }
-        Log.i("CopySync", "share → sending $name ($size bytes)")
+        DebugLog.i("share → sending $name ($size bytes)")
         onCaptured(Captured.Binary(file, mime, name, size, sha))
     }
 
@@ -178,12 +178,12 @@ class SyncService : Service() {
                         ),
                     )
                     SyncState.lastEvent.value = "↑ ${c.text.take(40)}"
-                    Log.i("CopySync", "local copy -> sendClip (ws=${ws != null}, sent=$sent, e2e=${key != null})")
+                    DebugLog.i("local copy -> sendClip (ws=${ws != null}, sent=$sent, e2e=${key != null})")
                 }
                 is Captured.Binary -> {
                     ensureKey()
                     if (blob == null) {
-                        Log.w("CopySync", "no blob channel; file not sent")
+                        DebugLog.w("no blob channel; file not sent")
                     } else {
                         val kind = if (c.mime.startsWith("image/")) "image" else "file"
                         val dev = settings.deviceId.orEmpty()
@@ -198,13 +198,13 @@ class SyncService : Service() {
                                 runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             } else {
-                                if (runCatching { blob?.put(ct) }.isFailure) { Log.w("CopySync", "e2e upload failed"); return@launch }
+                                if (runCatching { blob?.put(ct) }.isFailure) { DebugLog.w("e2e upload failed"); return@launch }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             }
                             c.file.delete()
                             dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, ctSha, kind, blobId, c.name, c.size, c.mime, enc = true))
                             SyncState.lastEvent.value = "↑ ${c.name} (e2e ${c.size / 1024}KB)"
-                            Log.i("CopySync", "sent e2e ${c.name} ${c.size} bytes ($blobId)")
+                            DebugLog.i("sent e2e ${c.name} ${c.size} bytes ($blobId)")
                         } else {
                             val blobId = "sha256:" + c.sha
                             if (threshold > 0 && c.size > threshold) {
@@ -212,7 +212,7 @@ class SyncService : Service() {
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
                             } else {
-                                if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) { Log.w("CopySync", "file upload failed: ${c.name}"); return@launch }
+                                if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) { DebugLog.w("file upload failed: ${c.name}"); return@launch }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 c.file.delete()
@@ -304,7 +304,7 @@ class SyncService : Service() {
             }
             MsgType.ACK -> {
                 val a = runCatching { env.decodePayload<Ack>() }.getOrNull()
-                Log.i("CopySync", "ack ${a?.id}: status=${a?.status} queuedFor=${a?.queuedFor}")
+                DebugLog.i("ack ${a?.id}: status=${a?.status} queuedFor=${a?.queuedFor}")
             }
             MsgType.ROSTER -> {
                 val r = runCatching { env.decodePayload<Roster>() }.getOrNull()
@@ -322,11 +322,11 @@ class SyncService : Service() {
                 val br = runCatching { env.decodePayload<BlobRequest>() }.getOrNull() ?: return
                 val f = capture?.heldFile(br.id)
                 if (f == null) {
-                    Log.w("CopySync", "blob_request for unheld blob ${br.id}")
+                    DebugLog.w("blob_request for unheld blob ${br.id}")
                 } else {
                     runCatching { blob?.putFile(f, "application/octet-stream", br.id) }
-                        .onSuccess { Log.i("CopySync", "served on demand: ${br.id} (${f.length()} bytes)") }
-                        .onFailure { Log.w("CopySync", "serve failed: ${it.message}") }
+                        .onSuccess { DebugLog.i("served on demand: ${br.id} (${f.length()} bytes)") }
+                        .onFailure { DebugLog.w("serve failed: ${it.message}") }
                 }
             }
             MsgType.CLIP -> {
@@ -360,7 +360,7 @@ class SyncService : Service() {
                         }
                         Notifications.notifyClip(this, ev.originDeviceId, text)
                         SyncState.lastEvent.value = "↓ ${text.take(40)}"
-                        Log.i("CopySync", "received text (e2e=${ev.enc != null}, readable=$readable)")
+                        DebugLog.i("received text (e2e=${ev.enc != null}, readable=$readable)")
                     }
                     ev.blobId != null && imageMime != null && (!ev.onDemand || ev.size in 1L..PREVIEW_CAP_BYTES) -> {
                         // Any image (eager, or on-demand within the cap) is fetched + decrypted +
@@ -388,11 +388,11 @@ class SyncService : Service() {
                                 Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null)
                             }
                             SyncState.lastEvent.value = "↓ image ${data!!.size / 1024}KB"
-                            Log.i("CopySync", "received image ${data!!.size} bytes (onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
+                            DebugLog.i("received image ${data!!.size} bytes (onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
                         } else {
                             dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, "image", ev.blobId!!, nm, ev.size, imageMime, enc = ev.enc != null))
                             Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null)
-                            Log.w("CopySync", "inbound image: fetch/decrypt failed for ${ev.blobId}")
+                            DebugLog.w("inbound image: fetch/decrypt failed for ${ev.blobId}")
                         }
                     }
                     ev.blobId != null -> {
@@ -402,9 +402,9 @@ class SyncService : Service() {
                         dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
                         Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*", ev.enc != null)
                         SyncState.lastEvent.value = "↓ $nm (download)"
-                        Log.i("CopySync", "received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
+                        DebugLog.i("received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
                     }
-                    else -> Log.i("CopySync", "ignoring unsupported clip (mime=${ev.mime})")
+                    else -> DebugLog.i("ignoring unsupported clip (mime=${ev.mime})")
                 }
                 dao.prune(300)
                 refreshNotification()
@@ -414,7 +414,7 @@ class SyncService : Service() {
 
     private fun update(s: String) {
         SyncState.status.value = s
-        Log.i("CopySync", "status: $s")
+        DebugLog.i("status: $s")
         refreshNotification()
     }
 
