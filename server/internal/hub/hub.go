@@ -18,6 +18,7 @@ import (
 type Store interface {
 	ListDevices() ([]model.Device, error)
 	GetDevice(model.DeviceID) (model.Device, bool, error)
+	PutDevice(model.Device) error
 	UpdateLastSeen(model.DeviceID, time.Time) error
 	Enqueue(model.DeviceID, model.QueueItem, int) (int, error)
 	DrainQueue(model.DeviceID) ([]model.QueueItem, error)
@@ -43,6 +44,12 @@ type routeReq struct {
 	reply chan RouteResult
 }
 
+type setPoolReq struct {
+	id    model.DeviceID
+	pool  string
+	reply chan struct{}
+}
+
 type rosterReq struct {
 	reply chan []protocol.DeviceInfo
 }
@@ -65,6 +72,7 @@ type Hub struct {
 	route      chan routeReq
 	roster     chan rosterReq
 	blobReq    chan blobReqMsg
+	setPool    chan setPoolReq
 
 	clients  map[model.DeviceID]*Client      // owned by Run only
 	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
@@ -86,6 +94,7 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		route:      make(chan routeReq),
 		roster:     make(chan rosterReq),
 		blobReq:    make(chan blobReqMsg),
+		setPool:    make(chan setPoolReq),
 		clients:    make(map[model.DeviceID]*Client),
 		onDemand:   make(map[model.BlobID]model.DeviceID),
 	}
@@ -107,6 +116,9 @@ func (h *Hub) Run(ctx context.Context) {
 			r.reply <- h.snapshot()
 		case r := <-h.blobReq:
 			r.reply <- h.handleBlobRequest(r.id)
+		case r := <-h.setPool:
+			h.handleSetPool(r.id, r.pool)
+			close(r.reply)
 		}
 	}
 }
@@ -180,6 +192,8 @@ func (h *Hub) handleRegister(r registerReq) {
 		MaxMsg:            settings.MaxMessageBytes,
 		BlobCap:           settings.BlobMaxBytes,
 		OnDemandThreshold: settings.OnDemandThresholdBytes,
+		Pools:             h.availablePools(settings),
+		Pool:              poolName(c.Device.Pool),
 	}
 	if b, err := protocol.Encode(protocol.TypeHelloOK, ok); err == nil {
 		c.Enqueue(b)
@@ -251,8 +265,16 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 
 func (h *Hub) resolveTargets(ev model.ClipEvent) []model.Device {
 	if ev.Targets.All {
+		// "all" routes to every device in the origin's share pool.
 		devs, _ := h.store.ListDevices()
-		return devs
+		pool := h.poolOf(ev.OriginDevice)
+		out := make([]model.Device, 0, len(devs))
+		for _, d := range devs {
+			if poolName(d.Pool) == pool {
+				out = append(out, d)
+			}
+		}
+		return out
 	}
 	out := make([]model.Device, 0, len(ev.Targets.Devices))
 	for _, id := range ev.Targets.Devices {
@@ -261,6 +283,69 @@ func (h *Hub) resolveTargets(ev model.ClipEvent) []model.Device {
 		}
 	}
 	return out
+}
+
+// poolName normalizes an empty pool to "default".
+func poolName(p string) string {
+	if p == "" {
+		return "default"
+	}
+	return p
+}
+
+func (h *Hub) poolOf(id model.DeviceID) string {
+	if d, found, _ := h.store.GetDevice(id); found {
+		return poolName(d.Pool)
+	}
+	return "default"
+}
+
+// availablePools is the union of admin-configured pools and any pool a device
+// currently belongs to, always including "default".
+func (h *Hub) availablePools(settings config.RuntimeSettings) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(p string) {
+		p = poolName(p)
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	add("default")
+	for _, p := range settings.Pools {
+		add(p)
+	}
+	if devs, err := h.store.ListDevices(); err == nil {
+		for _, d := range devs {
+			add(d.Pool)
+		}
+	}
+	return out
+}
+
+// SetPool changes a device's share pool and refreshes the roster for everyone.
+func (h *Hub) SetPool(id model.DeviceID, pool string) {
+	reply := make(chan struct{})
+	h.setPool <- setPoolReq{id: id, pool: poolName(pool), reply: reply}
+	<-reply
+}
+
+func (h *Hub) handleSetPool(id model.DeviceID, pool string) {
+	dev, found, err := h.store.GetDevice(id)
+	if err != nil || !found || poolName(dev.Pool) == pool {
+		return
+	}
+	dev.Pool = pool
+	if err := h.store.PutDevice(dev); err != nil {
+		h.log.Warn("set pool failed", "device", id, "err", err)
+		return
+	}
+	if c, ok := h.clients[id]; ok {
+		c.Device.Pool = pool
+	}
+	h.log.Info("device pool changed", "device", id, "pool", pool)
+	h.broadcastPresence(dev, true, "")
 }
 
 func (h *Hub) enqueue(id model.DeviceID, ev model.ClipEvent, depth int) {

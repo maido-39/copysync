@@ -40,6 +40,8 @@ func main() {
 		err = cmdWatch(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "pool":
+		err = cmdPool(os.Args[2:])
 	case "history":
 		err = cmdHistory(os.Args[2:])
 	case "-h", "--help", "help":
@@ -67,6 +69,7 @@ Usage:
   copyctl watch   [--save-dir DIR] [--config FILE]
   copyctl run     [--targets all|id,id] [--save-dir DIR] [--config FILE]
   copyctl history [--search TERM]
+  copyctl pool    NAME [--config FILE]
 
 Commands:
   pair     Redeem an OTP and store the device token + server pin.

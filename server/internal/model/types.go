@@ -24,6 +24,7 @@ type Device struct {
 	ID         DeviceID  `json:"id"`
 	Name       string    `json:"name"`
 	Platform   Platform  `json:"platform"`
+	Pool       string    `json:"pool,omitempty"` // share pool; empty means "default"
 	CreatedAt  time.Time `json:"createdAt"`
 	LastSeenAt time.Time `json:"lastSeenAt"`
 	Revoked    bool      `json:"revoked"`

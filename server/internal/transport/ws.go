@@ -146,6 +146,11 @@ func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps
 			if b, err := protocol.Encode(protocol.TypeAck, ack); err == nil {
 				client.Enqueue(b)
 			}
+		case protocol.TypeSetPool:
+			var sp protocol.SetPool
+			if err := env.Decode(&sp); err == nil {
+				d.Hub.SetPool(originID, sp.Pool)
+			}
 		default:
 			// Ignore unknown frame types for forward compatibility.
 		}

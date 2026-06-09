@@ -20,6 +20,7 @@ const (
 	TypeClip     = "clip"         // both directions
 	TypeAck      = "ack"          // S->C
 	TypeBlobReq  = "blob_request" // S->C: asks the origin to upload an on-demand blob
+	TypeSetPool  = "set_pool"     // C->S: change this device's share pool
 	TypePresence = "presence"     // S->C
 	TypeRoster   = "roster"       // S->C
 	TypeError    = "error"        // S->C
@@ -56,6 +57,13 @@ type HelloOK struct {
 	MaxMsg            int64        `json:"maxMsg"`
 	BlobCap           int64        `json:"blobCap"`
 	OnDemandThreshold int64        `json:"onDemandThreshold"`
+	Pools             []string     `json:"pools"` // available share pools
+	Pool              string       `json:"pool"`  // this device's current pool
+}
+
+// SetPool changes the sending device's share pool (clips route within a pool).
+type SetPool struct {
+	Pool string `json:"pool"`
 }
 
 // BlobRequest asks the origin device to upload an on-demand blob to the server now.
