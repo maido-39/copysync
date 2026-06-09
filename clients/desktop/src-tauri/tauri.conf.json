@@ -16,6 +16,19 @@
         "height": 660,
         "minWidth": 720,
         "minHeight": 520
+      },
+      {
+        "label": "quickpanel",
+        "url": "quickpanel.html",
+        "title": "CopySync Quick Panel",
+        "width": 400,
+        "height": 480,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "center": true
       }
     ],
     "security": {

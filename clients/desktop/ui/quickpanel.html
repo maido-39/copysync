@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CopySync Quick Panel</title>
+    <style>
+      :root { --bg:#161d2e; --panel:#1b2230; --line:#232c3d; --text:#e6e9f0; --muted:#8b93a7; --accent:#6366f1; --ok:#22c55e; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; }
+      body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; overflow: hidden; }
+      header { padding: 10px 12px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+      header b { color: var(--text); }
+      header .hint { font-size: 11px; }
+      #list { flex: 1; overflow: auto; }
+      .it { padding: 9px 12px; border-bottom: 1px solid var(--panel); cursor: pointer; font-size: 13px; display: flex; gap: 7px; align-items: baseline; }
+      .it:hover { background: rgba(34,197,94,0.14); }
+      .dir { color: var(--accent); font-size: 11px; flex: none; width: 12px; text-align: center; }
+      .txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .empty { padding: 18px 12px; color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <header><b>📋 Quick Panel</b><span class="hint">클릭하면 복사 · 다시 단축키로 닫기</span></header>
+    <div id="list"><div class="empty">불러오는 중…</div></div>
+    <script src="quickpanel.js"></script>
+  </body>
+</html>

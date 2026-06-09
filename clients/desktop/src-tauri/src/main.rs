@@ -94,6 +94,17 @@ fn history_key(data_dir: &std::path::Path) -> [u8; 32] {
     k
 }
 
+/// Quick Panel: copy a history item's text back to the OS clipboard, then hide
+/// the panel. The clipboard watcher re-syncs it like any normal copy.
+#[tauri::command]
+fn quickpanel_copy(app: AppHandle, text: String) -> Result<(), String> {
+    clipboard::set_text(&text).map_err(|e| e.to_string())?;
+    if let Some(win) = app.get_webview_window("quickpanel") {
+        let _ = win.hide();
+    }
+    Ok(())
+}
+
 struct AppState {
     tx: Mutex<Option<UnboundedSender<Cmd>>>,
     hist: Arc<Mutex<History>>,
@@ -894,12 +905,18 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .on_window_event(|window, event| {
-            // Closing the window hides it to the tray (the sync keeps running).
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .on_window_event(|window, event| match event {
+            // Closing the main window hides it to the tray (the sync keeps running).
+            WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // The Quick Panel is dismissable: hide as soon as it loses focus.
+            WindowEvent::Focused(false) if window.label() == "quickpanel" => {
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .setup(|app| {
             let dir = app
@@ -955,6 +972,27 @@ fn main() {
                 })
                 .build(app)?;
             *app.state::<AppState>().tray.lock().unwrap() = Some(tray);
+
+            // Quick Panel: a global hotkey (Ctrl/Cmd+Shift+V) toggles a small
+            // always-on-top history overlay for fast re-copy.
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+                let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
+                let _ = app.global_shortcut().on_shortcut(hotkey, |app, _sc, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if let Some(win) = app.get_webview_window("quickpanel") {
+                        if win.is_visible().unwrap_or(false) {
+                            let _ = win.hide();
+                        } else {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            let _ = win.emit("quickpanel-show", ());
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -969,7 +1007,8 @@ fn main() {
             get_autostart,
             set_autostart,
             set_pool,
-            pair
+            pair,
+            quickpanel_copy
         ])
         .run(tauri::generate_context!())
         .expect("error while running CopySync");
