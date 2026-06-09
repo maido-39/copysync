@@ -25,6 +25,12 @@ body {
 a { color: var(--accent2); }
 .muted { color: var(--muted); }
 .small { font-size: 12.5px; }
+.mon-list { display: flex; flex-direction: column; max-height: 62vh; overflow: auto; }
+.mon-row { display: flex; gap: 10px; align-items: center; padding: 7px 6px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.mon-chip { background: rgba(99,102,241,.18); color: var(--accent2); padding: 2px 8px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.mon-kind { color: var(--muted); width: 44px; flex: none; }
+.mon-prev { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mon-meta { color: var(--muted); font-size: 11px; white-space: nowrap; flex: none; }
 .hidden { display: none !important; }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 

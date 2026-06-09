@@ -113,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/settings", s.requireAdmin(s.handleGetSettings))
 	mux.HandleFunc("PUT /admin/settings", s.requireAdmin(s.handlePutSettings))
 	mux.HandleFunc("POST /admin/broadcast", s.requireAdmin(s.handleBroadcast))
+	mux.HandleFunc("GET /admin/monitor/stream", s.requireAdmin(s.handleMonitorStream))
 
 	// Admin SPA + static assets (catch-all GET).
 	mux.Handle("GET /", s.webui)

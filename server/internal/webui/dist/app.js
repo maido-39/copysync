@@ -150,6 +150,7 @@
     { id: "devices", label: "기기", ic: "💻" },
     { id: "pairing", label: "페어링", ic: "🔗" },
     { id: "settings", label: "설정", ic: "⚙️" },
+    { id: "monitor", label: "모니터링", ic: "📡" },
     { id: "account", label: "계정", ic: "👤" },
   ];
 
@@ -180,12 +181,14 @@
 
   function go(id) {
     state.section = id;
+    if (state.monitorES) { state.monitorES.close(); state.monitorES = null; }
     for (var k in state.nav) state.nav[k].classList.toggle("active", k === id);
     clear(state.main);
     if (id === "overview") sectionOverview();
     else if (id === "devices") sectionDevices();
     else if (id === "pairing") sectionPairing();
     else if (id === "settings") sectionSettings();
+    else if (id === "monitor") sectionMonitor();
     else sectionAccount();
   }
 
@@ -397,6 +400,32 @@
       }}, "설정 저장");
       holder.appendChild(el("div", { class: "row" }, save));
     } catch (e) { clear(holder); holder.appendChild(el("p", { class: "msg err" }, e.message)); }
+  }
+
+  // ---- monitor (live) --------------------------------------------------------
+  function sectionMonitor() {
+    var m = state.main;
+    m.appendChild(pageHead("모니터링", "들어오는 클립 실시간 — E2E 클립은 내용이 보이지 않습니다."));
+    var card = el("div", { class: "card" });
+    var listEl = el("div", { class: "mon-list" }, el("p", { class: "muted" }, "대기 중… 클립이 들어오면 여기에 표시됩니다."));
+    card.appendChild(listEl);
+    m.appendChild(card);
+    var first = true;
+    var es = new EventSource("/admin/monitor/stream");
+    state.monitorES = es;
+    es.onmessage = function (e) {
+      var ev;
+      try { ev = JSON.parse(e.data); } catch (_) { return; }
+      if (first) { clear(listEl); first = false; }
+      var prev = ev.preview || ("(" + (ev.mime || ev.kind) + " · " + fmtBytes(ev.size) + ")");
+      var row = el("div", { class: "mon-row" },
+        el("span", { class: "mon-chip" }, ev.pool || "default"),
+        el("span", { class: "mon-kind" }, ev.kind || ""),
+        el("span", { class: "mon-prev" }, prev),
+        el("span", { class: "mon-meta" }, (ev.origin || "") + " · " + (ev.ts || "")));
+      listEl.insertBefore(row, listEl.firstChild);
+      while (listEl.childNodes.length > 200) listEl.removeChild(listEl.lastChild);
+    };
   }
 
   // ---- account ---------------------------------------------------------------

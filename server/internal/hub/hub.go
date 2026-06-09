@@ -7,6 +7,8 @@ package hub
 import (
 	"context"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/syaro/copysync/internal/config"
@@ -76,6 +78,11 @@ type Hub struct {
 
 	clients  map[model.DeviceID]*Client      // owned by Run only
 	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
+
+	monMu     sync.Mutex                // guards the live-monitor subscribers + ring
+	monSubs   map[int]chan MonitorEvent // admin live-monitor subscribers
+	monSeq    int
+	monRecent []MonitorEvent // recent events replayed to a new subscriber
 }
 
 // New creates a hub.
@@ -97,6 +104,7 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		setPool:    make(chan setPoolReq),
 		clients:    make(map[model.DeviceID]*Client),
 		onDemand:   make(map[model.BlobID]model.DeviceID),
+		monSubs:    make(map[int]chan MonitorEvent),
 	}
 }
 
@@ -227,6 +235,7 @@ func (h *Hub) handleUnregister(c *Client) {
 
 func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	settings, _ := h.store.GetSettings()
+	h.publishMonitor(ev)
 	targets := h.resolveTargets(ev)
 	// Remember who holds an on-demand blob so a later GET can pull it from them.
 	if ev.OnDemand && ev.BlobID != "" {
@@ -362,6 +371,93 @@ func (h *Hub) snapshot() []protocol.DeviceInfo {
 		out = append(out, protocol.DeviceInfo{Device: d, Online: online})
 	}
 	return out
+}
+
+// MonitorEvent is a live admin-monitor record of a relayed clip. Preview holds
+// the inline text when visible (E2E off); E2E clips show only a marker.
+type MonitorEvent struct {
+	TS      string `json:"ts"`
+	Origin  string `json:"origin"`
+	Pool    string `json:"pool"`
+	Kind    string `json:"kind"`
+	Mime    string `json:"mime"`
+	Size    int64  `json:"size"`
+	Preview string `json:"preview"`
+	E2E     bool   `json:"e2e"`
+}
+
+// SubscribeMonitor registers a live subscriber, returning its id, channel, and a
+// snapshot of recent events to replay first.
+func (h *Hub) SubscribeMonitor() (int, <-chan MonitorEvent, []MonitorEvent) {
+	h.monMu.Lock()
+	defer h.monMu.Unlock()
+	id := h.monSeq
+	h.monSeq++
+	ch := make(chan MonitorEvent, 64)
+	h.monSubs[id] = ch
+	return id, ch, append([]MonitorEvent(nil), h.monRecent...)
+}
+
+// UnsubscribeMonitor removes a live subscriber.
+func (h *Hub) UnsubscribeMonitor(id int) {
+	h.monMu.Lock()
+	defer h.monMu.Unlock()
+	if ch, ok := h.monSubs[id]; ok {
+		close(ch)
+		delete(h.monSubs, id)
+	}
+}
+
+func (h *Hub) publishMonitor(ev model.ClipEvent) {
+	me := MonitorEvent{TS: ev.TS, Origin: h.deviceName(ev.OriginDevice), Pool: h.poolOf(ev.OriginDevice), Size: ev.Size, E2E: ev.Enc != nil}
+	if len(ev.Mime) > 0 {
+		me.Mime = ev.Mime[0]
+	}
+	switch {
+	case ev.InlineText != "":
+		me.Kind = "text"
+		if me.E2E {
+			me.Preview = "🔒 (E2E ciphertext)"
+		} else {
+			me.Preview = truncate(ev.InlineText, 200)
+		}
+	case ev.BlobID != "":
+		if strings.HasPrefix(me.Mime, "image/") {
+			me.Kind = "image"
+		} else {
+			me.Kind = "file"
+		}
+		me.Preview = ev.Name
+	default:
+		me.Kind = "text"
+	}
+	h.monMu.Lock()
+	h.monRecent = append(h.monRecent, me)
+	if len(h.monRecent) > 50 {
+		h.monRecent = h.monRecent[len(h.monRecent)-50:]
+	}
+	for _, ch := range h.monSubs {
+		select {
+		case ch <- me:
+		default: // drop for a slow subscriber
+		}
+	}
+	h.monMu.Unlock()
+}
+
+func (h *Hub) deviceName(id model.DeviceID) string {
+	if d, found, _ := h.store.GetDevice(id); found && d.Name != "" {
+		return d.Name
+	}
+	return string(id)
+}
+
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func (h *Hub) broadcastPresence(d model.Device, online bool, exclude model.DeviceID) {
