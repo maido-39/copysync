@@ -23,7 +23,7 @@ use copysync_core::{blob, e2e, pairing, pinning, ws, Config};
 
 /// Commands flowing into the sync actor.
 enum Cmd {
-    LocalText(String),   // OS-clipboard text change (echo-guarded)
+    LocalText { text: String, html: Option<String> }, // OS-clipboard text/rich-text change
     LocalImage(Image),   // OS-clipboard image change (echo-guarded)
     SendText(String),    // explicit text send from the UI
     SendFile(String),    // explicit file send from the UI (path)
@@ -228,7 +228,8 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>) {
                 if t != last_text {
                     last_text = t.clone();
                     last_img.clear();
-                    let _ = tx.send(Cmd::LocalText(t));
+                    let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
+                    let _ = tx.send(Cmd::LocalText { text: t, html });
                 }
             }
             _ => {
@@ -289,15 +290,15 @@ async fn sync_actor(
                     tokio::select! {
                         cmd = rx.recv() => match cmd {
                             None => return,
-                            Some(Cmd::LocalText(t)) => {
-                                let sha = sha_hex(t.as_bytes());
+                            Some(Cmd::LocalText { text, html }) => {
+                                let sha = sha_hex(text.as_bytes());
                                 if seen(&recent_text, &sha) { continue; }
                                 remember(&mut recent_text, sha);
-                                if !send_text_clip(&mut sock, &mut seq, &t, &key, current_targets(&targets), &app, &hist).await { break; }
+                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&targets), &app, &hist).await { break; }
                             }
                             Some(Cmd::SendText(t)) => {
                                 remember(&mut recent_text, sha_hex(t.as_bytes()));
-                                if !send_text_clip(&mut sock, &mut seq, &t, &key, current_targets(&targets), &app, &hist).await { break; }
+                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&targets), &app, &hist).await { break; }
                             }
                             Some(Cmd::LocalImage(img)) => {
                                 let sha = sha_hex(&img.rgba);
@@ -372,6 +373,7 @@ async fn send_text_clip(
     sock: &mut ws::Ws,
     seq: &mut u64,
     text: &str,
+    html: Option<&str>,
     key: &Option<(Vec<u8>, String)>,
     targets: Targets,
     app: &AppHandle,
@@ -381,6 +383,7 @@ async fn send_text_clip(
     let ev = match ClipEvent::new_text(
         *seq,
         text,
+        html,
         key.as_ref().map(|(k, i)| (k.as_slice(), i.as_str())),
         targets,
     ) {
@@ -684,8 +687,28 @@ async fn handle_incoming(
         }
         (None, _) => ev.inline_text.clone(),
     };
+    // Optional rich-text (HTML) variant.
+    let html: Option<String> = if ev.html.is_empty() {
+        None
+    } else {
+        match (&ev.enc, key) {
+            (Some(_), Some((k, _))) => {
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                STANDARD
+                    .decode(&ev.html)
+                    .ok()
+                    .and_then(|raw| e2e::open(k, &raw).ok())
+                    .map(|p| String::from_utf8_lossy(&p).to_string())
+            }
+            (Some(_), None) => None,
+            (None, _) => Some(ev.html.clone()),
+        }
+    };
     remember(recent_text, sha_hex(text.as_bytes()));
-    let _ = clipboard::set_text(&text);
+    match &html {
+        Some(h) => { let _ = clipboard::set_html(h, &text); }
+        None => { let _ = clipboard::set_text(&text); }
+    }
     add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
     notify(app, "CopySync", &preview(&text));
     let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":"text","text":text,"origin":ev.origin_device}));

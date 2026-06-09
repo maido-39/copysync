@@ -98,4 +98,14 @@ napp 2; kill $WPID 2>/dev/null; wait $WPID 2>/dev/null || true
 grep -q "e2e ciphertext" "$W/watchD.log" && pass "mismatched passphrase correctly failed to decrypt" || { fail "expected decrypt failure marker"; sed 's/^/    /' "$W/watchD.log"; }
 
 echo
+echo "=== TEST E: rich-text/HTML round-trip (Rust --(E2E text+html)--> server --> Rust) ==="
+"$INTEROP" pair "$BASE" "$(mint_otp)" rusthtml "$W/rusthtml.json" "$PASS" "$PIN" >/dev/null
+"$INTEROP" recv "$W/rusthtml.json" 8 >"$W/recvE.log" 2>&1 &
+RPID=$!; napp 2
+"$INTEROP" send "$W/rustdev.json" "bold-fallback-text" "<b>CSHTML</b> rich text" >/dev/null 2>&1
+napp 3; wait $RPID 2>/dev/null || true
+grep -q "CLIP text bold-fallback-text" "$W/recvE.log" && pass "plain-text fallback received" || { fail "no plain fallback"; sed 's/^/    /' "$W/recvE.log"; }
+grep -q "html: <b>CSHTML</b> rich text" "$W/recvE.log" && pass "HTML variant decrypted end-to-end (server relays it opaquely)" || { fail "no html variant"; sed 's/^/    /' "$W/recvE.log"; }
+
+echo
 if [ "$FAILED" = 0 ]; then echo "ALL INTEROP TESTS PASSED ✓"; else echo "SOME TESTS FAILED ✗"; exit 1; fi

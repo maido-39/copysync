@@ -64,7 +64,8 @@ After `hello_ok`, the server immediately replays any **queued** clips (see
 | `seq` | uint64 | per-origin monotonic counter |
 | `ts` | RFC3339 | client time (advisory; server fills if zero) |
 | `mime` | string[] | ordered MIME preferences, e.g. `["image/png","text/plain"]` |
-| `inlineText` | string? | small text only, and only when E2E is off |
+| `inlineText` | string? | inline text payload (base64 ciphertext when E2E) |
+| `html` | string? | rich-text (`text/html`) variant of the same clip (base64 ciphertext when E2E); clients that support it set both the HTML and the plain-text fallback |
 | `blobId` | string? | content address (`sha256:<hex>`) for large payloads |
 | `name` | string? | filename hint for file payloads |
 | `onDemand` | bool? | `true` ⇒ bytes not uploaded; the origin holds them and uploads on a `blob_request` |

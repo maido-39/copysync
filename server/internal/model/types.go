@@ -114,6 +114,7 @@ type ClipEvent struct {
 	TS           string   `json:"ts"` // RFC3339; relayed as-is, server stamps when empty
 	Mime         []string `json:"mime"`
 	InlineText   string   `json:"inlineText,omitempty"`
+	Html         string   `json:"html,omitempty"` // rich-text (text/html) variant; encrypted like InlineText when E2E
 	BlobID       BlobID   `json:"blobId,omitempty"`
 	Name         string   `json:"name,omitempty"`     // filename hint for file payloads
 	OnDemand     bool     `json:"onDemand,omitempty"` // bytes not uploaded yet; pull from origin on request

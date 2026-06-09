@@ -164,10 +164,15 @@ class SyncService : Service() {
                         wireSha = sha256Hex(raw)
                         encMeta = EncMeta("aes-256-gcm", kid)
                     }
+                    val htmlField: String? = c.html?.takeIf { it.isNotEmpty() }?.let { h ->
+                        key?.let { k -> Base64.encodeToString(E2eCrypto.seal(k, h.toByteArray()), Base64.NO_WRAP) } ?: h
+                    }
+                    val mimes = if (htmlField != null) listOf("text/html", "text/plain") else listOf("text/plain")
                     val sent = ws?.sendClip(
                         ClipEvent(
-                            id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf("text/plain"),
-                            inlineText = inline, size = c.text.toByteArray().size.toLong(), sha256 = wireSha, enc = encMeta,
+                            id = UUID.randomUUID().toString(), seq = ++seq, mime = mimes,
+                            inlineText = inline, html = htmlField,
+                            size = c.text.toByteArray().size.toLong(), sha256 = wireSha, enc = encMeta,
                             targets = currentTargets(),
                         ),
                     )
@@ -344,7 +349,12 @@ class SyncService : Service() {
                             ),
                         )
                         if (readable) {
-                            capture?.applyInbound(text, settings.sensitiveMark)
+                            var html: String? = ev.html?.takeIf { it.isNotEmpty() }
+                            if (html != null && ev.enc != null) {
+                                val k = key
+                                html = if (k != null) runCatching { String(E2eCrypto.open(k, Base64.decode(html, Base64.NO_WRAP))) }.getOrNull() else null
+                            }
+                            capture?.applyInbound(text, html, settings.sensitiveMark)
                             scheduleAutoClear(sha256Hex(text))
                         }
                         Notifications.notifyClip(this, ev.originDeviceId, text)

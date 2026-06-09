@@ -19,7 +19,7 @@ private const val SRC_CACHE_CAP_BYTES = 512L * 1024 * 1024 // hold up to 512 MiB
 
 /** A captured clipboard item: plain text, or binary content (image or file). */
 sealed interface Captured {
-    data class Text(val text: String) : Captured
+    data class Text(val text: String, val html: String? = null) : Captured
     data class Binary(val file: File, val mime: String, val name: String, val size: Long, val sha: String) : Captured
 }
 
@@ -111,7 +111,7 @@ class ClipboardCaptureEngine(
         val item = clip.getItemAt(0)
         item.uri?.let { uri -> cacheUri(uri, clip)?.let { return it } }
         val text = item.coerceToText(context)?.toString()
-        return if (!text.isNullOrEmpty()) Captured.Text(text) else null
+        return if (!text.isNullOrEmpty()) Captured.Text(text, item.htmlText) else null
     }
 
     /** Stream a content URI to the source cache, computing its sha256. */
@@ -175,11 +175,12 @@ class ClipboardCaptureEngine(
     }
 
     /** Write inbound text to the clipboard (echo-suppressed). */
-    fun applyInbound(text: String, sensitive: Boolean = false) {
+    fun applyInbound(text: String, html: String? = null, sensitive: Boolean = false) {
         val sha = sha256Hex(text)
         guard.mark(sha)
         lastActivitySha = sha
-        val clip = ClipData.newPlainText("CopySync", text)
+        val clip = if (!html.isNullOrEmpty()) ClipData.newHtmlText("CopySync", text, html)
+        else ClipData.newPlainText("CopySync", text)
         if (sensitive) markSensitive(clip)
         if (!overlay.writeWithFocus(clip)) runCatching { clipboard.setPrimaryClip(clip) }
     }

@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
                 !cfg.e2e_pass.is_empty()
             );
         }
-        "send" => send_text(arg(&args, 1)?, arg(&args, 2)?).await?,
+        "send" => send_text(arg(&args, 1)?, arg(&args, 2)?, args.get(3).map(|s| s.as_str())).await?,
         "sendfile" => send_file(arg(&args, 1)?, arg(&args, 2)?).await?,
         "recv" => {
             let secs: u64 = arg(&args, 2)?.parse()?;
@@ -60,7 +60,7 @@ fn arg<'a>(args: &'a [String], i: usize) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing argument #{i}"))
 }
 
-async fn send_text(config: &str, text: &str) -> Result<()> {
+async fn send_text(config: &str, text: &str, html: Option<&str>) -> Result<()> {
     let cfg = Config::load(config)?;
     let pin = cfg.pin_bytes()?;
     let (mut ws, _hello) =
@@ -69,6 +69,7 @@ async fn send_text(config: &str, text: &str) -> Result<()> {
     let ev = ClipEvent::new_text(
         1,
         text,
+        html,
         key.as_ref().map(|(k, id)| (k.as_slice(), id.as_str())),
         Targets::All,
     )?;
@@ -152,6 +153,16 @@ async fn recv(config: &str, secs: u64) -> Result<()> {
                     );
                 } else {
                     println!("CLIP text {}", decrypt_text(&ev, &key)?);
+                    if !ev.html.is_empty() {
+                        let h = match (&ev.enc, &key) {
+                            (Some(_), Some((k, _))) => {
+                                String::from_utf8(e2e::open(k, &STANDARD.decode(&ev.html)?)?)?
+                            }
+                            (Some(_), None) => "<encrypted>".into(),
+                            (None, _) => ev.html.clone(),
+                        };
+                        println!("  html: {h}");
+                    }
                 }
             }
         }

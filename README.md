@@ -19,9 +19,9 @@ end-to-end encrypted. Built for Android, Windows, and Linux.
 - **Real-time sync** across all your devices on the local network.
 - **Clipboard queuing** — items for an offline device are held and delivered when
   it reconnects.
-- **All clipboard types** — text, images, and files. Files over a server-set
-  threshold are advertised **on demand**: bytes transfer only when another device
-  actually pastes/downloads them.
+- **All clipboard types** — text, **rich text (HTML)**, images, and files. Files
+  over a server-set threshold are advertised **on demand**: bytes transfer only
+  when another device actually pastes/downloads them.
 - **Offline history + search** — kept locally on each client (Android, desktop,
   and `copyctl`).
 - **Push notifications** for clips copied on other devices (client-side).

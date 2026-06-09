@@ -37,6 +37,18 @@ pub fn set_image(img: &Image) -> Result<()> {
     Ok(())
 }
 
+/// Read the clipboard's rich-text (HTML) representation, if any.
+pub fn get_html() -> Result<String> {
+    Ok(arboard::Clipboard::new()?.get().html()?)
+}
+
+/// Set both an HTML representation and a plain-text fallback (`alt`).
+pub fn set_html(html: &str, alt: &str) -> Result<()> {
+    arboard::Clipboard::new()?
+        .set_html(html.to_string(), Some(alt.to_string()))?;
+    Ok(())
+}
+
 /// Encode a raw RGBA clipboard image to PNG bytes (for the blob channel).
 /// Pure CPU — no display needed, so it is unit-testable headlessly.
 pub fn encode_png(img: &Image) -> Result<Vec<u8>> {

@@ -167,6 +167,9 @@ pub struct ClipEvent {
     pub mime: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inline_text: String,
+    /// Rich-text (text/html) variant; ciphertext (base64) when E2E, like inline_text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub html: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub blob_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -210,16 +213,22 @@ impl ClipEvent {
     pub fn new_text(
         seq: u64,
         text: &str,
+        html: Option<&str>,
         key: Option<(&[u8], &str)>,
         targets: Targets,
     ) -> anyhow::Result<ClipEvent> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use sha2::{Digest, Sha256};
+        let html = html.filter(|h| !h.is_empty());
         let mut ev = ClipEvent {
             id: new_id(),
             seq,
             ts: now_ts(),
-            mime: vec!["text/plain".into()],
+            mime: if html.is_some() {
+                vec!["text/html".into(), "text/plain".into()]
+            } else {
+                vec!["text/plain".into()]
+            },
             size: text.len() as i64,
             targets,
             ..Default::default()
@@ -229,6 +238,9 @@ impl ClipEvent {
                 let raw = crate::e2e::seal(k, text.as_bytes())?;
                 ev.inline_text = STANDARD.encode(&raw);
                 ev.sha256 = hex::encode(Sha256::digest(&raw));
+                if let Some(h) = html {
+                    ev.html = STANDARD.encode(crate::e2e::seal(k, h.as_bytes())?);
+                }
                 ev.enc = Some(EncMeta {
                     alg: crate::e2e::ALG.into(),
                     key_id: kid.into(),
@@ -238,6 +250,9 @@ impl ClipEvent {
             None => {
                 ev.inline_text = text.to_string();
                 ev.sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+                if let Some(h) = html {
+                    ev.html = h.to_string();
+                }
             }
         }
         Ok(ev)

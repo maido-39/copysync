@@ -70,6 +70,7 @@ data class ClipEvent(
     val ts: String? = null, // omitted when unset; server stamps its own receive time
     val mime: List<String> = emptyList(),
     val inlineText: String? = null,
+    val html: String? = null, // rich-text (text/html) variant; ciphertext (base64) when E2E
     val blobId: String? = null,
     val name: String? = null,
     val onDemand: Boolean = false,
