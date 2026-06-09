@@ -175,6 +175,32 @@ fn get_history(state: State<'_, AppState>, query: Option<String>) -> Result<Vec<
     .map_err(|e| e.to_string())
 }
 
+/// A small PNG data-URI thumbnail of an image file, for history previews.
+#[tauri::command]
+fn thumbnail(path: String) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let data = std::fs::read(&path).ok()?;
+    if data.is_empty() || data.len() > 60_000_000 {
+        return None;
+    }
+    let img = image::load_from_memory(&data).ok()?;
+    let thumb = img.thumbnail(320, 320); // keeps aspect ratio, max 320px
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(buf.into_inner())))
+}
+
+/// First ~600 chars of a text file, for history previews.
+#[tauri::command]
+fn text_preview(path: String) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(String::from_utf8_lossy(&buf).chars().take(600).collect())
+}
+
 #[tauri::command]
 fn send_text(state: State<'_, AppState>, text: String) -> Result<(), String> {
     if text.is_empty() {
@@ -842,6 +868,8 @@ fn main() {
             get_roster,
             set_targets,
             get_history,
+            thumbnail,
+            text_preview,
             send_text,
             send_file,
             get_autostart,

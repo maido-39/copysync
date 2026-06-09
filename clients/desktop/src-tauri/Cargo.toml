@@ -20,5 +20,6 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

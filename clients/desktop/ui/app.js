@@ -36,24 +36,46 @@ function fmtSize(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v.toFixed(i ? 1 : 0)} ${u[i]}`;
 }
-function itemHtml(e) {
+let lastRows = [];
+// Received files/images keep their saved local path in `preview`; that's what we
+// thumbnail/snippet. (Text clips put the text itself there; outbound has no file.)
+function itemPath(e) {
+  return e.direction === "in" && (e.kind === "image" || e.kind === "file") ? e.preview : null;
+}
+function itemHtml(e, i) {
   const label = e.kind === "image" ? "이미지" : e.kind === "file" ? "파일" : "텍스트";
   const head = e.kind === "text" ? esc(e.preview) : esc(e.name || e.preview);
   const dir = e.direction === "out" ? "보냄" : "받음";
   const meta = [dir, e.origin && e.origin !== "me" ? e.origin : null, fmtSize(e.size), e.ts]
     .filter(Boolean).join(" · ");
+  const path = itemPath(e);
+  let media = `<span class="ic">${e.kind === "image" ? "🖼️" : e.kind === "file" ? "📄" : "🔤"}</span>`;
+  if (e.kind === "image" && path) media = `<img class="thumb" data-i="${i}" alt=""/>`;
+  else if (e.kind === "file" && path && (e.mime || "").startsWith("text/")) media = `<pre class="snip" data-i="${i}">…</pre>`;
   return `<div class="item dir-${e.direction}">
     <span class="tag ${e.kind}">${label}</span>
+    ${media}
     <div class="body"><div class="preview">${head}</div><div class="meta">${esc(meta)}</div></div>
   </div>`;
+}
+function hydrate() {
+  document.querySelectorAll("#hist-list [data-i]").forEach((el) => {
+    const e = lastRows[+el.dataset.i];
+    if (!e) return;
+    const path = itemPath(e);
+    if (!path) return;
+    if (el.tagName === "IMG") invoke("thumbnail", { path }).then((d) => { if (d) el.src = d; }).catch(() => {});
+    else invoke("text_preview", { path }).then((t) => { if (t) el.textContent = t; }).catch(() => {});
+  });
 }
 async function loadHistory() {
   const q = $("#search").value;
   try {
-    const rows = await invoke("get_history", { query: q || null });
-    $("#hist-list").innerHTML = rows.length
-      ? rows.map(itemHtml).join("")
+    lastRows = await invoke("get_history", { query: q || null });
+    $("#hist-list").innerHTML = lastRows.length
+      ? lastRows.map((e, i) => itemHtml(e, i)).join("")
       : `<div class="empty">기록이 없습니다.</div>`;
+    hydrate();
   } catch (e) {
     $("#hist-list").innerHTML = `<div class="empty">${esc(String(e))}</div>`;
   }

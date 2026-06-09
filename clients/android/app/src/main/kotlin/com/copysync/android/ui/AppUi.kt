@@ -345,6 +345,13 @@ private fun HistoryCard(e: ClipEntity) {
                 val dir = if (e.direction == "in") "←" else "→"
                 val title = if (e.kind == "text") e.text.replace("\n", " ").trim() else e.name.ifEmpty { e.text }
                 Text("$dir $title", maxLines = 2, style = MaterialTheme.typography.bodyMedium)
+                if (e.kind == "file" && e.mime.startsWith("text/") && e.localPath != null) {
+                    val snip = rememberTextSnippet(ctx, e.localPath)
+                    if (!snip.isNullOrEmpty()) Text(
+                        snip.trim(), maxLines = 3,
+                        style = MaterialTheme.typography.bodySmall, color = Color(0xFF455A64),
+                    )
+                }
                 val meta = buildString {
                     if (e.kind != "text") {
                         append(e.mime.ifEmpty { e.kind })
@@ -549,10 +556,12 @@ private fun relTime(ts: Long): String {
 @Composable
 private fun rememberThumb(ctx: Context, e: ClipEntity): ImageBitmap? {
     val sha = e.blobId.removePrefix("sha256:")
-    if (sha.isEmpty()) return null
-    val path = File(File(ctx.cacheDir, "clip-src"), sha).absolutePath
-    val state = produceState<ImageBitmap?>(initialValue = null, key1 = sha) {
-        value = withContext(Dispatchers.IO) { decodeThumb(path) }
+    val cachePath = if (sha.isNotEmpty()) File(File(ctx.cacheDir, "clip-src"), sha).absolutePath else null
+    val state = produceState<ImageBitmap?>(initialValue = null, key1 = sha, key2 = e.localPath ?: "") {
+        value = withContext(Dispatchers.IO) {
+            // Prefer the local decrypted cache; fall back to the downloaded file (SAF URI).
+            cachePath?.let { decodeThumb(it) } ?: e.localPath?.let { decodeThumbUri(ctx, it) }
+        }
     }
     return state.value
 }
@@ -568,3 +577,32 @@ private fun decodeThumb(path: String, maxPx: Int = 256): ImageBitmap? = runCatch
     val opts = BitmapFactory.Options().apply { inSampleSize = sample }
     BitmapFactory.decodeFile(path, opts)?.asImageBitmap()
 }.getOrNull()
+
+/** Decode a downsampled thumbnail from a content:// URI (downloaded files). */
+private fun decodeThumbUri(ctx: Context, uriStr: String, maxPx: Int = 256): ImageBitmap? = runCatching {
+    val uri = Uri.parse(uriStr)
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    if (bounds.outWidth <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / sample > maxPx || bounds.outHeight / sample > maxPx) sample *= 2
+    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }?.asImageBitmap()
+}.getOrNull()
+
+/** First ~400 chars of a downloaded text file, for history previews. */
+@Composable
+private fun rememberTextSnippet(ctx: Context, uriStr: String): String? {
+    val state = produceState<String?>(initialValue = null, key1 = uriStr) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                ctx.contentResolver.openInputStream(Uri.parse(uriStr))?.use { input ->
+                    val buf = ByteArray(4096)
+                    val n = input.read(buf).coerceAtLeast(0)
+                    String(buf, 0, n).take(400)
+                }
+            }.getOrNull()
+        }
+    }
+    return state.value
+}

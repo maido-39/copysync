@@ -372,7 +372,7 @@ class SyncService : Service() {
                             val ext = imageMime.substringAfter('/').substringBefore(';').ifEmpty { "img" }
                             capture?.applyInboundImage(data!!, ev.name ?: "in-${ev.id.take(8)}.$ext", settings.sensitiveMark)
                             scheduleAutoClear(sha256Hex(data!!))
-                            if (ev.enc == null) runCatching { // preview cache (plaintext only)
+                            runCatching { // local preview cache (decrypted bytes; device-only, for thumbnails)
                                 val dir = File(cacheDir, "clip-src").apply { mkdirs() }
                                 File(dir, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!)
                             }
