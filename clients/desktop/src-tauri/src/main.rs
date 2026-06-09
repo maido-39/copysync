@@ -58,6 +58,42 @@ struct RosterDevice {
     online: bool,
 }
 
+/// 32-byte key for at-rest history encryption. Uses the native OS keyring on
+/// macOS/Windows; elsewhere (e.g. Linux without a Secret Service) a 0600 key file
+/// in the app data dir. Generated once, then reused.
+fn history_key(data_dir: &std::path::Path) -> [u8; 32] {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if let Ok(entry) = keyring::Entry::new("copysync", "history-key") {
+            if let Ok(b64) = entry.get_password() {
+                if let Ok(raw) = STANDARD.decode(&b64) {
+                    if let Ok(k) = <[u8; 32]>::try_from(raw.as_slice()) {
+                        return k;
+                    }
+                }
+            }
+            let k = copysync_core::e2e::random_key();
+            let _ = entry.set_password(&STANDARD.encode(k));
+            return k;
+        }
+    }
+    let kf = data_dir.join("history.key");
+    if let Ok(b) = std::fs::read(&kf) {
+        if let Ok(k) = <[u8; 32]>::try_from(b.as_slice()) {
+            return k;
+        }
+    }
+    let k = copysync_core::e2e::random_key();
+    let _ = std::fs::write(&kf, k);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&kf, std::fs::Permissions::from_mode(0o600));
+    }
+    k
+}
+
 struct AppState {
     tx: Mutex<Option<UnboundedSender<Cmd>>>,
     hist: Arc<Mutex<History>>,
@@ -873,7 +909,7 @@ fn main() {
             let data = app.path().app_data_dir().unwrap_or_else(|_| dir.clone());
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::create_dir_all(&data);
-            let hist = History::open(data.join("history.db"))
+            let hist = History::open(data.join("history.db"), Some(history_key(&data)))
                 .map_err(|e| format!("open history: {e}"))?;
             let state = AppState {
                 tx: Mutex::new(None),

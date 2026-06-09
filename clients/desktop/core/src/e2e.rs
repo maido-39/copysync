@@ -31,6 +31,15 @@ pub fn key_id(key: &[u8]) -> String {
     hex::encode(s)[..16].to_string()
 }
 
+/// A fresh random 32-byte key — for local at-rest encryption (the history DB),
+/// independent of the passphrase-derived E2E group key.
+pub fn random_key() -> [u8; 32] {
+    use rand::RngCore;
+    let mut k = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut k);
+    k
+}
+
 /// Encrypt: returns `nonce(12) || AES-256-GCM(plaintext)+tag(16)`.
 pub fn seal(key: &[u8], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
