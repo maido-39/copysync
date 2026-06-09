@@ -156,6 +156,23 @@ ciphertext. Server-originated admin broadcast is disabled while E2E is on.
 files all round-trip; the on-disk blob store holds only ciphertext. The Android
 client port is next.)
 
+## Discovery (mDNS / DNS-SD)
+
+The server advertises itself on the local link as a DNS-SD service so clients can
+find it without a typed IP:
+
+- **Service type:** `_copysync._tcp` (domain `local.`)
+- **Instance name:** the server name
+- **Port:** the HTTPS listener port
+- **TXT records:** `id=<serverId>`, `name=<serverName>`, `proto=1`
+
+A client browses `_copysync._tcp.local.`, resolves an instance to host + port, and
+offers `https://<host>:<port>` as a pairing target. Discovery only fills in the
+address; the SPKI pin and OTP still come from the pairing payload/QR, so trust is
+unchanged. mDNS is **link-local** — it does not cross a VPN/WireGuard tunnel or
+VLAN, so a remote server must still be entered by IP. (copyctl: `copyctl discover`;
+Android: the "같은 네트워크에서 서버 검색" button on the pairing screen.)
+
 ## Pairing
 
 1. **Admin** generates a one-time code: `POST /admin/pairing` →

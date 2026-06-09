@@ -1,6 +1,6 @@
-# Go build output
+# Go build output (binaries only — anchored so they don't match cmd/ source dirs)
 /server/copysyncd
-copysyncd
+/server/copyctl
 *.test
 *.out
 coverage*.out
@@ -13,10 +13,15 @@ coverage*.out
 # Android / Gradle
 /clients/android/.gradle/
 **/build/
+**/.kotlin/
 /clients/android/local.properties
 /clients/android/captures/
 *.apk
 *.keystore
+
+# Rust / Tauri (desktop) build output
+**/target/
+/clients/desktop/src-tauri/gen/
 
 # Editor / OS
 .DS_Store

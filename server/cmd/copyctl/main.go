@@ -34,6 +34,8 @@ func main() {
 		err = cmdSend(os.Args[2:])
 	case "pull":
 		err = cmdPull(os.Args[2:])
+	case "discover":
+		err = cmdDiscover(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "run":
@@ -60,6 +62,7 @@ func usage() {
 Usage:
   copyctl pair    --server URL --otp CODE --name NAME [--pin B64] [--config FILE]
   copyctl send    [--text STR | --file PATH] [--targets all|id,id] [--config FILE]
+  copyctl discover [--timeout 4s]
   copyctl pull    --id sha256:HEX --out PATH [--config FILE]
   copyctl watch   [--save-dir DIR] [--config FILE]
   copyctl run     [--targets all|id,id] [--save-dir DIR] [--config FILE]
