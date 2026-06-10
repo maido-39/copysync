@@ -422,7 +422,7 @@ func (h *Hub) publishMonitor(ev model.ClipEvent) {
 		if me.E2E {
 			me.Preview = "🔒 (E2E ciphertext)"
 		} else {
-			me.Preview = truncate(ev.InlineText, 200)
+			me.Preview = truncate(ev.InlineText, 16384) // full text (bounded); UI collapses + expands
 		}
 	case ev.BlobID != "":
 		if strings.HasPrefix(me.Mime, "image/") {

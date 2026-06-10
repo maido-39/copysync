@@ -435,21 +435,35 @@
       try { ev = JSON.parse(e.data); } catch (_) { return; }
       if (first) { clear(listEl); first = false; }
       var prevText = ev.preview || ("(" + (ev.mime || ev.kind) + " · " + fmtBytes(ev.size) + ")");
-      var prevEl;
+      var body = el("div", { class: "mon-body" });
       if (ev.kind === "image" && ev.blobId) {
-        var thumb = el("img", {
+        body.appendChild(el("img", {
           class: "mon-thumb", alt: "", src: "/admin/monitor/blob/" + encodeURIComponent(ev.blobId),
           onerror: function (e2) { e2.target.style.display = "none"; },
-        });
-        prevEl = el("span", { class: "mon-prev" }, thumb, ev.preview || "");
-      } else {
-        prevEl = el("span", { class: "mon-prev" }, prevText);
+          onclick: function (e2) { e2.target.classList.toggle("big"); },
+        }));
       }
+      var textEl = el("span", { class: "mon-prev" }, prevText);
+      body.appendChild(textEl);
+      var actions = el("span", { class: "mon-actions" });
+      if (prevText.length > 60) {
+        var more = el("button", { class: "mon-btn", title: "전문 보기 / 접기" }, "⋯");
+        more.onclick = function () { more.textContent = textEl.classList.toggle("expanded") ? "▲" : "⋯"; };
+        actions.appendChild(more);
+      }
+      var copyBtn = el("button", { class: "mon-btn", title: "복사" }, "복사");
+      copyBtn.onclick = function () {
+        navigator.clipboard.writeText(prevText).then(function () {
+          copyBtn.textContent = "✓"; setTimeout(function () { copyBtn.textContent = "복사"; }, 1200);
+        }).catch(function () {});
+      };
+      actions.appendChild(copyBtn);
       var row = el("div", { class: "mon-row" },
         el("span", { class: "mon-chip" }, ev.pool || "default"),
         el("span", { class: "mon-kind" }, ev.kind || ""),
-        prevEl,
-        el("span", { class: "mon-meta" }, (ev.origin || "") + " · " + (ev.ts || "")));
+        body,
+        el("span", { class: "mon-meta" }, (ev.origin || "") + " · " + (ev.ts || "")),
+        actions);
       listEl.insertBefore(row, listEl.firstChild);
       while (listEl.childNodes.length > 200) listEl.removeChild(listEl.lastChild);
     };
