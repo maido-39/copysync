@@ -18,6 +18,7 @@ object MsgType {
     const val PRESENCE = "presence"
     const val ROSTER = "roster"
     const val ERROR = "error"
+    const val TOKEN_ROTATE = "token_rotate"
 }
 
 /** Every control-channel frame: {"t": type, "d": payload}. */
@@ -57,6 +58,9 @@ data class HelloOk(
 
 @Serializable
 data class SetPool(val pool: String = "")
+
+@Serializable
+data class TokenRotate(val token: String = "")
 
 @Serializable
 data class BlobRequest(val id: String = "")

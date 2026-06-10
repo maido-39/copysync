@@ -22,6 +22,7 @@ import com.copysync.android.net.ClipEvent
 import com.copysync.android.net.DeviceInfo
 import com.copysync.android.net.Presence
 import com.copysync.android.net.Roster
+import com.copysync.android.net.TokenRotate
 import com.copysync.android.net.E2eCrypto
 import com.copysync.android.net.EncMeta
 import com.copysync.android.net.Envelope
@@ -360,6 +361,13 @@ class SyncService : Service() {
                 val d: DeviceInfo = p.device.copy(online = p.online)
                 if (i >= 0) cur[i] = d else cur.add(d)
                 SyncState.roster.value = cur
+            }
+            MsgType.TOKEN_ROTATE -> {
+                val tr = runCatching { env.decodePayload<TokenRotate>() }.getOrNull()
+                if (tr != null && tr.token.isNotEmpty()) {
+                    secrets.token = tr.token
+                    DebugLog.i("bearer token rotated + saved")
+                }
             }
             MsgType.BLOB_REQUEST -> {
                 val br = runCatching { env.decodePayload<BlobRequest>() }.getOrNull() ?: return

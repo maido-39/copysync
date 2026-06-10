@@ -16,6 +16,7 @@ pub const T_SET_POOL: &str = "set_pool";
 pub const T_PRESENCE: &str = "presence";
 pub const T_ROSTER: &str = "roster";
 pub const T_ERROR: &str = "error";
+pub const T_TOKEN_ROTATE: &str = "token_rotate";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +113,12 @@ pub struct BlobRequest {
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct SetPool {
     pub pool: String,
+}
+
+/// Sent S→C with a re-issued bearer token (Stage-3 rotation); persist it.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TokenRotate {
+    pub token: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]

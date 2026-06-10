@@ -339,6 +339,7 @@
       ["allowServerBroadcast", "서버 브로드캐스트 허용", "bool", "E2E가 켜지면 자동으로 꺼집니다."],
       ["sessionTtlSeconds", "관리자 세션 TTL(초)", "int", ""],
       ["pairingCodeTtlSeconds", "페어링 코드 TTL(초)", "int", ""],
+      ["tokenRotateDays", "토큰 회전 주기(일)", "int", "기기 토큰이 이보다 오래되면 자동 재발급합니다. 0 = 비활성. 구버전 클라이언트는 영향 없이 그대로 동작합니다."],
     ] },
   ];
 

@@ -350,8 +350,9 @@ fn start_sync(app: &AppHandle, cfg: Config) {
     let roster = state.roster.clone();
     let targets = state.targets.clone();
     let downloads = state.downloads.clone();
+    let cfg_path = state.cfg_path.clone();
     tauri::async_runtime::spawn(async move {
-        sync_actor(app2, cfg, rx, hist, status, roster, targets, downloads).await;
+        sync_actor(app2, cfg, cfg_path, rx, hist, status, roster, targets, downloads).await;
     });
 }
 
@@ -393,7 +394,8 @@ fn current_targets(t: &Arc<Mutex<Targets>>) -> Targets {
 #[allow(clippy::too_many_arguments)]
 async fn sync_actor(
     app: AppHandle,
-    cfg: Config,
+    mut cfg: Config,
+    cfg_path: PathBuf,
     mut rx: UnboundedReceiver<Cmd>,
     hist: Arc<Mutex<History>>,
     status: Arc<Mutex<Status>>,
@@ -460,7 +462,18 @@ async fn sync_actor(
                         },
                         frame = ws::recv(&mut sock) => match frame {
                             Ok(Some((t, d))) => {
-                                handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &on_demand).await;
+                                if t == protocol::T_TOKEN_ROTATE {
+                                    // Stage-3: persist the re-issued bearer token; the next
+                                    // reconnect uses it and the server retires the old one.
+                                    if let Ok(tr) = serde_json::from_value::<protocol::TokenRotate>(d) {
+                                        if !tr.token.is_empty() {
+                                            cfg.token = tr.token;
+                                            let _ = cfg.save(&cfg_path);
+                                        }
+                                    }
+                                } else {
+                                    handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &on_demand).await;
+                                }
                             }
                             Ok(None) => break,
                             Err(_) => break,
