@@ -29,6 +29,9 @@ type Deps struct {
 	Now func() time.Time
 	// ValidateToken returns the device for a (deviceID, token) pair, or false.
 	ValidateToken func(model.DeviceID, string) (model.Device, bool)
+	// MaybeRotateToken optionally re-issues the device's bearer token after a
+	// successful auth, returning a new plaintext token to deliver (or "" for none).
+	MaybeRotateToken func(model.DeviceID, string) string
 	// MaxMessage returns the current WS read limit in bytes.
 	MaxMessage func() int64
 }
@@ -86,6 +89,16 @@ func serve(parent context.Context, d Deps, c *websocket.Conn) {
 	go writePump(ctx, c, client)
 	d.Hub.Register(client)
 	defer d.Hub.Unregister(client)
+
+	// 2b) Token rotation: if the server re-issued this device's token, deliver it
+	// so the client persists it (the old token is retired once the new is used).
+	if d.MaybeRotateToken != nil {
+		if newTok := d.MaybeRotateToken(hello.DeviceID, hello.Token); newTok != "" {
+			if b, err := protocol.Encode(protocol.TypeTokenRotate, protocol.TokenRotate{Token: newTok}); err == nil {
+				client.Enqueue(b)
+			}
+		}
+	}
 
 	// 3) Read pump: blocks until the connection ends.
 	readPump(ctx, c, client, d, hello.DeviceID)

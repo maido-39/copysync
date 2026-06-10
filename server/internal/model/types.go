@@ -34,7 +34,8 @@ type Device struct {
 // The plaintext token is returned to the client exactly once, at pairing time.
 type TokenRecord struct {
 	DeviceID  DeviceID  `json:"deviceId"`
-	TokenHash string    `json:"tokenHash"` // base64(HMAC-SHA256(token, serverSecret))
+	TokenHash string    `json:"tokenHash"`          // base64(HMAC-SHA256(token, serverSecret))
+	PrevHash  string    `json:"prevHash,omitempty"` // previous token during rotation; valid until the new one is first used
 	IssuedAt  time.Time `json:"issuedAt"`
 	Revoked   bool      `json:"revoked"`
 }

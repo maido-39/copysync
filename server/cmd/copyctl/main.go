@@ -285,6 +285,17 @@ func cmdWatch(args []string) error {
 				}
 				fmt.Printf("· %s is now %s\n", p.Device.Name, state)
 			}
+		case protocol.TypeTokenRotate:
+			var tr protocol.TokenRotate
+			if env.Decode(&tr) == nil && tr.Token != "" {
+				cfg.Token = tr.Token
+				cl.cfg.Token = tr.Token
+				if err := saveConfig(*cfgPath, cfg); err != nil {
+					fmt.Printf("! token rotated but save failed: %v\n", err)
+				} else {
+					fmt.Println("· bearer token rotated + saved")
+				}
+			}
 		}
 	}
 }

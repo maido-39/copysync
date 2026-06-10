@@ -85,10 +85,42 @@ func run(cfg config.Config, log *slog.Logger) error {
 		if err != nil || !found || rec.Revoked {
 			return model.Device{}, false
 		}
-		if !auth.ConstantTimeEqual(rec.TokenHash, auth.HashToken(secret, token)) {
+		presented := auth.HashToken(secret, token)
+		// Accept the current token, or the previous one during a rotation grace.
+		if !auth.ConstantTimeEqual(rec.TokenHash, presented) && !auth.ConstantTimeEqual(rec.PrevHash, presented) {
 			return model.Device{}, false
 		}
 		return dev, true
+	}
+
+	// maybeRotate runs after a successful auth (Stage-3 token rotation): it retires
+	// the old token once the new one is in use, and re-issues tokens older than the
+	// configured age. Returns a new plaintext token to deliver, or "".
+	maybeRotate := func(id model.DeviceID, token string) string {
+		rec, found, err := st.GetToken(id)
+		if err != nil || !found {
+			return ""
+		}
+		presented := auth.HashToken(secret, token)
+		curMatch := auth.ConstantTimeEqual(rec.TokenHash, presented)
+		// Client presented the NEW token while an old one is still pending → retire it.
+		if curMatch && rec.PrevHash != "" {
+			_ = st.RetireOldToken(id)
+			return ""
+		}
+		// Re-issue only from the current token, when enabled, not already rotating, and old enough.
+		s, _ := st.GetSettings()
+		if s.TokenRotateDays <= 0 || rec.PrevHash != "" || !curMatch {
+			return ""
+		}
+		if time.Since(rec.IssuedAt) < time.Duration(s.TokenRotateDays)*24*time.Hour {
+			return ""
+		}
+		newToken := auth.GenerateToken()
+		if st.RotateToken(id, auth.HashToken(secret, newToken), time.Now()) != nil {
+			return ""
+		}
+		return newToken
 	}
 
 	// The blob channel authenticates by bearer token alone; resolve it to a
@@ -102,11 +134,12 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 
 	wsHandler := transport.Handler(transport.Deps{
-		Hub:           h,
-		Log:           log,
-		Now:           time.Now,
-		ValidateToken: validate,
-		MaxMessage:    func() int64 { s, _ := st.GetSettings(); return s.MaxMessageBytes },
+		Hub:              h,
+		Log:              log,
+		Now:              time.Now,
+		ValidateToken:    validate,
+		MaybeRotateToken: maybeRotate,
+		MaxMessage:       func() int64 { s, _ := st.GetSettings(); return s.MaxMessageBytes },
 	})
 
 	api := httpapi.New(httpapi.Config{

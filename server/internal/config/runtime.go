@@ -14,7 +14,8 @@ type RuntimeSettings struct {
 	AllowServerBroadcast   bool     `json:"allowServerBroadcast"`   // admin broadcast (auto-off when E2E on)
 	SessionTTLSeconds      int64    `json:"sessionTtlSeconds"`      // admin session lifetime
 	PairingCodeTTLSeconds  int64    `json:"pairingCodeTtlSeconds"`
-	Pools                  []string `json:"pools"` // available share pools; clips route within a pool
+	Pools                  []string `json:"pools"`           // available share pools; clips route within a pool
+	TokenRotateDays        int      `json:"tokenRotateDays"` // re-issue device tokens older than N days (0 = disabled)
 }
 
 // DefaultRuntimeSettings returns the built-in defaults.
@@ -32,6 +33,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		SessionTTLSeconds:      12 * 3600,
 		PairingCodeTTLSeconds:  5 * 60,
 		Pools:                  []string{"default"},
+		TokenRotateDays:        0, // opt-in; admin enables in Settings
 	}
 }
 
@@ -58,6 +60,9 @@ func (s *RuntimeSettings) Normalize() {
 	}
 	if s.PairingCodeTTLSeconds < 30 {
 		s.PairingCodeTTLSeconds = 30
+	}
+	if s.TokenRotateDays < 0 {
+		s.TokenRotateDays = 0
 	}
 	// Pools: always include "default", dedupe, drop blanks.
 	seen := map[string]bool{}

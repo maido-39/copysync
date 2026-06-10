@@ -24,6 +24,8 @@ const (
 	TypePresence = "presence"     // S->C
 	TypeRoster   = "roster"       // S->C
 	TypeError    = "error"        // S->C
+	// TypeTokenRotate delivers a re-issued bearer token; the client persists it.
+	TypeTokenRotate = "token_rotate" // S->C
 )
 
 // Envelope wraps every control-channel frame: {"t": <type>, "d": <payload>}.
@@ -64,6 +66,13 @@ type HelloOK struct {
 // SetPool changes the sending device's share pool (clips route within a pool).
 type SetPool struct {
 	Pool string `json:"pool"`
+}
+
+// TokenRotate carries a freshly issued bearer token. The client must persist it
+// and use it on the next connect; the server retires the old token once it sees
+// the new one in use.
+type TokenRotate struct {
+	Token string `json:"token"`
 }
 
 // BlobRequest asks the origin device to upload an on-demand blob to the server now.
