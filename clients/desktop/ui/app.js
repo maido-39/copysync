@@ -43,10 +43,15 @@ function fmtSize(n) {
   return `${v.toFixed(i ? 1 : 0)} ${u[i]}`;
 }
 let lastRows = [];
-// Received files/images keep their saved local path in `preview`; that's what we
-// thumbnail/snippet. (Text clips put the text itself there; outbound has no file.)
+// Files/images keep their saved local path in `preview` (inbound: the downloaded
+// file; outbound images: a locally cached PNG) — that's what we thumbnail/snippet.
+// Text clips put the text itself there, so only treat path-looking values as files.
 function itemPath(e) {
-  return e.direction === "in" && (e.kind === "image" || e.kind === "file") ? e.preview : null;
+  const p = e.preview || "";
+  const looksPath = p.includes("/") || p.includes("\\");
+  if (e.kind === "image") return looksPath ? p : null;
+  if (e.kind === "file" && e.direction === "in") return looksPath ? p : null;
+  return null;
 }
 function itemHtml(e, i) {
   const label = e.kind === "image" ? "이미지" : e.kind === "file" ? "파일" : "텍스트";

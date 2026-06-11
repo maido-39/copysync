@@ -432,11 +432,11 @@ class SyncService : Service() {
                                 capture?.applyInboundImage(data!!, nm, settings.sensitiveMark)
                                 scheduleAutoClear(sha256Hex(data!!))
                                 dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data!!) }, "image", ev.blobId!!, nm, data!!.size.toLong(), imageMime, enc = ev.enc != null))
-                                Notifications.notifyClip(this, ev.originDeviceId, "(image)")
+                                Notifications.notifyClip(this, ev.originDeviceId, "🖼 $nm", data)
                             } else {
                                 // on-demand: thumbnail is cached, but let the user save it explicitly
                                 dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, "image", ev.blobId!!, nm, ev.size, imageMime, enc = ev.enc != null))
-                                Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null)
+                                Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, imageMime, ev.enc != null, data)
                             }
                             SyncState.lastEvent.value = "↓ image ${data!!.size / 1024}KB"
                             DebugLog.i("received image ${data!!.size} bytes (onDemand=${ev.onDemand}, e2e=${ev.enc != null})")

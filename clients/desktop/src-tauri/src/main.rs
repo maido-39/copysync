@@ -559,6 +559,18 @@ async fn send_text_clip(
     true
 }
 
+/// Cache an outbound clipboard image locally so the history can render its
+/// thumbnail (inbound images already persist a file; outbound only kept a label).
+fn cache_outbound_image(app: &AppHandle, png: &[u8]) -> Option<String> {
+    let dir = app.path().app_data_dir().ok()?.join("clip-out");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.png", sha_hex(png)));
+    if !path.exists() {
+        std::fs::write(&path, png).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_image_clip(
     sock: &mut ws::Ws,
@@ -610,7 +622,8 @@ async fn send_image_clip(
     if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
         return false;
     }
-    add_history(hist, &ev.ts, "image", "me", "out", "(클립보드 이미지)", "image/png", png.len() as i64, &ev.blob_id, "clipboard.png");
+    let prev = cache_outbound_image(app, &png).unwrap_or_else(|| "(클립보드 이미지)".into());
+    add_history(hist, &ev.ts, "image", "me", "out", &prev, "image/png", png.len() as i64, &ev.blob_id, "clipboard.png");
     let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"image","name":"clipboard.png","size":png.len()}));
     true
 }
