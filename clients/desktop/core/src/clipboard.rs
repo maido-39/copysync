@@ -28,6 +28,23 @@ pub fn get_image() -> Result<Image> {
     })
 }
 
+/// File paths on the clipboard (Windows Explorer "copy file" = CF_HDROP). Returns
+/// None on non-Windows, or when the clipboard holds no file list.
+#[cfg(windows)]
+pub fn get_files() -> Option<Vec<String>> {
+    let files: Vec<String> = clipboard_win::get_clipboard(clipboard_win::formats::FileList).ok()?;
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn get_files() -> Option<Vec<String>> {
+    None
+}
+
 pub fn set_image(img: &Image) -> Result<()> {
     arboard::Clipboard::new()?.set_image(arboard::ImageData {
         width: img.width,

@@ -359,12 +359,14 @@ fn start_sync(app: &AppHandle, cfg: Config) {
 fn clipboard_loop(tx: UnboundedSender<Cmd>) {
     let mut last_text = String::new();
     let mut last_img = String::new();
+    let mut last_files = String::new();
     loop {
         match clipboard::get_text() {
             Ok(t) if !t.is_empty() => {
                 if t != last_text {
                     last_text = t.clone();
                     last_img.clear();
+                    last_files.clear();
                     let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
                     let _ = tx.send(Cmd::LocalText { text: t, html });
                 }
@@ -375,7 +377,19 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>) {
                     if h != last_img {
                         last_img = h;
                         last_text.clear();
+                        last_files.clear();
                         let _ = tx.send(Cmd::LocalImage(img));
+                    }
+                } else if let Some(files) = clipboard::get_files() {
+                    // Windows Explorer file copy (CF_HDROP): send each file.
+                    let key = files.join("\u{1}");
+                    if key != last_files {
+                        last_files = key;
+                        last_text.clear();
+                        last_img.clear();
+                        for f in files {
+                            let _ = tx.send(Cmd::SendFile(f));
+                        }
                     }
                 }
             }

@@ -30,6 +30,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 

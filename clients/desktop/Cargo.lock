@@ -717,6 +717,7 @@ dependencies = [
  "arboard",
  "argon2",
  "base64 0.22.1",
+ "clipboard-win",
  "futures-util",
  "hex",
  "image",
