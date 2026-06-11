@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Core permissions for the CopySync window.",
-  "windows": ["main", "quickpanel"],
+  "windows": ["main", "quickpanel", "toast"],
   "permissions": ["core:default", "dialog:default", "notification:default", "autostart:default", "global-shortcut:default"]
 }

@@ -147,6 +147,49 @@ fn preview(s: &str) -> String {
     }
 }
 
+/// A reliable incoming-clip popup: a small always-on-top window shown bottom-right.
+/// Used instead of OS toasts, which don't appear for portable (uninstalled) Windows
+/// builds. Resolves the sender's friendly name from the roster.
+fn show_toast(app: &AppHandle, origin: &str, body: &str, image: Option<String>) {
+    let name = {
+        let st = app.state::<AppState>();
+        let r = st.roster.lock().unwrap();
+        r.iter()
+            .find(|d| d.id == origin)
+            .map(|d| d.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "다른 기기".to_string())
+    };
+    if let Some(win) = app.get_webview_window("toast") {
+        if let (Ok(Some(mon)), Ok(ws)) = (win.primary_monitor(), win.outer_size()) {
+            let sz = mon.size();
+            let m = 16i32;
+            let x = sz.width as i32 - ws.width as i32 - m;
+            let y = sz.height as i32 - ws.height as i32 - 56 - m;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x.max(0), y.max(0)));
+        }
+        let _ = win.emit("toast-show", serde_json::json!({ "title": name, "body": body, "image": image }));
+        let _ = win.show();
+    }
+}
+
+/// A small base64 PNG data-URI thumbnail from raw image bytes (for the toast).
+fn thumb_data_uri(data: &[u8]) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let img = image::load_from_memory(data).ok()?;
+    let thumb = img.thumbnail(128, 128);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(buf.into_inner())))
+}
+
+#[tauri::command]
+fn hide_toast(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("toast") {
+        let _ = win.hide();
+    }
+}
+
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -843,9 +886,9 @@ async fn handle_incoming(
                 remember(recent_img, sha_hex(&img.rgba));
                 let _ = clipboard::set_image(&img);
             }
-            notify(app, "CopySync", &format!("이미지를 받았습니다 · {}", human(plain.len())));
+            show_toast(app, &ev.origin_device, &format!("🖼 {name} · {}", human(plain.len())), thumb_data_uri(&plain));
         } else {
-            notify(app, "CopySync", &format!("파일: {name} · {}", human(plain.len())));
+            show_toast(app, &ev.origin_device, &format!("📎 {name} · {}", human(plain.len())), None);
         }
         add_history(hist, &ev.ts, ev.kind(), &ev.origin_device, "in", &path.to_string_lossy(),
             ev.mime.first().map(|s| s.as_str()).unwrap_or(""), plain.len() as i64, &ev.blob_id, &name);
@@ -898,7 +941,7 @@ async fn handle_incoming(
         None => { let _ = clipboard::set_text(&text); }
     }
     add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
-    notify(app, "CopySync", &preview(&text));
+    show_toast(app, &ev.origin_device, &preview(&text), None);
     let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":"text","text":text,"origin":ev.origin_device}));
 }
 
@@ -1048,7 +1091,8 @@ fn main() {
             set_autostart,
             set_pool,
             pair,
-            quickpanel_copy
+            quickpanel_copy,
+            hide_toast
         ])
         .run(tauri::generate_context!())
         .expect("error while running CopySync");
