@@ -22,7 +22,7 @@ use copysync_core::history::{Entry, History};
 use copysync_core::protocol::{
     self, BlobRequest, ClipEvent, DeviceInfo, EncMeta, Presence, Roster, Targets,
 };
-use copysync_core::{blob, e2e, pairing, pinning, ws, Config};
+use copysync_core::{blob, e2e, pairing, pinning, privacy, ws, Config};
 
 /// Commands flowing into the sync actor.
 enum Cmd {
@@ -188,6 +188,19 @@ fn hide_toast(app: AppHandle) {
     if let Some(win) = app.get_webview_window("toast") {
         let _ = win.hide();
     }
+}
+
+/// Delete a (sensitive) history row after a TTL so secrets don't linger.
+fn schedule_purge(hist: Arc<Mutex<History>>, id: i64, ttl_secs: u64) {
+    if id < 0 || ttl_secs == 0 {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
+        if let Ok(h) = hist.lock() {
+            let _ = h.delete(id);
+        }
+    });
 }
 
 fn file_name(path: &str) -> String {
@@ -468,6 +481,7 @@ async fn sync_actor(
         }
     };
     let key = cfg.e2e_key();
+    let custom_res = cfg.custom_regexes();
     let http = pinning::http_client(pin);
     let pull = blob::pull_client(pin);
     let mut seq: u64 = 0;
@@ -495,6 +509,17 @@ async fn sync_actor(
                                 let sha = sha_hex(text.as_bytes());
                                 if seen(&recent_text, &sha) { continue; }
                                 remember(&mut recent_text, sha);
+                                if cfg.exclude_sensitive {
+                                    if let Some(reason) = privacy::classify(&text, &custom_res) {
+                                        // Privacy filter: never sync; record locally + auto-purge.
+                                        let id = hist.lock().unwrap()
+                                            .add(&protocol::now_ts(), "text", "me", "out", &text, "text/plain", text.len() as i64, "", "")
+                                            .unwrap_or(-1);
+                                        schedule_purge(hist.clone(), id, cfg.sensitive_ttl_secs);
+                                        let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"text","text":text,"sensitive":reason.label()}));
+                                        continue;
+                                    }
+                                }
                                 if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&targets), &app, &hist).await { break; }
                             }
                             Some(Cmd::SendText(t)) => {

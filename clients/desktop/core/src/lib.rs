@@ -13,6 +13,7 @@ pub mod e2e;
 pub mod history;
 pub mod pairing;
 pub mod pinning;
+pub mod privacy;
 pub mod protocol;
 pub mod ws;
 

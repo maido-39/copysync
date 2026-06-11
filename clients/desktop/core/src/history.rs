@@ -133,6 +133,12 @@ impl History {
             .collect())
     }
 
+    /// Delete a row by id (purges sensitive clips after their TTL).
+    pub fn delete(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     fn query(&self, sql: &str, p: impl rusqlite::Params) -> anyhow::Result<Vec<Entry>> {
         let key = self.key;
         let mut stmt = self.conn.prepare(sql)?;

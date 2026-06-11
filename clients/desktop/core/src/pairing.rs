@@ -74,5 +74,8 @@ pub async fn claim(
         token: r.token,
         pin,
         e2e_pass: e2e_pass.to_string(),
+        exclude_sensitive: true,
+        sensitive_ttl_secs: 45,
+        custom_patterns: Vec::new(),
     })
 }
