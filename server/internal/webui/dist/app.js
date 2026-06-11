@@ -100,7 +100,7 @@
     root.appendChild(el("div", { class: "auth-wrap" },
       el("div", { class: "auth" },
         el("div", { class: "logo" },
-          el("div", { class: "mark" }, "📋"),
+          el("img", { class: "logo-img", src: "/mascot.png", alt: "CopySync" }),
           el("h1", null, "CopySync"),
           el("p", null, sub || "self-hosted LAN clipboard sync")),
         el("div", { class: "card" }, el("h2", null, title), formNode))));
@@ -166,7 +166,7 @@
     });
     var sidebar = el("aside", { class: "sidebar" },
       el("div", { class: "brand" },
-        el("div", { class: "mark" }, "📋"),
+        el("img", { class: "brand-img", src: "/mascot.png", alt: "" }),
         el("div", null, el("b", null, "CopySync"), el("div", { class: "srv" }, state.me.serverName || ""))),
       nav,
       el("div", { class: "foot" },

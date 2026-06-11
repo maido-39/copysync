@@ -32,3 +32,7 @@ coverage*.out
 .idea/
 .vscode/
 *.swp
+
+# Synology NAS metadata
+@eaDir/
+**/@eaDir/
