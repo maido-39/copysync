@@ -5,9 +5,11 @@
 *.out
 coverage*.out
 
-# Local runtime state (bbolt db, self-signed certs, blobs)
+# Local runtime state (bbolt db, self-signed certs, blobs).
+# NOTE: anchored to the repo root only — a bare `**/data/` also matches source
+# packages like clients/android/.../data/, so do not re-add it.
 /data/
-**/data/
+/server/data/
 *.db
 
 # Android / Gradle
