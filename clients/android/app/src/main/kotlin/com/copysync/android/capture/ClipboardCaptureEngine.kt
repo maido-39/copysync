@@ -187,7 +187,12 @@ class ClipboardCaptureEngine(
     }
 
     /** Write an inbound image to the clipboard via a FileProvider URI. */
-    fun applyInboundImage(bytes: ByteArray, name: String, sensitive: Boolean = false) {
+    fun applyInboundImage(bytes: ByteArray, name: String, sensitive: Boolean = false) =
+        applyInboundFile(bytes, name, sensitive)
+
+    /** Write an inbound file of ANY type to the clipboard via a FileProvider URI,
+     *  so a sub-threshold file is immediately pasteable (no manual download). */
+    fun applyInboundFile(bytes: ByteArray, name: String, sensitive: Boolean = false) {
         val sha = sha256Hex(bytes)
         guard.mark(sha)
         lastActivitySha = sha

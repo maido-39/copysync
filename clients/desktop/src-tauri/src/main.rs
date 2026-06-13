@@ -30,6 +30,7 @@ enum Cmd {
     LocalImage(Image),   // OS-clipboard image change (echo-guarded)
     SendText(String),    // explicit text send from the UI
     SendFile(String),    // explicit file send from the UI (path)
+    LocalFiles(Vec<String>), // OS-clipboard file copy (CF_HDROP); echo-guarded
     SetPool(String),     // switch this device's share pool
 }
 
@@ -437,15 +438,13 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>) {
                         let _ = tx.send(Cmd::LocalImage(img));
                     }
                 } else if let Some(files) = clipboard::get_files() {
-                    // Windows Explorer file copy (CF_HDROP): send each file.
+                    // Windows Explorer file copy (CF_HDROP).
                     let key = files.join("\u{1}");
                     if key != last_files {
                         last_files = key;
                         last_text.clear();
                         last_img.clear();
-                        for f in files {
-                            let _ = tx.send(Cmd::SendFile(f));
-                        }
+                        let _ = tx.send(Cmd::LocalFiles(files));
                     }
                 }
             }
@@ -487,6 +486,7 @@ async fn sync_actor(
     let mut seq: u64 = 0;
     let mut recent_text: VecDeque<String> = VecDeque::new();
     let mut recent_img: VecDeque<String> = VecDeque::new();
+    let mut recent_files: VecDeque<String> = VecDeque::new();
     let mut on_demand: HashMap<String, Hold> = HashMap::new();
 
     loop {
@@ -535,6 +535,13 @@ async fn sync_actor(
                             Some(Cmd::SendFile(p)) => {
                                 if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
                             }
+                            Some(Cmd::LocalFiles(files)) => {
+                                for p in files {
+                                    // Skip a file we just placed on the clipboard from an inbound clip (echo).
+                                    if seen(&recent_files, &p) { continue; }
+                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
+                                }
+                            }
                             Some(Cmd::SetPool(name)) => {
                                 if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break; }
                                 let snap = { let mut s = status.lock().unwrap(); s.pool = name; s.clone() };
@@ -554,7 +561,7 @@ async fn sync_actor(
                                         }
                                     }
                                 } else {
-                                    handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &on_demand).await;
+                                    handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &mut recent_files, &on_demand).await;
                                 }
                             }
                             Ok(None) => break,
@@ -827,12 +834,13 @@ async fn handle_frame(
     roster: &Arc<Mutex<Vec<RosterDevice>>>,
     recent_text: &mut VecDeque<String>,
     recent_img: &mut VecDeque<String>,
+    recent_files: &mut VecDeque<String>,
     on_demand: &HashMap<String, Hold>,
 ) {
     match t.as_str() {
         protocol::T_CLIP => {
             if let Ok(ev) = serde_json::from_value::<ClipEvent>(d) {
-                handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img).await;
+                handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img, recent_files).await;
             }
         }
         protocol::T_BLOB_REQUEST => {
@@ -874,6 +882,7 @@ async fn handle_incoming(
     downloads: &Path,
     recent_text: &mut VecDeque<String>,
     recent_img: &mut VecDeque<String>,
+    recent_files: &mut VecDeque<String>,
 ) {
     if ev.is_blob() {
         let data = match blob::get_blob(pull, &cfg.server_url, &cfg.token, &ev.blob_id).await {
@@ -913,6 +922,12 @@ async fn handle_incoming(
             }
             show_toast(app, &ev.origin_device, &format!("🖼 {name} · {}", human(plain.len())), thumb_data_uri(&plain));
         } else {
+            // Eager (≤ threshold) file: put it on the clipboard so it's pasteable.
+            if !ev.on_demand {
+                let p = path.to_string_lossy().to_string();
+                remember(recent_files, p.clone());
+                let _ = clipboard::set_files(&[p]);
+            }
             show_toast(app, &ev.origin_device, &format!("📎 {name} · {}", human(plain.len())), None);
         }
         add_history(hist, &ev.ts, ev.kind(), &ev.origin_device, "in", &path.to_string_lossy(),

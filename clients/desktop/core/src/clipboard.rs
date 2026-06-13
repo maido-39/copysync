@@ -45,6 +45,22 @@ pub fn get_files() -> Option<Vec<String>> {
     None
 }
 
+/// Put file paths on the clipboard (Windows Explorer paste = CF_HDROP), so a
+/// received file is immediately pasteable. No-op off Windows.
+#[cfg(windows)]
+pub fn set_files(paths: &[String]) -> Result<()> {
+    let _clip = clipboard_win::Clipboard::new_attempts(10)
+        .map_err(|e| anyhow::anyhow!("open clipboard: {e}"))?;
+    clipboard_win::raw::empty().map_err(|e| anyhow::anyhow!("empty clipboard: {e}"))?;
+    clipboard_win::raw::set_file_list(paths).map_err(|e| anyhow::anyhow!("set CF_HDROP: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_files(_paths: &[String]) -> Result<()> {
+    Ok(())
+}
+
 pub fn set_image(img: &Image) -> Result<()> {
     arboard::Clipboard::new()?.set_image(arboard::ImageData {
         width: img.width,

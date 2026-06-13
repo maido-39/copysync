@@ -446,14 +446,39 @@ class SyncService : Service() {
                             DebugLog.w("inbound image: fetch/decrypt failed for ${ev.blobId}")
                         }
                     }
+                    ev.blobId != null && !ev.onDemand -> {
+                        // Eager (≤ threshold) file of ANY type: fetch, decrypt, and put it
+                        // straight on the clipboard so it's immediately pasteable.
+                        ensureKey()
+                        var data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
+                        if (data != null && ev.enc != null) {
+                            val k = key
+                            data = if (k != null) runCatching { E2eCrypto.open(k, data!!) }.getOrNull() else null
+                        }
+                        val nm = ev.name ?: "file"
+                        val kind = if (imageMime != null) "image" else "file"
+                        if (data != null) {
+                            runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ev.blobId!!.removePrefix("sha256:")).writeBytes(data!!) }
+                            capture?.applyInboundFile(data!!, nm, settings.sensitiveMark)
+                            scheduleAutoClear(sha256Hex(data!!))
+                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256.ifEmpty { sha256Hex(data!!) }, kind, ev.blobId!!, nm, data!!.size.toLong(), ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
+                            Notifications.notifyClip(this, ev.originDeviceId, "📎 $nm", if (imageMime != null) data else null)
+                            SyncState.lastEvent.value = "↓ $nm → 클립보드"
+                            DebugLog.i("received file → clipboard: $nm (${data!!.size} bytes, e2e=${ev.enc != null})")
+                        } else {
+                            dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
+                            Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*", ev.enc != null)
+                            DebugLog.w("eager file fetch failed → downloadable: $nm")
+                        }
+                    }
                     ev.blobId != null -> {
-                        // Non-image file, or a large on-demand image → record as downloadable.
+                        // On-demand (> threshold): record as downloadable; fetched on tap.
                         val nm = ev.name ?: "file"
                         val kind = if (imageMime != null) "image" else "file"
                         dao.insert(fileEntity(ev.id, "in", ev.originDeviceId, ev.sha256, kind, ev.blobId!!, nm, ev.size, ev.mime.firstOrNull() ?: "", enc = ev.enc != null))
                         Notifications.notifyDownloadable(this, ev.originDeviceId, ev.blobId!!, nm, ev.mime.firstOrNull() ?: "*/*", ev.enc != null)
                         SyncState.lastEvent.value = "↓ $nm (download)"
-                        DebugLog.i("received file metadata: $nm (${ev.size} bytes, onDemand=${ev.onDemand}, e2e=${ev.enc != null})")
+                        DebugLog.i("received file metadata: $nm (${ev.size} bytes, onDemand=true, e2e=${ev.enc != null})")
                     }
                     else -> DebugLog.i("ignoring unsupported clip (mime=${ev.mime})")
                 }
