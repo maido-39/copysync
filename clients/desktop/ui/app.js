@@ -13,6 +13,24 @@ document.querySelectorAll("nav#tabs button").forEach((b) => {
   });
 });
 
+// ---- debug log (event recorder for the 디버깅 tab)
+let dbgRecording = false;
+const dbgLines = [];
+function dbg(msg) {
+  if (!dbgRecording) return;
+  const t = new Date().toLocaleTimeString();
+  dbgLines.push("[" + t + "] " + msg);
+  if (dbgLines.length > 500) dbgLines.shift();
+  const el = $("#dbg-log");
+  if (el) el.textContent = dbgLines.join("\n");
+}
+$("#dbg-record").addEventListener("change", (e) => {
+  dbgRecording = e.target.checked;
+  dbg("기록 " + (dbgRecording ? "시작" : "중지"));
+});
+$("#dbg-copy").addEventListener("click", () => navigator.clipboard.writeText(dbgLines.join("\n")).catch(() => {}));
+$("#dbg-clear").addEventListener("click", () => { dbgLines.length = 0; const el = $("#dbg-log"); if (el) el.textContent = ""; });
+
 // ---- status
 function renderStatus(s) {
   $("#s-server").textContent = s.server_name || "—";
@@ -136,7 +154,7 @@ document.querySelectorAll('input[name=route]').forEach((r) =>
 async function loadRoster() {
   try { roster = await invoke("get_roster"); renderDevices(); } catch (e) {}
 }
-listen("roster", (ev) => { roster = ev.payload || []; renderDevices(); });
+listen("roster", (ev) => { roster = ev.payload || []; dbg("로스터 " + roster.length + "대"); renderDevices(); });
 loadRoster();
 
 // ---- pair
@@ -159,9 +177,20 @@ $("#pair-btn").addEventListener("click", async () => {
 });
 
 // ---- live events
-listen("status", (ev) => renderStatus(ev.payload));
-listen("clip", () => { if ($("#history").classList.contains("active")) loadHistory(); });
-listen("error", (ev) => console.warn("copysync:", ev.payload));
+let lastConn = null;
+listen("status", (ev) => {
+  const s = ev.payload || {};
+  if (s.connected !== lastConn) { lastConn = s.connected; dbg("연결 " + (s.connected ? "됨" : "끊김")); }
+  renderStatus(s);
+});
+listen("clip", (ev) => {
+  const p = ev.payload || {};
+  const arrow = p.direction === "out" ? "↑보냄" : "↓받음";
+  const body = p.text ? p.text.slice(0, 60) : (p.name || "");
+  dbg("클립 " + arrow + " " + (p.kind || "text") + " " + (p.sensitive ? "🔒 " : "") + body);
+  if ($("#history").classList.contains("active")) loadHistory();
+});
+listen("error", (ev) => { dbg("오류 " + ev.payload); console.warn("copysync:", ev.payload); });
 
 // ---- autostart
 async function loadAutostart() {

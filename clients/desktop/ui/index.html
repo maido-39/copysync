@@ -15,8 +15,8 @@
     <nav id="tabs">
       <button data-tab="status" class="active">🔗 연결</button>
       <button data-tab="history">📋 기록</button>
-      <button data-tab="pair">🔌 페어링</button>
       <button data-tab="settings">⚙️ 설정</button>
+      <button data-tab="debug">🐞 디버깅</button>
     </nav>
 
     <main>
@@ -62,10 +62,17 @@
         <div id="hist-list" class="list"></div>
       </section>
 
-      <!-- 페어링 -->
-      <section id="pair" class="tab">
+      <!-- 설정 -->
+      <section id="settings" class="tab">
         <div class="card">
-          <h2>기기 페어링</h2>
+          <h2>동기화 · 보안</h2>
+          <label class="radio"><input type="checkbox" id="privacy-filter" /> 민감 클립 동기화 제외</label>
+          <p class="hint">비밀번호·카드·키·OTP로 추정되는 클립은 다른 기기로 보내지 않습니다.</p>
+          <label class="radio"><input type="checkbox" id="autostart" /> 부팅 시 자동 시작</label>
+          <p class="hint">창을 닫으면 트레이로 최소화되고 동기화는 계속됩니다.</p>
+        </div>
+        <div class="card">
+          <h2>기기 페어링 / 재페어링</h2>
           <p class="hint">서버 관리자 화면에서 OTP를 만들어 입력하세요. 핀을 비우면 최초 접속 시 자동 신뢰합니다.</p>
           <label>서버 주소<input id="p-server" placeholder="https://192.168.0.10:8443" /></label>
           <label>OTP<input id="p-otp" placeholder="8자리 코드" /></label>
@@ -74,24 +81,26 @@
           <label>E2E 암호문 (선택)<input id="p-e2e" type="password" placeholder="모든 기기에서 동일하게" /></label>
           <button id="pair-btn" class="primary">페어링</button>
           <p id="pair-msg" class="msg"></p>
-        </div>
-      </section>
-
-      <!-- 설정 -->
-      <section id="settings" class="tab">
-        <div class="card">
-          <h2>설정</h2>
-          <dl class="kv">
-            <dt>서버 ID</dt><dd id="set-sid">—</dd>
-          </dl>
-          <label class="radio"><input type="checkbox" id="autostart" /> 부팅 시 자동 시작</label>
-          <label class="radio"><input type="checkbox" id="privacy-filter" /> 민감 클립 동기화 제외 (비번·카드·키·OTP)</label>
-          <p class="hint">설정은 페어링 시 저장됩니다. 창을 닫으면 트레이로 최소화되고 동기화는 계속됩니다.</p>
+          <dl class="kv" style="margin-top:10px"><dt>서버 ID</dt><dd id="set-sid">—</dd></dl>
         </div>
         <div class="card">
           <h2>정보</h2>
           <p class="hint">CopySync 데스크톱 · Tauri + webkit · 프로토콜 v1<br/>
           클립보드는 종단간(E2E) 암호화로 동기화되며 서버는 내용을 볼 수 없습니다.</p>
+        </div>
+      </section>
+
+      <!-- 디버깅 -->
+      <section id="debug" class="tab">
+        <div class="card">
+          <h2>디버깅</h2>
+          <label class="radio"><input type="checkbox" id="dbg-record" /> 이벤트 기록</label>
+          <p class="hint">켜면 동기화 이벤트(보냄/받음·연결·오류)를 기록합니다. 문제 보고 시 복사해 주세요.</p>
+          <div class="row">
+            <button id="dbg-copy">복사</button>
+            <button id="dbg-clear">지우기</button>
+          </div>
+          <pre id="dbg-log" style="font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:50vh;overflow:auto;background:rgba(0,0,0,.25);border-radius:8px;padding:10px;margin-top:8px"></pre>
         </div>
       </section>
     </main>
