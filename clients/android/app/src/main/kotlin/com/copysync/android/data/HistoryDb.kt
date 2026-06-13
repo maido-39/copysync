@@ -48,6 +48,9 @@ interface ClipDao {
 
     @Query("DELETE FROM clips WHERE rowid NOT IN (SELECT rowid FROM clips ORDER BY ts DESC LIMIT :keep)")
     suspend fun prune(keep: Int)
+
+    @Query("DELETE FROM clips WHERE clipId = :id")
+    suspend fun deleteByClipId(id: String)
 }
 
 @Database(entities = [ClipEntity::class], version = 3, exportSchema = false)

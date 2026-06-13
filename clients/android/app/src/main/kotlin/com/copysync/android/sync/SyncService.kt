@@ -409,6 +409,10 @@ class SyncService : Service() {
                                 origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) }, enc = ev.enc != null,
                             ),
                         )
+                        if (Privacy.classify(text) != null) {
+                            // Received password-like clip: purge from history after a short TTL.
+                            scope.launch { delay(45_000L); runCatching { dao.deleteByClipId(ev.id) } }
+                        }
                         if (readable) {
                             var html: String? = ev.html?.takeIf { it.isNotEmpty() }
                             if (html != null && ev.enc != null) {

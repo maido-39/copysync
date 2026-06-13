@@ -999,7 +999,11 @@ async fn handle_incoming(
         Some(h) => { let _ = clipboard::set_html(h, &text); }
         None => { let _ = clipboard::set_text(&text); }
     }
-    add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
+    let row = add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
+    if privacy::classify(&text, &[]).is_some() {
+        // Received password-like clip: purge from local history after the TTL.
+        schedule_purge(hist.clone(), row, cfg.sensitive_ttl_secs);
+    }
     show_toast(app, &ev.origin_device, &preview(&text), None);
     let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":"text","text":text,"origin":ev.origin_device}));
 }
@@ -1031,9 +1035,11 @@ fn add_history(
     size: i64,
     blob_id: &str,
     name: &str,
-) {
+) -> i64 {
     if let Ok(h) = hist.lock() {
-        let _ = h.add(ts, kind, origin, dir, preview, mime, size, blob_id, name);
+        h.add(ts, kind, origin, dir, preview, mime, size, blob_id, name).unwrap_or(-1)
+    } else {
+        -1
     }
 }
 
