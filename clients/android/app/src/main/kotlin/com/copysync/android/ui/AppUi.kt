@@ -443,6 +443,7 @@ private fun SettingsTab() {
     var canOverlay by remember { mutableStateOf(AndroidSettings.canDrawOverlays(ctx)) }
     var e2ePass by remember { mutableStateOf(Secrets(ctx).e2ePass ?: "") }
     var sensitive by remember { mutableStateOf(settings.sensitiveMark) }
+    var excludeSens by remember { mutableStateOf(settings.excludeSensitive) }
     var autoClear by remember { mutableStateOf(settings.autoClearSeconds) }
 
     Column(
@@ -491,6 +492,11 @@ private fun SettingsTab() {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("보안", style = MaterialTheme.typography.titleSmall)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("민감 클립 동기화 제외", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                    Switch(checked = excludeSens, onCheckedChange = { excludeSens = it; settings.excludeSensitive = it })
+                }
+                Text("비밀번호·카드·키 등으로 추정되는 클립은 다른 기기로 보내지 않습니다.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Text("받은 항목 민감 표시", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                     Switch(checked = sensitive, onCheckedChange = { sensitive = it; settings.sensitiveMark = it })

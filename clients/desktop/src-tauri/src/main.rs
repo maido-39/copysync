@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -115,6 +116,7 @@ struct AppState {
     tray: Mutex<Option<tauri::tray::TrayIcon>>,
     cfg_path: PathBuf,
     downloads: PathBuf,
+    exclude_sensitive: Arc<AtomicBool>,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -291,6 +293,21 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_privacy_filter(state: State<'_, AppState>) -> bool {
+    state.exclude_sensitive.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_privacy_filter(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state.exclude_sensitive.store(enabled, Ordering::Relaxed);
+    if let Ok(mut cfg) = Config::load(&state.cfg_path) {
+        cfg.exclude_sensitive = enabled;
+        let _ = cfg.save(&state.cfg_path);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn get_roster(state: State<'_, AppState>) -> Vec<RosterDevice> {
     state.roster.lock().unwrap().clone()
 }
@@ -388,6 +405,7 @@ async fn pair(
 
 fn start_sync(app: &AppHandle, cfg: Config) {
     let state = app.state::<AppState>();
+    state.exclude_sensitive.store(cfg.exclude_sensitive, Ordering::Relaxed);
     {
         let mut s = state.status.lock().unwrap();
         s.paired = true;
@@ -481,6 +499,7 @@ async fn sync_actor(
     };
     let key = cfg.e2e_key();
     let custom_res = cfg.custom_regexes();
+    let exclude_flag = app.state::<AppState>().exclude_sensitive.clone();
     let http = pinning::http_client(pin);
     let pull = blob::pull_client(pin);
     let mut seq: u64 = 0;
@@ -509,7 +528,7 @@ async fn sync_actor(
                                 let sha = sha_hex(text.as_bytes());
                                 if seen(&recent_text, &sha) { continue; }
                                 remember(&mut recent_text, sha);
-                                if cfg.exclude_sensitive {
+                                if exclude_flag.load(Ordering::Relaxed) {
                                     if let Some(reason) = privacy::classify(&text, &custom_res) {
                                         // Privacy filter: never sync; record locally + auto-purge.
                                         let id = hist.lock().unwrap()
@@ -1060,6 +1079,7 @@ fn main() {
                 tray: Mutex::new(None),
                 cfg_path: dir.join("config.json"),
                 downloads: data.join("downloads"),
+                exclude_sensitive: Arc::new(AtomicBool::new(true)),
             };
             let cfg_path = state.cfg_path.clone();
             app.manage(state);
@@ -1129,6 +1149,8 @@ fn main() {
             send_file,
             get_autostart,
             set_autostart,
+            get_privacy_filter,
+            set_privacy_filter,
             set_pool,
             pair,
             quickpanel_copy,

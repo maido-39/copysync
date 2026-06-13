@@ -177,6 +177,20 @@ $("#autostart").addEventListener("change", async (e) => {
 });
 loadAutostart();
 
+// ---- privacy filter (toggle: don't sync sensitive clips)
+async function loadPrivacyFilter() {
+  try { $("#privacy-filter").checked = await invoke("get_privacy_filter"); } catch (e) {}
+}
+$("#privacy-filter").addEventListener("change", async (e) => {
+  try {
+    await invoke("set_privacy_filter", { enabled: e.target.checked });
+  } catch (err) {
+    alert("필터 설정 실패: " + err);
+    e.target.checked = !e.target.checked;
+  }
+});
+loadPrivacyFilter();
+
 $("#pool").addEventListener("change", (e) => {
   invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
 });

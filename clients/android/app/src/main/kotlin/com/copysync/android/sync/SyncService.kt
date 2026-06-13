@@ -21,6 +21,7 @@ import com.copysync.android.net.BlobRequest
 import com.copysync.android.net.ClipEvent
 import com.copysync.android.net.DeviceInfo
 import com.copysync.android.net.Presence
+import com.copysync.android.net.Privacy
 import com.copysync.android.net.Roster
 import com.copysync.android.net.TokenRotate
 import com.copysync.android.net.E2eCrypto
@@ -158,6 +159,14 @@ class SyncService : Service() {
                 is Captured.Text -> {
                     ensureKey()
                     val sha = sha256Hex(c.text)
+                    if (settings.excludeSensitive) {
+                        val sens = Privacy.classify(c.text)
+                        if (sens != null) {
+                            SyncState.lastEvent.value = "🔒 민감(${sens.label}) — 동기화 안 함"
+                            DebugLog.i("sensitive clip filtered (not synced): ${sens.label}")
+                            return@launch
+                        }
+                    }
                     dao.insert(
                         ClipEntity(
                             clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
