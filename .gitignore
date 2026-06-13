@@ -29,6 +29,10 @@ coverage*.out
 /dist/
 /livedata/
 
+# Docker: local env overrides (may hold admin pass) + the bind-mounted data dir
+# (bbolt db, blobs, TLS key). `/data/` is already ignored above; keep `.env` out.
+.env
+
 # Editor / OS
 .DS_Store
 .idea/

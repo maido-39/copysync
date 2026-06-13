@@ -6,18 +6,31 @@ services:
     image: copysync:latest
     container_name: copysync
     restart: unless-stopped
-    ports:
-      - "8443:8443"
-    environment:
-      COPYSYNC_SERVER_NAME: "CopySync"
-      COPYSYNC_ADMIN_USER: "admin"
-      # Default password; you are FORCED to change it on first admin login.
-      COPYSYNC_ADMIN_PASS: "changeme"
-      # Extra TLS SAN entries (LAN IPs / hostnames) so clients can pin & connect.
-      # Auto-detected LAN IPs + localhost are always included.
-      # COPYSYNC_TLS_HOSTS: "192.168.1.10,copysync.local"
-    volumes:
-      - copysync-data:/data
 
-volumes:
-  copysync-data:
+    # Run as the HOST user (not root, not the image's 65532) so every file the
+    # server writes into the bind-mounted ./data — the bbolt db, blobs, and the
+    # TLS private key — stays owned by YOU and is safe to move/back up without
+    # sudo. Find your ids with `id -u` / `id -g`; override in .env if not 1000.
+    user: "${COPYSYNC_UID:-1000}:${COPYSYNC_GID:-1000}"
+
+    ports:
+      - "${COPYSYNC_PORT:-8443}:8443"
+
+    environment:
+      COPYSYNC_DATA_DIR: /data
+      COPYSYNC_HTTPS_ADDR: ":8443"
+      COPYSYNC_SERVER_NAME: "${COPYSYNC_SERVER_NAME:-CopySync}"
+      COPYSYNC_ADMIN_USER: "${COPYSYNC_ADMIN_USER:-admin}"
+      # You are FORCED to change this on first admin login.
+      COPYSYNC_ADMIN_PASS: "${COPYSYNC_ADMIN_PASS:-changeme}"
+      # Extra TLS SANs (comma-separated LAN IPs / hostnames). Auto-detected LAN
+      # IPs + localhost are always included.
+      COPYSYNC_TLS_HOSTS: "${COPYSYNC_TLS_HOSTS:-}"
+      COPYSYNC_LOG_LEVEL: "${COPYSYNC_LOG_LEVEL:-info}"
+
+    # PORTABLE STATE — everything that makes this server *this* server (identity
+    # /TLS pin, paired devices, settings, queued blobs) lives in one host folder.
+    # Move ./data + this file to another machine and `docker compose up` brings
+    # up the exact same server. Default ./data; override with COPYSYNC_DATA.
+    volumes:
+      - "${COPYSYNC_DATA:-./data}:/data"

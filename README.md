@@ -59,16 +59,28 @@ docs/PROTOCOL.md    wire protocol — source of truth for all clients
 ## Quick start (Docker)
 
 ```bash
+cp .env.example .env          # set COPYSYNC_UID/GID to your `id -u`/`id -g` if not 1000
+mkdir -p data && chmod 700 data   # create the data dir FIRST (see Permissions)
 docker compose up --build -d
 ```
 
-Then open the admin UI at **https://<server-ip>:8443** (accept the self-signed
-certificate warning). First login uses `admin` / `changeme` and **forces** you to
-set a new password.
+Open the admin UI at **https://<server-ip>:8443** (accept the self-signed
+certificate warning). First login is `admin` / `changeme` and **forces** a new
+password. Health check: `curl -k https://localhost:8443/healthz`.
 
-State (database, certificate, blobs) persists in the `copysync-data` volume. The
-certificate is generated once and reused so the pin stays stable — do not delete
-the volume unless you intend to re-pair every device.
+**Permissions.** The container runs as *your* host user
+(`COPYSYNC_UID:COPYSYNC_GID`, default `1000:1000`) — so everything it writes into
+`./data` stays owned by you: no root-owned files, no `sudo` to move or back it up.
+Create `./data` yourself **before** the first `up`; if Docker auto-creates a
+missing bind-mount source it makes it `root`-owned and the server can't write to
+it. The folder holds the TLS **private key**, so keep it private (`chmod 700`).
+
+**Portable state.** Identity (TLS key + SPKI pin), paired devices, settings, and
+queued blobs all live in `./data` — that folder *is* the server. To move the
+server to another host, copy `./data` + `docker-compose.yml` over and
+`docker compose up -d`: it comes back as the same server (pin stays stable, so
+devices stay paired). Point `COPYSYNC_DATA` at another path to relocate it.
+Deleting `./data` resets the server and forces every device to re-pair.
 
 ## Quick start (local / development)
 
