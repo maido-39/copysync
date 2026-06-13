@@ -12,6 +12,7 @@ import android.util.Log
 import com.copysync.android.capture.Captured
 import com.copysync.android.capture.ClipboardCaptureEngine
 import com.copysync.android.data.ClipEntity
+import com.copysync.android.data.HistoryCrypto
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
@@ -170,7 +171,8 @@ class SyncService : Service() {
                     dao.insert(
                         ClipEntity(
                             clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
-                            direction = "out", origin = settings.deviceId.orEmpty(), text = c.text, sha = sha,
+                            direction = "out", origin = settings.deviceId.orEmpty(),
+                            text = HistoryCrypto.seal(this@SyncService, c.text), sha = sha,
                             enc = key != null,
                         ),
                     )
@@ -282,7 +284,8 @@ class SyncService : Service() {
         kind: String, blobId: String, name: String, size: Long, mime: String, enc: Boolean = false,
     ) = ClipEntity(
         clipId = clipId, ts = System.currentTimeMillis(), direction = dir, origin = origin,
-        text = "($kind) $name", sha = sha, kind = kind, blobId = blobId, name = name, sizeBytes = size, mime = mime, enc = enc,
+        text = HistoryCrypto.seal(this@SyncService, "($kind) $name"), sha = sha, kind = kind,
+        blobId = blobId, name = HistoryCrypto.seal(this@SyncService, name), sizeBytes = size, mime = mime, enc = enc,
     )
 
     private fun startConnectLoop() {
@@ -406,7 +409,8 @@ class SyncService : Service() {
                         dao.insert(
                             ClipEntity(
                                 clipId = ev.id, ts = System.currentTimeMillis(), direction = "in",
-                                origin = ev.originDeviceId, text = text, sha = ev.sha256.ifEmpty { sha256Hex(text) }, enc = ev.enc != null,
+                                origin = ev.originDeviceId, text = HistoryCrypto.seal(this@SyncService, text),
+                                sha = ev.sha256.ifEmpty { sha256Hex(text) }, enc = ev.enc != null,
                             ),
                         )
                         if (Privacy.classify(text) != null) {

@@ -28,5 +28,11 @@ class Secrets(context: Context) {
         get() = prefs.getString("e2ePass", null)
         set(v) = prefs.edit().putString("e2ePass", v).apply()
 
+    /** Random 32-byte AES key (base64) for at-rest history encryption; generated
+     *  once on first use. See [HistoryCrypto]. */
+    var historyKey: String?
+        get() = prefs.getString("historyKey", null)
+        set(v) = prefs.edit().putString("historyKey", v).apply()
+
     fun clear() = prefs.edit().clear().apply()
 }

@@ -36,6 +36,15 @@ pub struct Config {
     /// Empty disables the hotkey.
     #[serde(default = "default_quick_panel_shortcut")]
     pub quick_panel_shortcut: String,
+
+    /// Wipe the OS clipboard this many seconds after applying a received clip
+    /// (0 = never). Mirrors the Android auto-clear timer.
+    #[serde(default)]
+    pub auto_clear_secs: u64,
+    /// Mark received clips so the OS clipboard history / cloud sync skips them
+    /// (Windows only). Mirrors Android's "받은 항목 민감 표시".
+    #[serde(default)]
+    pub mark_received_sensitive: bool,
 }
 
 /// Default Quick Panel hotkey: Cmd+Shift+V on macOS, Ctrl+Shift+V elsewhere.

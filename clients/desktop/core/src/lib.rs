@@ -9,6 +9,7 @@
 pub mod blob;
 pub mod clipboard;
 pub mod config;
+pub mod discovery;
 pub mod e2e;
 pub mod history;
 pub mod pairing;

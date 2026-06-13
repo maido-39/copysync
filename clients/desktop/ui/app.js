@@ -285,6 +285,50 @@ $("#shortcut").addEventListener("blur", () => {
 });
 loadShortcut();
 
+// ---- mark received clips sensitive (exclude from OS clipboard history)
+async function loadMarkSensitive() {
+  try { $("#mark-sensitive").checked = await invoke("get_mark_sensitive"); } catch (e) {}
+}
+$("#mark-sensitive").addEventListener("change", async (e) => {
+  try { await invoke("set_mark_sensitive", { enabled: e.target.checked }); }
+  catch (err) { alert("설정 실패: " + err); e.target.checked = !e.target.checked; }
+});
+loadMarkSensitive();
+
+// ---- auto-clear the clipboard N seconds after a received clip
+function paintAutoClear(secs) {
+  document.querySelectorAll("#autoclear-row .ac").forEach((b) => {
+    b.classList.toggle("primary", Number(b.dataset.secs) === Number(secs));
+  });
+}
+async function loadAutoClear() {
+  try { paintAutoClear(await invoke("get_auto_clear")); } catch (e) {}
+}
+document.querySelectorAll("#autoclear-row .ac").forEach((b) => {
+  b.addEventListener("click", async () => {
+    const secs = Number(b.dataset.secs);
+    try { await invoke("set_auto_clear", { secs }); paintAutoClear(secs); }
+    catch (err) { alert("자동 비우기 설정 실패: " + err); }
+  });
+});
+loadAutoClear();
+
+// ---- mDNS server discovery (fills the server field on click)
+$("#discover-btn").addEventListener("click", async () => {
+  const box = $("#discover-list");
+  box.innerHTML = `<p class="hint">검색 중…</p>`;
+  try {
+    const found = await invoke("discover_servers");
+    if (!found.length) { box.innerHTML = `<p class="hint">서버를 찾지 못했습니다 (같은 LAN인지 확인).</p>`; return; }
+    const st = "display:block;width:100%;text-align:left;margin-top:6px;padding:9px 11px;border-radius:8px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);cursor:pointer";
+    box.innerHTML = found.map((s) =>
+      `<button type="button" class="found" data-url="${esc(s.url)}" style="${st}">${esc(s.name)} — ${esc(s.url)}</button>`
+    ).join("");
+    box.querySelectorAll(".found").forEach((b) =>
+      b.addEventListener("click", () => { $("#p-server").value = b.dataset.url; }));
+  } catch (e) { box.innerHTML = `<p class="hint">검색 실패: ${esc(String(e))}</p>`; }
+});
+
 $("#pool").addEventListener("change", (e) => {
   invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
 });

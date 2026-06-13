@@ -68,6 +68,16 @@
           <h2>동기화 · 보안</h2>
           <label class="radio"><input type="checkbox" id="privacy-filter" /> 민감 클립 동기화 제외</label>
           <p class="hint">비밀번호·카드·키·OTP로 추정되는 클립은 다른 기기로 보내지 않습니다.</p>
+          <label class="radio"><input type="checkbox" id="mark-sensitive" /> 받은 항목 민감 표시</label>
+          <p class="hint">받은 클립을 Windows 클립보드 기록(Win+V)·클라우드 동기화에서 제외합니다.</p>
+          <label>받은 뒤 클립보드 자동 비우기</label>
+          <div class="row" id="autoclear-row">
+            <button type="button" class="ac" data-secs="0">끔</button>
+            <button type="button" class="ac" data-secs="30">30초</button>
+            <button type="button" class="ac" data-secs="60">1분</button>
+            <button type="button" class="ac" data-secs="300">5분</button>
+          </div>
+          <p class="hint">받은 텍스트를 일정 시간 뒤 클립보드에서 지웁니다 (비밀번호 흔적 최소화).</p>
           <label class="radio"><input type="checkbox" id="autostart" /> 부팅 시 자동 시작</label>
           <p class="hint">창을 닫으면 트레이로 최소화되고 동기화는 계속됩니다.</p>
         </div>
@@ -85,6 +95,8 @@
           <h2>기기 페어링 / 재페어링</h2>
           <p class="hint">서버 관리자 화면에서 OTP를 만들어 입력하세요. 핀을 비우면 최초 접속 시 자동 신뢰합니다.</p>
           <label>서버 주소<input id="p-server" placeholder="https://192.168.0.10:8443" /></label>
+          <div class="row"><button id="discover-btn" type="button">같은 네트워크에서 서버 검색</button></div>
+          <div id="discover-list"></div>
           <label>OTP<input id="p-otp" placeholder="8자리 코드" /></label>
           <label>기기 이름<input id="p-name" value="desktop" /></label>
           <label>SPKI 핀 (선택)<input id="p-pin" placeholder="base64" /></label>

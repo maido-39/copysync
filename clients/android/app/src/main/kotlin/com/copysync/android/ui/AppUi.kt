@@ -2,6 +2,7 @@ package com.copysync.android.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.widget.Toast
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -10,6 +11,7 @@ import android.provider.Settings as AndroidSettings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -65,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.copysync.android.data.ClipEntity
 import com.copysync.android.data.Downloads
+import com.copysync.android.data.HistoryCrypto
 import com.copysync.android.data.HistoryDb
 import com.copysync.android.data.Secrets
 import com.copysync.android.data.Settings
@@ -358,9 +361,16 @@ private fun HistoryTab() {
     val ctx = LocalContext.current
     val dao = remember { HistoryDb.get(ctx).clipDao() }
     var query by remember { mutableStateOf("") }
-    val history by remember(query) {
-        if (query.isBlank()) dao.recent() else dao.search(query)
-    }.collectAsState(initial = emptyList())
+    // History text/name are encrypted at rest — decrypt the recent window in
+    // memory and filter there (LIKE can't search ciphertext columns).
+    val raw by remember { dao.recent() }.collectAsState(initial = emptyList())
+    val history = remember(raw, query) {
+        val rows = raw.map {
+            it.copy(text = HistoryCrypto.open(ctx, it.text), name = HistoryCrypto.open(ctx, it.name))
+        }
+        if (query.isBlank()) rows
+        else rows.filter { it.text.contains(query, true) || it.name.contains(query, true) }
+    }
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         OutlinedTextField(
@@ -384,7 +394,13 @@ private fun HistoryTab() {
 private fun HistoryCard(e: ClipEntity) {
     val ctx = LocalContext.current
     Card(
-        Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth().clickable(enabled = e.kind == "text" && e.text.isNotEmpty()) {
+            // Tap a text clip to put it back on the clipboard (desktop Quick Panel
+            // parity); the capture engine re-syncs it like any normal copy.
+            ctx.getSystemService(ClipboardManager::class.java)
+                .setPrimaryClip(ClipData.newPlainText("CopySync", e.text))
+            Toast.makeText(ctx, "클립보드에 복사됨", Toast.LENGTH_SHORT).show()
+        },
         colors = CardDefaults.cardColors(containerColor = categoryColor(e)),
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {

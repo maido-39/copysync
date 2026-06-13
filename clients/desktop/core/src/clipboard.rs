@@ -19,6 +19,40 @@ pub fn set_text(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Empty the OS clipboard (used by the auto-clear timer after receiving a clip).
+pub fn clear() -> Result<()> {
+    arboard::Clipboard::new()?.clear()?;
+    Ok(())
+}
+
+/// Set clipboard text and, on Windows, tag it so Clipboard History (Win+V) and
+/// the cloud clipboard skip it — for received clips the user chose to treat as
+/// sensitive. Off Windows this is just a plain text set.
+#[cfg(windows)]
+pub fn set_text_sensitive(s: &str) -> Result<()> {
+    use clipboard_win::raw;
+    let _clip = clipboard_win::Clipboard::new_attempts(10)
+        .map_err(|e| anyhow::anyhow!("open clipboard: {e}"))?;
+    raw::empty().map_err(|e| anyhow::anyhow!("empty clipboard: {e}"))?;
+    raw::set_string(s).map_err(|e| anyhow::anyhow!("set text: {e}"))?;
+    // The mere presence of this format tells clipboard managers to skip the clip.
+    if let Some(f) = raw::register_format("ExcludeClipboardContentFromMonitorProcessing") {
+        let _ = raw::set_without_clear(f.get(), &[0u8; 4]);
+    }
+    // DWORD 0 = opt out of the local history and the cloud clipboard.
+    for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
+        if let Some(f) = raw::register_format(name) {
+            let _ = raw::set_without_clear(f.get(), &0u32.to_ne_bytes());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_text_sensitive(s: &str) -> Result<()> {
+    set_text(s)
+}
+
 pub fn get_image() -> Result<Image> {
     let img = arboard::Clipboard::new()?.get_image()?;
     Ok(Image {

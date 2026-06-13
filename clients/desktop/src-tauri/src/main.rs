@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -189,6 +189,10 @@ struct AppState {
     exclude_sensitive: Arc<AtomicBool>,
     /// The Quick Panel global hotkey currently registered (accelerator string).
     quick_panel_shortcut: Arc<Mutex<String>>,
+    /// Wipe the clipboard this many seconds after a received clip (0 = never).
+    auto_clear_secs: Arc<AtomicU64>,
+    /// Mark received clips so the OS clipboard history / cloud sync skips them.
+    mark_sensitive: Arc<AtomicBool>,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -274,6 +278,20 @@ fn schedule_purge(hist: Arc<Mutex<History>>, id: i64, ttl_secs: u64) {
         tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
         if let Ok(h) = hist.lock() {
             let _ = h.delete(id);
+        }
+    });
+}
+
+/// Wipe the clipboard `secs` after a received clip — but only if it still holds
+/// that exact text, so a newer copy the user made is never clobbered.
+fn schedule_clear_text(expected: String, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        if clipboard::get_text().map(|t| t == expected).unwrap_or(false) {
+            let _ = clipboard::clear();
         }
     });
 }
@@ -379,6 +397,47 @@ fn set_privacy_filter(state: State<'_, AppState>, enabled: bool) -> Result<(), S
     Ok(())
 }
 
+/// Seconds to wait before auto-clearing a received clip from the OS clipboard.
+#[tauri::command]
+fn get_auto_clear(state: State<'_, AppState>) -> u64 {
+    state.auto_clear_secs.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_auto_clear(state: State<'_, AppState>, secs: u64) -> Result<(), String> {
+    state.auto_clear_secs.store(secs, Ordering::Relaxed);
+    if let Ok(mut cfg) = Config::load(&state.cfg_path) {
+        cfg.auto_clear_secs = secs;
+        let _ = cfg.save(&state.cfg_path);
+    }
+    Ok(())
+}
+
+/// Whether received clips are marked sensitive (excluded from OS clipboard history).
+#[tauri::command]
+fn get_mark_sensitive(state: State<'_, AppState>) -> bool {
+    state.mark_sensitive.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_mark_sensitive(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state.mark_sensitive.store(enabled, Ordering::Relaxed);
+    if let Ok(mut cfg) = Config::load(&state.cfg_path) {
+        cfg.mark_received_sensitive = enabled;
+        let _ = cfg.save(&state.cfg_path);
+    }
+    Ok(())
+}
+
+/// Browse the LAN for CopySync servers over mDNS. Returns `[{name, url}]`.
+#[tauri::command]
+async fn discover_servers() -> Result<Vec<copysync_core::discovery::Found>, String> {
+    tauri::async_runtime::spawn_blocking(|| copysync_core::discovery::discover(2500))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_roster(state: State<'_, AppState>) -> Vec<RosterDevice> {
     state.roster.lock().unwrap().clone()
@@ -478,6 +537,8 @@ async fn pair(
 fn start_sync(app: &AppHandle, cfg: Config) {
     let state = app.state::<AppState>();
     state.exclude_sensitive.store(cfg.exclude_sensitive, Ordering::Relaxed);
+    state.auto_clear_secs.store(cfg.auto_clear_secs, Ordering::Relaxed);
+    state.mark_sensitive.store(cfg.mark_received_sensitive, Ordering::Relaxed);
     {
         let mut s = state.status.lock().unwrap();
         s.paired = true;
@@ -1067,9 +1128,16 @@ async fn handle_incoming(
         }
     };
     remember(recent_text, sha_hex(text.as_bytes()));
+    let st = app.state::<AppState>();
+    let mark = st.mark_sensitive.load(Ordering::Relaxed);
+    let auto_clear = st.auto_clear_secs.load(Ordering::Relaxed);
     match &html {
         Some(h) => { let _ = clipboard::set_html(h, &text); }
+        None if mark => { let _ = clipboard::set_text_sensitive(&text); }
         None => { let _ = clipboard::set_text(&text); }
+    }
+    if auto_clear > 0 {
+        schedule_clear_text(text.clone(), auto_clear);
     }
     let row = add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
     if privacy::classify(&text, &[]).is_some() {
@@ -1161,6 +1229,8 @@ fn main() {
                 quick_panel_shortcut: Arc::new(Mutex::new(
                     copysync_core::config::DEFAULT_QUICK_PANEL_SHORTCUT.to_string(),
                 )),
+                auto_clear_secs: Arc::new(AtomicU64::new(0)),
+                mark_sensitive: Arc::new(AtomicBool::new(false)),
             };
             let cfg_path = state.cfg_path.clone();
             app.manage(state);
@@ -1230,6 +1300,11 @@ fn main() {
             set_autostart,
             get_privacy_filter,
             set_privacy_filter,
+            get_auto_clear,
+            set_auto_clear,
+            get_mark_sensitive,
+            set_mark_sensitive,
+            discover_servers,
             get_shortcut,
             set_shortcut,
             set_pool,
