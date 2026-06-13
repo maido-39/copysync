@@ -30,13 +30,25 @@ pub struct Config {
     /// Extra user regexes that also mark a clip sensitive.
     #[serde(default)]
     pub custom_patterns: Vec<String>,
+
+    /// Global hotkey that toggles the Quick Panel history overlay (an accelerator
+    /// string parsed by tauri-plugin-global-shortcut, e.g. "Control+Shift+KeyV").
+    /// Empty disables the hotkey.
+    #[serde(default = "default_quick_panel_shortcut")]
+    pub quick_panel_shortcut: String,
 }
+
+/// Default Quick Panel hotkey: Cmd+Shift+V on macOS, Ctrl+Shift+V elsewhere.
+pub const DEFAULT_QUICK_PANEL_SHORTCUT: &str = "CommandOrControl+Shift+KeyV";
 
 fn default_true() -> bool {
     true
 }
 fn default_sensitive_ttl() -> u64 {
     45
+}
+fn default_quick_panel_shortcut() -> String {
+    DEFAULT_QUICK_PANEL_SHORTCUT.to_string()
 }
 
 impl Config {

@@ -77,5 +77,6 @@ pub async fn claim(
         exclude_sensitive: true,
         sensitive_ttl_secs: 45,
         custom_patterns: Vec::new(),
+        quick_panel_shortcut: crate::config::DEFAULT_QUICK_PANEL_SHORTCUT.to_string(),
     })
 }

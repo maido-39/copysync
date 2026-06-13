@@ -220,6 +220,71 @@ $("#privacy-filter").addEventListener("change", async (e) => {
 });
 loadPrivacyFilter();
 
+// ---- Quick Panel global hotkey (설정 → 단축키)
+let recordingShortcut = false;
+function prettyAccel(accel) {
+  if (!accel) return "";
+  return accel.split("+").map((t) => {
+    const u = t.toUpperCase();
+    if (u === "CONTROL" || u === "CTRL") return "Ctrl";
+    if (u === "COMMANDORCONTROL" || u === "COMMANDORCTRL" || u === "CMDORCTRL" || u === "CMDORCONTROL") return "Ctrl";
+    if (u === "SHIFT") return "Shift";
+    if (u === "ALT" || u === "OPTION") return "Alt";
+    if (u === "SUPER" || u === "COMMAND" || u === "CMD" || u === "META") return "Win";
+    if (u.startsWith("KEY") && t.length > 3) return t.slice(3);
+    if (u.startsWith("DIGIT")) return t.slice(5);
+    if (u.startsWith("ARROW")) return t.slice(5);
+    return t;
+  }).join("+");
+}
+async function loadShortcut() {
+  try {
+    const a = await invoke("get_shortcut");
+    const box = $("#shortcut");
+    box.dataset.accel = a || "";
+    box.value = prettyAccel(a) || "없음";
+  } catch (e) {}
+}
+$("#shortcut-record").addEventListener("click", () => {
+  recordingShortcut = true;
+  $("#shortcut").value = "키 조합을 누르세요…";
+  $("#shortcut").focus();
+});
+$("#shortcut-clear").addEventListener("click", async () => {
+  try { await invoke("set_shortcut", { accel: "" }); } catch (e) {}
+  await loadShortcut();
+});
+$("#shortcut").addEventListener("keydown", async (e) => {
+  if (!recordingShortcut) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const code = e.code;
+  const MODKEYS = ["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"];
+  if (MODKEYS.includes(code)) return;            // wait for a non-modifier key
+  if (code === "Escape") { recordingShortcut = false; loadShortcut(); return; }
+  const parts = [];
+  if (e.ctrlKey) parts.push("Control");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+  if (e.metaKey) parts.push("Super");
+  if (!parts.length) { $("#shortcut").value = "Ctrl/Alt/Shift 를 포함하세요"; return; }
+  parts.push(code);                              // e.code (KeyV, Digit1, F5…) is what the Rust parser accepts
+  const accel = parts.join("+");
+  recordingShortcut = false;
+  try {
+    await invoke("set_shortcut", { accel });
+    await loadShortcut();
+    dbg("단축키 변경 " + accel);
+  } catch (err) {
+    $("#shortcut").value = "사용 불가: " + err;
+    setTimeout(loadShortcut, 1800);
+  }
+});
+$("#shortcut").addEventListener("blur", () => {
+  if (recordingShortcut) { recordingShortcut = false; loadShortcut(); }
+});
+loadShortcut();
+
 $("#pool").addEventListener("change", (e) => {
   invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
 });

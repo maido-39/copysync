@@ -107,6 +107,76 @@ fn quickpanel_copy(app: AppHandle, text: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Show/hide the Quick Panel overlay (the body of the global hotkey handler).
+fn toggle_quick_panel(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("quickpanel") {
+        if win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.set_focus();
+            let _ = win.emit("quickpanel-show", ());
+        }
+    }
+}
+
+/// Register `accel` as the Quick Panel toggle hotkey. An empty/blank string means
+/// "no hotkey" (a no-op). Returns Err if the accelerator is invalid or the OS
+/// refuses the combo (e.g. another app already owns it).
+fn register_quick_panel(app: &AppHandle, accel: &str) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    if accel.trim().is_empty() {
+        return Ok(());
+    }
+    app.global_shortcut()
+        .on_shortcut(accel, |app, _sc, event| {
+            if event.state() == ShortcutState::Pressed {
+                toggle_quick_panel(app);
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// The currently-registered Quick Panel hotkey (accelerator string; empty = none).
+#[tauri::command]
+fn get_shortcut(state: State<'_, AppState>) -> String {
+    state.quick_panel_shortcut.lock().unwrap().clone()
+}
+
+/// Change the Quick Panel hotkey live: validate, swap the OS registration, and
+/// persist to config (best-effort, like the other settings). An empty `accel`
+/// disables the hotkey. On failure the previous hotkey is restored.
+#[tauri::command]
+fn set_shortcut(app: AppHandle, state: State<'_, AppState>, accel: String) -> Result<(), String> {
+    use std::str::FromStr;
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+
+    let accel = accel.trim().to_string();
+    let old = state.quick_panel_shortcut.lock().unwrap().clone();
+    if accel == old {
+        return Ok(());
+    }
+    // Validate first so a bad value never costs us the working hotkey.
+    if !accel.is_empty() {
+        Shortcut::from_str(&accel).map_err(|e| format!("잘못된 단축키 '{accel}': {e}"))?;
+    }
+    let gs = app.global_shortcut();
+    if !old.is_empty() {
+        let _ = gs.unregister(old.as_str());
+    }
+    if let Err(e) = register_quick_panel(&app, &accel) {
+        // Roll back to the previous hotkey (e.g. the new combo is taken by another app).
+        let _ = register_quick_panel(&app, &old);
+        return Err(e);
+    }
+    *state.quick_panel_shortcut.lock().unwrap() = accel.clone();
+    if let Ok(mut cfg) = Config::load(&state.cfg_path) {
+        cfg.quick_panel_shortcut = accel;
+        let _ = cfg.save(&state.cfg_path);
+    }
+    Ok(())
+}
+
 struct AppState {
     tx: Mutex<Option<UnboundedSender<Cmd>>>,
     hist: Arc<Mutex<History>>,
@@ -117,6 +187,8 @@ struct AppState {
     cfg_path: PathBuf,
     downloads: PathBuf,
     exclude_sensitive: Arc<AtomicBool>,
+    /// The Quick Panel global hotkey currently registered (accelerator string).
+    quick_panel_shortcut: Arc<Mutex<String>>,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -1086,10 +1158,19 @@ fn main() {
                 cfg_path: dir.join("config.json"),
                 downloads: data.join("downloads"),
                 exclude_sensitive: Arc::new(AtomicBool::new(true)),
+                quick_panel_shortcut: Arc::new(Mutex::new(
+                    copysync_core::config::DEFAULT_QUICK_PANEL_SHORTCUT.to_string(),
+                )),
             };
             let cfg_path = state.cfg_path.clone();
             app.manage(state);
-            if let Ok(cfg) = Config::load(&cfg_path) {
+            let loaded = Config::load(&cfg_path).ok();
+            // Adopt the saved Quick Panel hotkey (an old config without the field
+            // deserializes to the default); unpaired clients keep the literal default.
+            if let Some(accel) = loaded.as_ref().map(|c| c.quick_panel_shortcut.clone()) {
+                *app.state::<AppState>().quick_panel_shortcut.lock().unwrap() = accel;
+            }
+            if let Some(cfg) = loaded {
                 start_sync(app.handle(), cfg);
             }
 
@@ -1122,25 +1203,17 @@ fn main() {
                 .build(app)?;
             *app.state::<AppState>().tray.lock().unwrap() = Some(tray);
 
-            // Quick Panel: a global hotkey (Ctrl/Cmd+Shift+V) toggles a small
-            // always-on-top history overlay for fast re-copy.
+            // Quick Panel: a configurable global hotkey (default Ctrl/Cmd+Shift+V,
+            // editable in 설정 → 단축키) toggles a small always-on-top history
+            // overlay for fast re-copy.
             {
-                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-                let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
-                let _ = app.global_shortcut().on_shortcut(hotkey, |app, _sc, event| {
-                    if event.state() != ShortcutState::Pressed {
-                        return;
-                    }
-                    if let Some(win) = app.get_webview_window("quickpanel") {
-                        if win.is_visible().unwrap_or(false) {
-                            let _ = win.hide();
-                        } else {
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                            let _ = win.emit("quickpanel-show", ());
-                        }
-                    }
-                });
+                let accel = app
+                    .state::<AppState>()
+                    .quick_panel_shortcut
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let _ = register_quick_panel(app.handle(), &accel);
             }
             Ok(())
         })
@@ -1157,6 +1230,8 @@ fn main() {
             set_autostart,
             get_privacy_filter,
             set_privacy_filter,
+            get_shortcut,
+            set_shortcut,
             set_pool,
             pair,
             quickpanel_copy,

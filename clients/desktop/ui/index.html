@@ -72,6 +72,16 @@
           <p class="hint">창을 닫으면 트레이로 최소화되고 동기화는 계속됩니다.</p>
         </div>
         <div class="card">
+          <h2>단축키</h2>
+          <label>빠른 패널 (복사 기록 열기)</label>
+          <div class="row" style="display:flex;gap:8px;align-items:center;margin-top:4px">
+            <input id="shortcut" readonly placeholder="없음" style="flex:1;min-width:0" />
+            <button id="shortcut-record" type="button">변경</button>
+            <button id="shortcut-clear" type="button">해제</button>
+          </div>
+          <p class="hint">전역 단축키입니다. "변경"을 누른 뒤 원하는 조합(예: Ctrl+Shift+V)을 누르세요 — 어디서든 최근 복사 기록 오버레이를 띄웁니다. Esc로 취소, "해제"로 끄기.</p>
+        </div>
+        <div class="card">
           <h2>기기 페어링 / 재페어링</h2>
           <p class="hint">서버 관리자 화면에서 OTP를 만들어 입력하세요. 핀을 비우면 최초 접속 시 자동 신뢰합니다.</p>
           <label>서버 주소<input id="p-server" placeholder="https://192.168.0.10:8443" /></label>
