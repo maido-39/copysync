@@ -154,6 +154,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		WebUI:             webui.Handler(),
 		BlobStore:         blobStore,
 		ValidateBlobToken: validateBlobToken,
+		DataDir:           cfg.DataDir,
 	})
 
 	srv := &http.Server{

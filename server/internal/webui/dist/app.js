@@ -150,6 +150,7 @@
     { id: "devices", label: "기기", ic: "💻" },
     { id: "pairing", label: "페어링", ic: "🔗" },
     { id: "settings", label: "설정", ic: "⚙️" },
+    { id: "downloads", label: "다운로드", ic: "📥" },
     { id: "monitor", label: "모니터링", ic: "📡" },
     { id: "account", label: "계정", ic: "👤" },
   ];
@@ -188,6 +189,7 @@
     else if (id === "devices") sectionDevices();
     else if (id === "pairing") sectionPairing();
     else if (id === "settings") sectionSettings();
+    else if (id === "downloads") sectionDownloads();
     else if (id === "monitor") sectionMonitor();
     else sectionAccount();
   }
@@ -401,6 +403,70 @@
       }}, "설정 저장");
       holder.appendChild(el("div", { class: "row" }, save));
     } catch (e) { clear(holder); holder.appendChild(el("p", { class: "msg err" }, e.message)); }
+  }
+
+  // ---- downloads (file hosting) ----------------------------------------------
+  async function sectionDownloads() {
+    var m = state.main;
+    m.appendChild(pageHead("다운로드", "파일을 올려 같은 LAN의 기기에서 내려받게 합니다."));
+    var holder = el("div", null, el("p", { class: "muted" }, "불러오는 중…"));
+    m.appendChild(holder);
+    async function load() {
+      clear(holder);
+      var s = await api("GET", "/admin/settings");
+      var on = !!s.downloadsEnabled;
+      var cb = el("input", { type: "checkbox" }); cb.checked = on;
+      cb.addEventListener("change", async function () {
+        try {
+          await api("PUT", "/admin/settings", { downloadsEnabled: cb.checked });
+          toast(cb.checked ? "호스팅 켜짐" : "호스팅 꺼짐", "ok"); load();
+        } catch (e) { toast(e.message, "err"); cb.checked = !cb.checked; }
+      });
+      holder.appendChild(el("div", { class: "card" }, el("h2", null, "파일 호스팅"),
+        el("div", { class: "switch-row" },
+          el("div", { class: "lbl" }, el("b", null, "다운로드 호스팅 켜기"),
+            el("span", null, "켜면 같은 LAN의 누구나 인증 없이 내려받습니다.")),
+          el("label", { class: "toggle" }, cb, el("span", { class: "track" }))),
+        on ? el("p", { class: "help" }, "공개 주소: ",
+          el("a", { href: "/downloads/", target: "_blank" }, location.origin + "/downloads/")) : null));
+
+      var fileInput = el("input", { type: "file" });
+      var up = el("button", { class: "btn" }, "업로드");
+      up.addEventListener("click", async function () {
+        if (!fileInput.files.length) { toast("파일을 선택하세요", "err"); return; }
+        var fd = new FormData(); fd.append("file", fileInput.files[0]);
+        up.disabled = true;
+        try {
+          var res = await fetch("/admin/downloads", { method: "POST", credentials: "same-origin",
+            headers: { "X-CopySync-CSRF": "1" }, body: fd });
+          if (!res.ok) throw new Error("업로드 실패 (" + res.status + ")");
+          toast("업로드됨", "ok"); fileInput.value = ""; load();
+        } catch (e) { toast(e.message, "err"); }
+        up.disabled = false;
+      });
+      holder.appendChild(el("div", { class: "card" }, el("h2", null, "파일 추가"),
+        el("div", { class: "row" }, fileInput, up),
+        el("p", { class: "help" }, "또는 서버의 ./data/downloads/ 폴더에 직접 넣어도 됩니다.")));
+
+      var listCard = el("div", { class: "card" }, el("h2", null, "호스팅 중인 파일"));
+      var d = await api("GET", "/admin/downloads");
+      if (!d.files || !d.files.length) listCard.appendChild(el("p", { class: "muted" }, "없음"));
+      else d.files.forEach(function (f) {
+        var del = el("button", { class: "btn ghost" }, "삭제");
+        del.addEventListener("click", async function () {
+          try {
+            await api("DELETE", "/admin/downloads/" + encodeURIComponent(f.name));
+            toast("삭제됨", "ok"); load();
+          } catch (e) { toast(e.message, "err"); }
+        });
+        listCard.appendChild(el("div", { class: "switch-row" },
+          el("a", { href: "/downloads/" + encodeURIComponent(f.name), target: "_blank" },
+            f.name + " (" + fmtBytes(f.size) + ")"),
+          del));
+      });
+      holder.appendChild(listCard);
+    }
+    load().catch(function (e) { clear(holder); holder.appendChild(el("p", { class: "msg err" }, e.message)); });
   }
 
   // ---- monitor (live) --------------------------------------------------------

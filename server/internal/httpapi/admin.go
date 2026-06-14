@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/syaro/copysync/internal/auth"
-	"github.com/syaro/copysync/internal/config"
 	"github.com/syaro/copysync/internal/model"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -131,7 +130,13 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
-	var rs config.RuntimeSettings
+	// Start from the current settings so a partial update (e.g. just toggling
+	// downloads hosting) leaves every other field untouched.
+	rs, err := s.store.GetSettings()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "could not read settings")
+		return
+	}
 	if err := json.NewDecoder(r.Body).Decode(&rs); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad_request", "invalid body")
 		return

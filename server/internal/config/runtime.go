@@ -14,8 +14,9 @@ type RuntimeSettings struct {
 	AllowServerBroadcast   bool     `json:"allowServerBroadcast"`   // admin broadcast (auto-off when E2E on)
 	SessionTTLSeconds      int64    `json:"sessionTtlSeconds"`      // admin session lifetime
 	PairingCodeTTLSeconds  int64    `json:"pairingCodeTtlSeconds"`
-	Pools                  []string `json:"pools"`           // available share pools; clips route within a pool
-	TokenRotateDays        int      `json:"tokenRotateDays"` // re-issue device tokens older than N days (0 = disabled)
+	Pools                  []string `json:"pools"`            // available share pools; clips route within a pool
+	TokenRotateDays        int      `json:"tokenRotateDays"`  // re-issue device tokens older than N days (0 = disabled)
+	DownloadsEnabled       bool     `json:"downloadsEnabled"` // serve files from <data>/downloads at public GET /downloads/
 }
 
 // DefaultRuntimeSettings returns the built-in defaults.

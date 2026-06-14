@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/syaro/copysync/internal/blob"
@@ -33,6 +34,7 @@ type Server struct {
 
 	blobStore         *blob.FsBlobStore
 	validateBlobToken func(string) (model.Device, bool)
+	downloadsDir      string
 
 	loginLimiter *ipLimiter
 	pairLimiter  *ipLimiter
@@ -54,6 +56,7 @@ type Config struct {
 	WebUI             http.Handler
 	BlobStore         *blob.FsBlobStore
 	ValidateBlobToken func(string) (model.Device, bool)
+	DataDir           string
 }
 
 // New creates the HTTP API server.
@@ -75,6 +78,7 @@ func New(c Config) *Server {
 		webui:             c.WebUI,
 		blobStore:         c.BlobStore,
 		validateBlobToken: c.ValidateBlobToken,
+		downloadsDir:      filepath.Join(c.DataDir, "downloads"),
 		loginLimiter:      newIPLimiter(rate.Every(2*time.Second), 5),
 		pairLimiter:       newIPLimiter(rate.Every(2*time.Second), 5),
 		blobWaiters:       newBlobWaiters(),
@@ -116,6 +120,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/monitor/stream", s.requireAdmin(s.handleMonitorStream))
 	mux.HandleFunc("GET /admin/monitor/activity", s.requireAdmin(s.handleActivity))
 	mux.HandleFunc("GET /admin/monitor/blob/{id}", s.requireAdmin(s.handleMonitorBlob))
+
+	// File hosting: public download endpoints (gated by the DownloadsEnabled
+	// setting) + admin management (list / upload / delete).
+	mux.HandleFunc("GET /downloads/{$}", s.handleDownloadsIndex)
+	mux.HandleFunc("GET /downloads/{name}", s.handleDownloadFile)
+	mux.HandleFunc("GET /admin/downloads", s.requireAdmin(s.handleAdminDownloadsList))
+	mux.HandleFunc("POST /admin/downloads", s.requireAdmin(s.handleAdminDownloadUpload))
+	mux.HandleFunc("DELETE /admin/downloads/{name}", s.requireAdmin(s.handleAdminDownloadDelete))
 
 	// Admin SPA + static assets (catch-all GET).
 	mux.Handle("GET /", s.webui)
