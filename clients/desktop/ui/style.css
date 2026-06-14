@@ -1,13 +1,39 @@
 :root {
   --bg: #0f1216;
-  --panel: #171c23;
-  --panel2: #1e252e;
+  --bg-rgb: 15,18,22;
+  --panel-rgb: 23,28,35;
+  --panel2-rgb: 30,37,46;
   --line: #2a323d;
   --fg: #e6edf3;
   --muted: #8b97a6;
   --accent: #3fb950;
   --accent-dim: #2ea043;
   --blue: #4493f8;
+
+  /* theme controls — overwritten live from JS (localStorage-backed) */
+  --card-opacity: 1;
+  --bg-img: none;
+  --bg-blur: 0px;
+  --bg-bright: 1;
+  --bg-zoom: 1;
+  --bg-x: 50%;
+  --bg-y: 50%;
+
+  /* derived surfaces — transparency follows --card-opacity */
+  --panel: rgba(var(--panel-rgb), var(--card-opacity));
+  --panel2: rgba(var(--panel2-rgb), calc(0.4 + var(--card-opacity) * 0.6));
+}
+[data-theme="light"] {
+  --bg: #eef1f5;
+  --bg-rgb: 238,241,245;
+  --panel-rgb: 255,255,255;
+  --panel2-rgb: 236,240,244;
+  --line: #d3dae2;
+  --fg: #1b2230;
+  --muted: #57637a;
+  --accent: #1f883d;
+  --accent-dim: #1a7f37;
+  --blue: #2563eb;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
@@ -95,3 +121,29 @@ label.dev { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor
 .dir-in { border-left: 3px solid var(--blue); }
 .dir-out { border-left: 3px solid var(--accent); }
 .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+
+/* ---- background image layer + glassy surfaces ---------------------------- */
+.app-bg {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background-image: var(--bg-img); background-size: cover;
+  background-position: var(--bg-x) var(--bg-y); background-repeat: no-repeat;
+  filter: blur(var(--bg-blur)) brightness(var(--bg-bright));
+  transform: scale(calc(var(--bg-zoom) * 1.06)); transform-origin: center;
+}
+header, nav#tabs, .card, .item { -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+
+/* ---- theme controls ------------------------------------------------------ */
+.modebar { display: flex; gap: 6px; margin: 2px 0 10px; }
+.modebar button { flex: 1; padding: 8px 0; border-radius: 8px; cursor: pointer;
+  background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
+.modebar button.sel { background: var(--accent-dim); color: #04150a; border-color: transparent; font-weight: 600; }
+.slider { display: grid; grid-template-columns: 84px 1fr 46px; align-items: center; gap: 8px; margin: 9px 0; }
+.slider label { margin: 0; color: var(--fg); }
+.slider .val { color: var(--muted); font-size: 12px; text-align: right; }
+input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+.cropbox { position: relative; width: 100%; height: 140px; border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--line); background-color: var(--panel2); cursor: grab; margin-top: 8px;
+  background-image: var(--bg-img); background-size: cover; background-position: var(--bg-x) var(--bg-y); }
+.cropbox:active { cursor: grabbing; }
+.cropbox .hintlabel { position: absolute; left: 0; right: 0; bottom: 0; text-align: center;
+  font-size: 11px; color: #fff; background: rgba(0,0,0,.45); padding: 3px; }

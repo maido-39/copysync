@@ -335,3 +335,79 @@ $("#pool").addEventListener("change", (e) => {
 
 refreshStatus();
 setInterval(refreshStatus, 4000);
+
+// ---- theme (dark/light + background image + box transparency) -------------
+const THEME_KEY = "cs-theme";
+const themeDefaults = { mode: "dark", img: "", x: 50, y: 50, zoom: 1, bright: 1, blur: 0, cardOp: 1 };
+let theme = (() => {
+  try { return Object.assign({}, themeDefaults, JSON.parse(localStorage.getItem(THEME_KEY) || "{}")); }
+  catch (e) { return Object.assign({}, themeDefaults); }
+})();
+function saveTheme() { try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch (e) {} }
+const darkMql = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+function applyTheme() {
+  const root = document.documentElement;
+  const resolved = theme.mode === "system" ? (darkMql && !darkMql.matches ? "light" : "dark") : theme.mode;
+  root.dataset.theme = resolved === "light" ? "light" : "dark";
+  root.style.setProperty("--bg-img", theme.img ? `url("${theme.img}")` : "none");
+  root.style.setProperty("--bg-x", theme.x + "%");
+  root.style.setProperty("--bg-y", theme.y + "%");
+  root.style.setProperty("--bg-zoom", theme.zoom);
+  root.style.setProperty("--bg-bright", theme.bright);
+  root.style.setProperty("--bg-blur", theme.blur + "px");
+  root.style.setProperty("--card-opacity", theme.cardOp);
+}
+function setRange(id, v, suf) {
+  const i = $("#" + id); if (i) i.value = v;
+  const s = $("#" + id + "-v"); if (s) s.textContent = (Math.round(v * 100) / 100) + (suf || "");
+}
+function syncThemeControls() {
+  document.querySelectorAll("#theme-mode button").forEach((b) => b.classList.toggle("sel", b.dataset.mode === theme.mode));
+  setRange("bg-zoom", theme.zoom, "×"); setRange("bg-bright", theme.bright, "");
+  setRange("bg-blur", theme.blur, "px"); setRange("card-op", theme.cardOp, "");
+  const box = $("#bg-crop"); if (box) box.style.display = theme.img ? "block" : "none";
+}
+document.querySelectorAll("#theme-mode button").forEach((b) => {
+  b.addEventListener("click", () => { theme.mode = b.dataset.mode; applyTheme(); syncThemeControls(); saveTheme(); });
+});
+function wireSlider(id, key, suf) {
+  const i = $("#" + id); if (!i) return;
+  i.addEventListener("input", () => { theme[key] = Number(i.value); setRange(id, i.value, suf); applyTheme(); saveTheme(); });
+}
+wireSlider("bg-zoom", "zoom", "×"); wireSlider("bg-bright", "bright", "");
+wireSlider("bg-blur", "blur", "px"); wireSlider("card-op", "cardOp", "");
+$("#bg-pick").addEventListener("click", () => $("#bg-file").click());
+$("#bg-file").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    const im = new Image();
+    im.onload = () => {
+      const max = 1600, sc = Math.min(1, max / Math.max(im.width, im.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(im.width * sc); c.height = Math.round(im.height * sc);
+      c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+      theme.img = c.toDataURL("image/jpeg", 0.82);
+      theme.x = 50; theme.y = 50; applyTheme(); syncThemeControls(); saveTheme();
+    };
+    im.src = rd.result;
+  };
+  rd.readAsDataURL(f);
+});
+$("#bg-clear").addEventListener("click", () => { theme.img = ""; applyTheme(); syncThemeControls(); saveTheme(); });
+(() => {
+  const box = $("#bg-crop"); if (!box) return;
+  let dragging = false;
+  const pan = (e) => {
+    if (!dragging || !theme.img) return;
+    const r = box.getBoundingClientRect();
+    theme.x = Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100));
+    theme.y = Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100));
+    applyTheme(); saveTheme();
+  };
+  box.addEventListener("mousedown", (e) => { if (theme.img) { dragging = true; pan(e); e.preventDefault(); } });
+  window.addEventListener("mousemove", pan);
+  window.addEventListener("mouseup", () => { dragging = false; });
+})();
+if (darkMql) darkMql.addEventListener("change", () => { if (theme.mode === "system") applyTheme(); });
+applyTheme(); syncThemeControls();
