@@ -209,7 +209,7 @@ private fun MainScaffold(onUnpair: () -> Unit) {
     }
 
     val tabs = listOf("연결" to "🔗", "기록" to "📋", "설정" to "⚙️", "디버깅" to "🐞")
-    Scaffold(bottomBar = {
+    Scaffold(containerColor = Color.Transparent, bottomBar = {
         NavigationBar {
             tabs.forEachIndexed { i, (label, icon) ->
                 NavigationBarItem(
@@ -467,6 +467,7 @@ private fun SettingsTab() {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("설정", style = MaterialTheme.typography.headlineSmall)
+        ThemeSettingsCard()
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("E2E 암호화 (선택)", style = MaterialTheme.typography.titleSmall)

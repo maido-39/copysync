@@ -51,6 +51,32 @@ class Settings(context: Context) {
         get() = prefs.getInt(KEY_AUTOCLEAR, 0)
         set(v) = prefs.edit().putInt(KEY_AUTOCLEAR, v).apply()
 
+    // ---- theme / appearance ----
+    var themeMode: String
+        get() = prefs.getString(KEY_THEME, "system") ?: "system"
+        set(v) = prefs.edit().putString(KEY_THEME, v).apply()
+    var bgImagePath: String
+        get() = prefs.getString(KEY_BG, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_BG, v).apply()
+    var bgBrightness: Float
+        get() = prefs.getFloat(KEY_BRIGHT, 1f)
+        set(v) = prefs.edit().putFloat(KEY_BRIGHT, v).apply()
+    var bgBlur: Float
+        get() = prefs.getFloat(KEY_BLUR, 0f)
+        set(v) = prefs.edit().putFloat(KEY_BLUR, v).apply()
+    var bgZoom: Float
+        get() = prefs.getFloat(KEY_ZOOM, 1f)
+        set(v) = prefs.edit().putFloat(KEY_ZOOM, v).apply()
+    var bgX: Float
+        get() = prefs.getFloat(KEY_BGX, 0f)
+        set(v) = prefs.edit().putFloat(KEY_BGX, v).apply()
+    var bgY: Float
+        get() = prefs.getFloat(KEY_BGY, 0f)
+        set(v) = prefs.edit().putFloat(KEY_BGY, v).apply()
+    var cardOpacity: Float
+        get() = prefs.getFloat(KEY_CARDOP, 1f)
+        set(v) = prefs.edit().putFloat(KEY_CARDOP, v).apply()
+
     val isPaired: Boolean
         get() = !serverUrl.isNullOrEmpty() && !deviceId.isNullOrEmpty() && !spkiPin.isNullOrEmpty()
 
@@ -68,5 +94,13 @@ class Settings(context: Context) {
         const val KEY_SENS = "sensitiveMark"
         const val KEY_EXCLUDE = "excludeSensitive"
         const val KEY_AUTOCLEAR = "autoClearSeconds"
+        const val KEY_THEME = "themeMode"
+        const val KEY_BG = "bgImagePath"
+        const val KEY_BRIGHT = "bgBrightness"
+        const val KEY_BLUR = "bgBlur"
+        const val KEY_ZOOM = "bgZoom"
+        const val KEY_BGX = "bgX"
+        const val KEY_BGY = "bgY"
+        const val KEY_CARDOP = "cardOpacity"
     }
 }

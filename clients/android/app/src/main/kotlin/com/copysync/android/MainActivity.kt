@@ -19,6 +19,8 @@ import com.copysync.android.data.Secrets
 import com.copysync.android.net.claimAndStore
 import com.copysync.android.sync.SyncService
 import com.copysync.android.ui.AppRoot
+import com.copysync.android.ui.CopySyncTheme
+import com.copysync.android.ui.ThemeState
 import com.copysync.android.ui.DownloadReq
 import com.copysync.android.ui.PendingDownload
 
@@ -34,10 +36,9 @@ class MainActivity : ComponentActivity() {
         handleDeepLink(intent)
         // Ensure the sync service is running whenever a paired app is opened.
         if (Settings(this).isPaired) SyncService.start(this)
+        ThemeState.load(this)
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { AppRoot() }
-            }
+            CopySyncTheme { AppRoot() }
         }
     }
 
