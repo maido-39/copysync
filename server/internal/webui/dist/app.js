@@ -151,6 +151,7 @@
     { id: "pairing", label: "페어링", ic: "🔗" },
     { id: "settings", label: "설정", ic: "⚙️" },
     { id: "downloads", label: "다운로드", ic: "📥" },
+    { id: "theme", label: "화면", ic: "🎨" },
     { id: "monitor", label: "모니터링", ic: "📡" },
     { id: "account", label: "계정", ic: "👤" },
   ];
@@ -190,6 +191,7 @@
     else if (id === "pairing") sectionPairing();
     else if (id === "settings") sectionSettings();
     else if (id === "downloads") sectionDownloads();
+    else if (id === "theme") sectionTheme();
     else if (id === "monitor") sectionMonitor();
     else sectionAccount();
   }
@@ -561,5 +563,88 @@
     m.appendChild(card);
   }
 
+  // ---- theme (dark/light + background image) --------------------------------
+  var THEME_KEY = "cs-admin-theme";
+  var theme = (function () {
+    var def = { mode: "dark", img: "", x: 50, y: 50, zoom: 1, bright: 1, blur: 0, cardOp: 1 };
+    try { return Object.assign(def, JSON.parse(localStorage.getItem(THEME_KEY) || "{}")); } catch (e) { return def; }
+  })();
+  function saveTheme() { try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch (e) {} }
+  var darkMql = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  function applyTheme() {
+    var r = document.documentElement;
+    var mode = theme.mode === "system" ? (darkMql && !darkMql.matches ? "light" : "dark") : theme.mode;
+    r.setAttribute("data-theme", mode === "light" ? "light" : "dark");
+    if (!document.querySelector(".app-bg")) document.body.appendChild(el("div", { class: "app-bg" }));
+    r.style.setProperty("--bg-img", theme.img ? 'url("' + theme.img + '")' : "none");
+    r.style.setProperty("--bg-x", theme.x + "%");
+    r.style.setProperty("--bg-y", theme.y + "%");
+    r.style.setProperty("--bg-zoom", theme.zoom);
+    r.style.setProperty("--bg-bright", theme.bright);
+    r.style.setProperty("--bg-blur", theme.blur + "px");
+    r.style.setProperty("--card-opacity", theme.cardOp);
+  }
+  function sectionTheme() {
+    var m = state.main;
+    m.appendChild(pageHead("화면", "다크/라이트 모드 + 배경 이미지 (이 브라우저에만 저장)"));
+    var card = el("div", { class: "card" });
+    var modebar = el("div", { class: "modebar" });
+    function paintMode() { modebar.querySelectorAll("button").forEach(function (b) { b.classList.toggle("sel", b.dataset.mode === theme.mode); }); }
+    [["dark", "다크"], ["light", "라이트"], ["system", "시스템"]].forEach(function (mm) {
+      var b = el("button", { onclick: function () { theme.mode = mm[0]; applyTheme(); paintMode(); saveTheme(); } }, mm[1]);
+      b.dataset.mode = mm[0]; modebar.appendChild(b);
+    });
+    card.appendChild(modebar);
+    var file = el("input", { type: "file", accept: "image/*" }); file.style.display = "none";
+    file.addEventListener("change", function (e) {
+      var f = e.target.files[0]; if (!f) return;
+      var rd = new FileReader();
+      rd.onload = function () {
+        var im = new Image();
+        im.onload = function () {
+          var mx = 1600, sc = Math.min(1, mx / Math.max(im.width, im.height));
+          var c = document.createElement("canvas"); c.width = Math.round(im.width * sc); c.height = Math.round(im.height * sc);
+          c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+          theme.img = c.toDataURL("image/jpeg", 0.82); theme.x = 50; theme.y = 50; applyTheme(); go("theme"); saveTheme();
+        };
+        im.src = rd.result;
+      };
+      rd.readAsDataURL(f);
+    });
+    card.appendChild(el("div", { class: "row" },
+      el("button", { class: "btn", onclick: function () { file.click(); } }, "배경 이미지 선택…"),
+      theme.img ? el("button", { class: "btn ghost", onclick: function () { theme.img = ""; applyTheme(); go("theme"); saveTheme(); } }, "제거") : null,
+      file));
+    if (theme.img) {
+      var crop = el("div", { class: "cropbox" }, el("span", { class: "hintlabel" }, "드래그해서 위치 조정"));
+      var dragging = false;
+      function pan(e) {
+        var rr = crop.getBoundingClientRect();
+        theme.x = Math.max(0, Math.min(100, ((e.clientX - rr.left) / rr.width) * 100));
+        theme.y = Math.max(0, Math.min(100, ((e.clientY - rr.top) / rr.height) * 100));
+        applyTheme(); saveTheme();
+      }
+      crop.addEventListener("pointerdown", function (e) { crop.setPointerCapture(e.pointerId); dragging = true; pan(e); });
+      crop.addEventListener("pointermove", function (e) { if (dragging) pan(e); });
+      crop.addEventListener("pointerup", function () { dragging = false; });
+      card.appendChild(crop);
+      function slider(label, key, min, max, step, suf) {
+        var inp = el("input", { type: "range", min: min, max: max, step: step, value: theme[key] });
+        var val = el("span", { class: "val" }, (Math.round(theme[key] * 100) / 100) + suf);
+        inp.addEventListener("input", function () {
+          theme[key] = Number(inp.value); val.textContent = (Math.round(inp.value * 100) / 100) + suf; applyTheme(); saveTheme();
+        });
+        return el("div", { class: "slider" }, el("label", null, label), inp, val);
+      }
+      card.appendChild(slider("확대", "zoom", 1, 3, 0.02, "×"));
+      card.appendChild(slider("밝기", "bright", 0.3, 1.3, 0.02, ""));
+      card.appendChild(slider("흐림(블러)", "blur", 0, 24, 0.5, "px"));
+      card.appendChild(slider("박스 투명도", "cardOp", 0.3, 1, 0.02, ""));
+    }
+    m.appendChild(card);
+    paintMode();
+  }
+
+  applyTheme();
   start();
 })();

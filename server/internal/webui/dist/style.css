@@ -1,7 +1,8 @@
 :root {
   --bg: #0b0e14;
-  --panel: #141926;
-  --panel2: #1b2230;
+  --bg-rgb: 11,14,20;
+  --panel-rgb: 20,25,38;
+  --panel2-rgb: 27,34,48;
   --border: #232c3d;
   --text: #e6e9f0;
   --muted: #8b93a7;
@@ -13,15 +14,44 @@
   --warn: #f59e0b;
   --radius: 12px;
   --shadow: 0 6px 24px rgba(0,0,0,.35);
+
+  /* theme controls (set live from JS, localStorage-backed) */
+  --card-opacity: 1;
+  --bg-img: none;
+  --bg-blur: 0px;
+  --bg-bright: 1;
+  --bg-zoom: 1;
+  --bg-x: 50%;
+  --bg-y: 50%;
+  --panel: rgba(var(--panel-rgb), var(--card-opacity));
+  --panel2: rgba(var(--panel2-rgb), calc(0.4 + var(--card-opacity) * 0.6));
+}
+:root[data-theme="light"] {
+  --bg: #eef1f6;
+  --bg-rgb: 238,241,246;
+  --panel-rgb: 255,255,255;
+  --panel2-rgb: 237,240,245;
+  --border: #d4dae4;
+  --text: #1b2130;
+  --muted: #5a6478;
+  --shadow: 0 6px 24px rgba(20,30,60,.12);
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
   margin: 0;
   font: 14px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
-  background: radial-gradient(1200px 600px at 80% -10%, #161d2e 0, var(--bg) 55%) fixed;
+  background: var(--bg);
   color: var(--text);
 }
+.app-bg {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background-image: var(--bg-img); background-size: cover;
+  background-position: var(--bg-x) var(--bg-y); background-repeat: no-repeat;
+  filter: blur(var(--bg-blur)) brightness(var(--bg-bright));
+  transform: scale(calc(var(--bg-zoom) * 1.06)); transform-origin: center;
+}
+.sidebar, .card, .tile { -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 a { color: var(--accent2); }
 .muted { color: var(--muted); }
 .small { font-size: 12.5px; }
@@ -191,3 +221,14 @@ pre.payload {
   .field-grid, .pair-grid { grid-template-columns: 1fr; }
   .pair-grid { justify-items: center; }
 }
+
+/* ---------- theme controls ---------- */
+.modebar { display: flex; gap: 6px; margin: 4px 0 12px; }
+.modebar button { flex: 1; padding: 9px 0; border-radius: 9px; cursor: pointer; background: var(--panel2); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
+.modebar button.sel { background: linear-gradient(135deg, var(--accent), var(--accent-press)); color: #fff; border-color: transparent; }
+.slider { display: grid; grid-template-columns: 96px 1fr 48px; align-items: center; gap: 10px; margin: 10px 0; }
+.slider label { margin: 0; }
+.slider .val { color: var(--muted); font-size: 12px; text-align: right; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.cropbox { position: relative; width: 100%; height: 150px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background-color: var(--panel2); cursor: grab; margin-top: 8px; background-image: var(--bg-img); background-size: cover; background-position: var(--bg-x) var(--bg-y); touch-action: none; }
+.cropbox .hintlabel { position: absolute; left: 0; right: 0; bottom: 0; text-align: center; font-size: 11px; color: #fff; background: rgba(0,0,0,.45); padding: 4px; }
