@@ -4,8 +4,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * In-memory event log for the Debug tab. Lines always go to logcat; when
- * [enabled] is on, they are also buffered so the user can read/share every
- * sync + capture event for diagnosis (no ADB/READ_LOGS needed).
+ * [enabled] is on, every event is also buffered for diagnosis (no ADB/READ_LOGS
+ * needed). Warnings/errors are buffered even when [enabled] is off, so a failure
+ * is in the Debug tab after the fact without having to reproduce it.
  */
 object DebugLog {
     val enabled = MutableStateFlow(false)
@@ -17,7 +18,8 @@ object DebugLog {
     @Synchronized
     private fun add(level: Int, msg: String) {
         android.util.Log.println(level, "CopySync", msg)
-        if (!enabled.value) return
+        // Warnings/errors are ALWAYS buffered; verbose INFO only when recording is on.
+        if (!enabled.value && level != android.util.Log.WARN) return
         val lvl = if (level == android.util.Log.WARN) "W" else "I"
         buf.addLast("${fmt.format(java.util.Date())} $lvl $msg")
         while (buf.size > 800) buf.removeFirst()

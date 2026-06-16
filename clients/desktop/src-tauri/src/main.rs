@@ -219,6 +219,7 @@ fn seen(q: &VecDeque<String>, sha: &str) -> bool {
 }
 
 fn notify(app: &AppHandle, title: &str, body: &str) {
+    dlog(app, format!("🔔 {title}: {body}")); // also land it in the Debug tab
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
@@ -733,15 +734,22 @@ async fn sync_actor(
                 ping_at.tick().await;
                 let mut watchdog = tokio::time::interval(Duration::from_secs(15));
                 watchdog.tick().await;
-                loop {
+                let why: String = 'inner: loop {
                     tokio::select! {
                         _ = ping_at.tick() => {
-                            if ws::ping(&mut sock).await.is_err() { break; }
+                            if let Err(e) = ws::ping(&mut sock).await {
+                                break 'inner format!("핑(keepalive) 전송 실패: {e}");
+                            }
                         }
                         _ = watchdog.tick() => {
-                            if last_recv.elapsed() > WS_WATCHDOG { break; }
+                            if last_recv.elapsed() > WS_WATCHDOG {
+                                break 'inner format!(
+                                    "{}초 동안 서버 프레임 없음 — watchdog({}s) 초과로 연결 끊김 판단",
+                                    last_recv.elapsed().as_secs(), WS_WATCHDOG.as_secs()
+                                );
+                            }
                         }
-                        _ = reconnect.notified() => break,
+                        _ = reconnect.notified() => break 'inner "사용자가 재연결을 요청함".to_string(),
                         cmd = rx.recv() => match cmd {
                             None => return,
                             Some(Cmd::LocalText { text, html }) => {
@@ -759,30 +767,30 @@ async fn sync_actor(
                                         continue;
                                     }
                                 }
-                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&targets), &app, &hist).await { break; }
+                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&targets), &app, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::SendText(t)) => {
                                 remember(&mut recent_text, sha_hex(t.as_bytes()));
-                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&targets), &app, &hist).await { break; }
+                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&targets), &app, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::LocalImage(img)) => {
                                 let sha = sha_hex(&img.rgba);
                                 if seen(&recent_img, &sha) { continue; }
                                 remember(&mut recent_img, sha);
-                                if !send_image_clip(&mut sock, &mut seq, &img, &key, current_targets(&targets), &app, &hist, &http, &cfg).await { break; }
+                                if !send_image_clip(&mut sock, &mut seq, &img, &key, current_targets(&targets), &app, &hist, &http, &cfg).await { break 'inner "이미지 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::SendFile(p)) => {
-                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
+                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::LocalFiles(files)) => {
                                 for p in files {
                                     // Skip a file we just placed on the clipboard from an inbound clip (echo).
                                     if seen(&recent_files, &p) { continue; }
-                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break; }
+                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
                                 }
                             }
                             Some(Cmd::SetPool(name)) => {
-                                if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break; }
+                                if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break 'inner "풀 설정 전송 실패".to_string(); }
                                 let snap = { let mut s = status.lock().unwrap_or_else(|e| e.into_inner()); s.pool = name; s.clone() };
                                 let _ = app.emit("status", snap);
                                 rebuild_tray(&app);
@@ -800,17 +808,19 @@ async fn sync_actor(
                                         if !tr.token.is_empty() {
                                             cfg.token = tr.token;
                                             let _ = cfg.save(&cfg_path);
+                                            dlog(&app, "토큰 회전 — 새 인증 토큰 저장됨");
                                         }
                                     }
                                 } else {
                                     handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &mut recent_files, &on_demand).await;
                                 }
                             }
-                            Ok(None) => break,
-                            Err(_) => break,
+                            Ok(None) => break 'inner "서버가 연결을 종료함".to_string(),
+                            Err(e) => break 'inner format!("수신 오류: {e}"),
                         }
                     }
-                }
+                };
+                dlog(&app, format!("연결 종료 — {why} · 자동 재연결 시도"));
                 set_connected(&app, &status, false);
             }
             Err(e) => {
@@ -890,6 +900,15 @@ fn apply_presence(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, p: Pr
 
 // ----------------------------------------------------------------- outbound
 
+/// Append a line to the Debug-tab recorder (always captured there now, even with
+/// the verbose "이벤트 기록" toggle off) plus stderr — for failures the user should
+/// be able to see after the fact.
+fn dlog(app: &AppHandle, msg: impl Into<String>) {
+    let m = msg.into();
+    eprintln!("copysync: {m}");
+    let _ = app.emit("error", m);
+}
+
 async fn send_text_clip(
     sock: &mut ws::Ws,
     seq: &mut u64,
@@ -909,7 +928,7 @@ async fn send_text_clip(
         targets,
     ) {
         Ok(e) => e,
-        Err(_) => return true,
+        Err(e) => { dlog(app, format!("텍스트 클립 생성 실패(E2E 암호화?) — 전송 안 함: {e}")); return true; }
     };
     if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
         return false;
@@ -945,19 +964,19 @@ async fn send_image_clip(
 ) -> bool {
     let png = match clipboard::encode_png(img) {
         Ok(p) => p,
-        Err(_) => return true,
+        Err(e) => { dlog(app, format!("이미지 PNG 인코딩 실패 — 전송 안 함: {e}")); return true; }
     };
     let payload = match key {
         Some((k, _)) => match e2e::seal(k, &png) {
             Ok(c) => c,
-            Err(_) => return true,
+            Err(e) => { dlog(app, format!("이미지 E2E 암호화 실패 — 전송 안 함: {e}")); return true; }
         },
         None => png.clone(),
     };
     let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("image blob upload failed: {e}");
+            dlog(app, format!("이미지 blob 업로드 실패 — 전송 안 함: {e}"));
             return true; // blob channel issue, not the control channel
         }
     };
@@ -1024,7 +1043,7 @@ async fn send_file_clip(
                     Ok(d) => d,
                     Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
                 };
-                let ct = match e2e::seal(k, &data) { Ok(c) => c, Err(_) => return true };
+                let ct = match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog(app, format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } };
                 let sha = sha_hex(&ct);
                 let bid = format!("sha256:{sha}");
                 on_demand.insert(bid.clone(), Hold::Sealed(ct));
@@ -1051,7 +1070,7 @@ async fn send_file_clip(
             Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
         };
         let payload = match key {
-            Some((k, _)) => match e2e::seal(k, &data) { Ok(c) => c, Err(_) => return true },
+            Some((k, _)) => match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog(app, format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } },
             None => data,
         };
         let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
@@ -1110,8 +1129,9 @@ async fn handle_frame(
 ) {
     match t.as_str() {
         protocol::T_CLIP => {
-            if let Ok(ev) = serde_json::from_value::<ClipEvent>(d) {
-                handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img, recent_files).await;
+            match serde_json::from_value::<ClipEvent>(d) {
+                Ok(ev) => handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img, recent_files).await,
+                Err(e) => dlog(app, format!("받은 클립 디코딩 실패: {e}")),
             }
         }
         protocol::T_BLOB_REQUEST => {
@@ -1121,7 +1141,7 @@ async fn handle_frame(
                         Hold::Sealed(b) => b.clone(),
                         Hold::Plain(p) => match std::fs::read(p) {
                             Ok(b) => b,
-                            Err(_) => return,
+                            Err(e) => { dlog(app, format!("요청받은 파일 읽기 실패: {e}")); return; }
                         },
                     };
                     let _ = blob::put_blob(http, &cfg.server_url, &cfg.token, bytes).await;
@@ -1187,9 +1207,14 @@ async fn handle_incoming(
         let _ = std::fs::write(&path, &plain);
         let is_image = ev.mime.first().map(|m| m.starts_with("image/")).unwrap_or(false);
         if is_image {
-            if let Ok(img) = clipboard::decode_image(&plain) {
-                remember(recent_img, sha_hex(&img.rgba));
-                let _ = clipboard::set_image(&img);
+            match clipboard::decode_image(&plain) {
+                Ok(img) => {
+                    remember(recent_img, sha_hex(&img.rgba));
+                    if let Err(e) = clipboard::set_image(&img) {
+                        dlog(app, format!("받은 이미지 클립보드 적용 실패(RDP 경합?): {e}"));
+                    }
+                }
+                Err(e) => dlog(app, format!("받은 이미지 디코딩 실패: {e}")),
             }
             show_toast(app, &ev.origin_device, &format!("🖼 {name} · {}", human(plain.len())), thumb_data_uri(&plain));
         } else {
@@ -1197,7 +1222,9 @@ async fn handle_incoming(
             if !ev.on_demand {
                 let p = path.to_string_lossy().to_string();
                 remember(recent_files, p.clone());
-                let _ = clipboard::set_files(&[p]);
+                if let Err(e) = clipboard::set_files(&[p]) {
+                    dlog(app, format!("받은 파일 클립보드 적용 실패(RDP 경합?): {e}"));
+                }
             }
             show_toast(app, &ev.origin_device, &format!("📎 {name} · {}", human(plain.len())), None);
         }
@@ -1213,7 +1240,7 @@ async fn handle_incoming(
             use base64::{engine::general_purpose::STANDARD, Engine};
             let raw = match STANDARD.decode(&ev.inline_text) {
                 Ok(r) => r,
-                Err(_) => return,
+                Err(e) => { dlog(app, format!("받은 텍스트 base64 디코딩 실패: {e}")); return; }
             };
             match e2e::open(k, &raw) {
                 Ok(p) => String::from_utf8_lossy(&p).to_string(),
@@ -1250,10 +1277,13 @@ async fn handle_incoming(
     let st = app.state::<AppState>();
     let mark = st.mark_sensitive.load(Ordering::Relaxed);
     let auto_clear = st.auto_clear_secs.load(Ordering::Relaxed);
-    match &html {
-        Some(h) => { let _ = clipboard::set_html(h, &text); }
-        None if mark => { let _ = clipboard::set_text_sensitive(&text); }
-        None => { let _ = clipboard::set_text(&text); }
+    let applied = match &html {
+        Some(h) => clipboard::set_html(h, &text),
+        None if mark => clipboard::set_text_sensitive(&text),
+        None => clipboard::set_text(&text),
+    };
+    if let Err(e) = applied {
+        dlog(app, format!("받은 텍스트 클립보드 적용 실패(RDP 경합?): {e}"));
     }
     if auto_clear > 0 {
         schedule_clear_text(text.clone(), auto_clear);

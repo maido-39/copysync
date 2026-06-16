@@ -1,5 +1,6 @@
 package com.copysync.android.net
 
+import com.copysync.android.sync.DebugLog
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import okhttp3.OkHttpClient
@@ -29,18 +30,25 @@ class WsClient(private val client: OkHttpClient) {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                decodeEnvelope(text)?.let { incoming.tryEmit(it) }
+                val env = decodeEnvelope(text)
+                when {
+                    env == null -> DebugLog.w("프레임 파싱 실패: ${text.take(80)}")
+                    !incoming.tryEmit(env) -> DebugLog.w("수신 버퍼 가득 — 프레임 누락(${env.t})")
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 connected.value = false
                 webSocket.close(1000, null)
-                listener.onClosed(reason)
+                listener.onClosed(if (reason.isNotEmpty()) "$reason (code $code)" else "code $code")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 connected.value = false
-                listener.onClosed(t.message ?: "connection failure")
+                // Include the exception type + any HTTP status so pin/token/handshake
+                // failures are distinguishable in the Debug tab.
+                val http = response?.let { " (HTTP ${it.code})" } ?: ""
+                listener.onClosed("${t.javaClass.simpleName}: ${t.message ?: "connection failure"}$http")
             }
         })
     }

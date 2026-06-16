@@ -306,7 +306,14 @@ class SyncService : Service() {
                     val w = WsClient(client)
                     ws = w
                     blob = BlobClient(client, url, token)
-                    val incomingJob = launch { w.incoming.collect { handle(it) } }
+                    val incomingJob = launch {
+                        // Guard each frame: one throwing/unparseable frame must not kill
+                        // the whole receive loop (it'd silently stop all inbound sync).
+                        w.incoming.collect { env ->
+                            runCatching { handle(env) }
+                                .onFailure { DebugLog.w("수신 프레임 처리 오류(${env.t}): $it") }
+                        }
+                    }
                     val wsUrl = url.replaceFirst("https://", "wss://")
                         .replaceFirst("http://", "ws://").trimEnd('/') + "/ws"
                     update("connecting…")
@@ -321,6 +328,7 @@ class SyncService : Service() {
 
                         override fun onClosed(reason: String) {
                             SyncState.connected.value = false
+                            DebugLog.w("연결 끊김: $reason · 자동 재연결 시도")
                             update("disconnected: $reason")
                         }
                     })
@@ -338,7 +346,8 @@ class SyncService : Service() {
                     w.close()
                     blob = null
                 } catch (e: Exception) {
-                    update("error: ${e.message}")
+                    DebugLog.w("연결/실행 오류: $e")
+                    update("error: ${e.message ?: e.javaClass.simpleName}")
                     SyncState.connected.value = false
                 }
                 if (!SyncState.running.value) break
@@ -351,7 +360,8 @@ class SyncService : Service() {
     private suspend fun handle(env: Envelope) {
         when (env.t) {
             MsgType.HELLO_OK -> {
-                val ok = runCatching { env.decodePayload<HelloOk>() }.getOrNull()
+                val ok = runCatching { env.decodePayload<HelloOk>() }
+                    .onFailure { DebugLog.w("HELLO_OK 디코딩 실패: ${it.message}") }.getOrNull()
                 threshold = ok?.onDemandThreshold ?: 0
                 settings.onDemandThreshold = threshold
                 SyncState.roster.value = ok?.roster ?: emptyList()
@@ -395,7 +405,8 @@ class SyncService : Service() {
                 }
             }
             MsgType.CLIP -> {
-                val ev = runCatching { env.decodePayload<ClipEvent>() }.getOrNull() ?: return
+                val ev = runCatching { env.decodePayload<ClipEvent>() }
+                    .onFailure { DebugLog.w("받은 클립 디코딩 실패: ${it.message}") }.getOrNull() ?: return
                 val imageMime = ev.mime.firstOrNull { it.startsWith("image/") }
                 when {
                     ev.inlineText != null -> {
@@ -406,7 +417,7 @@ class SyncService : Service() {
                             val k = key
                             val dec = if (k != null && (ev.enc!!.keyId.isEmpty() || ev.enc!!.keyId == kid))
                                 runCatching { String(E2eCrypto.open(k, Base64.decode(text, Base64.NO_WRAP))) }.getOrNull() else null
-                            if (dec != null) text = dec else { text = "[encrypted — no matching key]"; readable = false }
+                            if (dec != null) text = dec else { text = "[encrypted — no matching key]"; readable = false; DebugLog.w("받은 텍스트 복호화 실패 — 일치하는 E2E 키 없음 (keyId=${ev.enc!!.keyId})") }
                         }
                         dao.insert(
                             ClipEntity(

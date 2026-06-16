@@ -16,13 +16,19 @@ document.querySelectorAll("nav#tabs button").forEach((b) => {
 // ---- debug log (event recorder for the 디버깅 tab)
 let dbgRecording = false;
 const dbgLines = [];
-function dbg(msg) {
-  if (!dbgRecording) return;
+// Always recorded — failures, reconnects, connection changes — so they're in
+// the Debug tab even if the user never turned "이벤트 기록" on before the problem.
+function dbgForce(msg) {
   const t = new Date().toLocaleTimeString();
   dbgLines.push("[" + t + "] " + msg);
-  if (dbgLines.length > 500) dbgLines.shift();
+  if (dbgLines.length > 800) dbgLines.shift();
   const el = $("#dbg-log");
   if (el) el.textContent = dbgLines.join("\n");
+}
+// Verbose per-event lines — only when recording is enabled.
+function dbg(msg) {
+  if (!dbgRecording) return;
+  dbgForce(msg);
 }
 $("#dbg-record").addEventListener("change", (e) => {
   dbgRecording = e.target.checked;
@@ -180,7 +186,7 @@ $("#pair-btn").addEventListener("click", async () => {
 let lastConn = null;
 listen("status", (ev) => {
   const s = ev.payload || {};
-  if (s.connected !== lastConn) { lastConn = s.connected; dbg("연결 " + (s.connected ? "됨" : "끊김")); }
+  if (s.connected !== lastConn) { lastConn = s.connected; dbgForce("🔌 연결 " + (s.connected ? "됨" : "끊김")); }
   renderStatus(s);
 });
 // Pink translucent toast shown when the privacy filter blocks an outbound clip.
@@ -223,12 +229,12 @@ listen("clip", (ev) => {
   if (p.sensitive) showBlockedToast(p.sensitive, p.text || p.name);
   if ($("#history").classList.contains("active")) loadHistory();
 });
-listen("error", (ev) => { dbg("오류 " + ev.payload); console.warn("copysync:", ev.payload); });
+listen("error", (ev) => { dbgForce("⚠️ " + ev.payload); console.warn("copysync:", ev.payload); });
 // Clipboard-watcher diagnostics (e.g. RDP/virtual file copies that aren't CF_HDROP).
 listen("cliplog", (ev) => dbg("📋 " + ev.payload));
 // Reconnect attempts (exponential backoff) — show the countdown + log it.
 listen("reconnect", (ev) => {
-  dbg("🔄 재연결 " + ev.payload);
+  dbgForce("🔄 재연결 " + ev.payload);
   const c = $("#s-conn"); if (c) c.textContent = "재연결 중 · " + ev.payload;
 });
 
