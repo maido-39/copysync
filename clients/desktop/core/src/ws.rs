@@ -16,6 +16,11 @@ use crate::{decode, encode, PROTO};
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Internal tag [`recv`] returns for a keepalive (ping/pong) frame — not a wire
+/// message type. Lets the actor's watchdog tell a live-but-idle connection from a
+/// dead one (important over RDP/flaky links where TCP can half-die silently).
+pub const KEEPALIVE: &str = "\u{0}keepalive";
+
 fn to_ws_url(base: &str) -> String {
     let b = base.trim_end_matches('/');
     let b = b.replacen("https://", "wss://", 1);
@@ -70,13 +75,22 @@ pub async fn send<T: Serialize>(ws: &mut Ws, t: &str, d: &T) -> Result<()> {
     Ok(())
 }
 
-/// Read the next control frame, skipping ping/pong and stopping on close.
-/// Returns the type tag and the raw `d` payload, or `None` at end of stream.
+/// Send a WebSocket ping (a liveness probe the actor issues periodically).
+pub async fn ping(ws: &mut Ws) -> Result<()> {
+    ws.send(Message::Ping(Vec::new().into())).await?;
+    Ok(())
+}
+
+/// Read the next control frame. Stops on close; surfaces ping/pong as a
+/// [`KEEPALIVE`] tag (instead of silently swallowing them) so the caller can
+/// reset a liveness watchdog. Returns the type tag and raw `d`, or `None` at EOF.
 pub async fn recv(ws: &mut Ws) -> Result<Option<(String, serde_json::Value)>> {
     loop {
         match ws.next().await {
             None | Some(Ok(Message::Close(_))) => return Ok(None),
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                return Ok(Some((KEEPALIVE.to_string(), serde_json::Value::Null)));
+            }
             Some(Ok(msg)) => {
                 let data = msg.into_data();
                 if data.is_empty() {

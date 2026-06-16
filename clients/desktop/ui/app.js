@@ -193,6 +193,11 @@ listen("clip", (ev) => {
 listen("error", (ev) => { dbg("오류 " + ev.payload); console.warn("copysync:", ev.payload); });
 // Clipboard-watcher diagnostics (e.g. RDP/virtual file copies that aren't CF_HDROP).
 listen("cliplog", (ev) => dbg("📋 " + ev.payload));
+// Reconnect attempts (exponential backoff) — show the countdown + log it.
+listen("reconnect", (ev) => {
+  dbg("🔄 재연결 " + ev.payload);
+  const c = $("#s-conn"); if (c) c.textContent = "재연결 중 · " + ev.payload;
+});
 
 // ---- autostart
 async function loadAutostart() {
@@ -333,6 +338,11 @@ $("#discover-btn").addEventListener("click", async () => {
 
 $("#pool").addEventListener("change", (e) => {
   invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
+});
+
+$("#reconnect-btn").addEventListener("click", () => {
+  invoke("reconnect").catch(() => {});
+  const c = $("#s-conn"); if (c) c.textContent = "재연결 중…";
 });
 
 refreshStatus();

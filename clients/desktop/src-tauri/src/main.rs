@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 
 use copysync_core::clipboard::{self, Image};
 use copysync_core::history::{Entry, History};
@@ -51,6 +52,8 @@ struct Status {
     e2e: bool,
     pool: String,
     pools: Vec<String>,
+    /// True while disconnected-but-paired and actively retrying.
+    reconnecting: bool,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -193,6 +196,8 @@ struct AppState {
     auto_clear_secs: Arc<AtomicU64>,
     /// Mark received clips so the OS clipboard history / cloud sync skips them.
     mark_sensitive: Arc<AtomicBool>,
+    /// Notified to force an immediate reconnect (manual "재연결" + wakes backoff).
+    reconnect: Arc<Notify>,
 }
 
 fn sha_hex(b: &[u8]) -> String {
@@ -427,6 +432,13 @@ fn set_mark_sensitive(state: State<'_, AppState>, enabled: bool) -> Result<(), S
         let _ = cfg.save(&state.cfg_path);
     }
     Ok(())
+}
+
+/// Force an immediate reconnect (manual "재연결"). Wakes the sync actor's backoff
+/// sleep or breaks an idle connection so it re-dials right away.
+#[tauri::command]
+fn reconnect(state: State<'_, AppState>) {
+    state.reconnect.notify_waiters();
 }
 
 /// Browse the LAN for CopySync servers over mDNS. Returns `[{name, url}]`.
@@ -672,6 +684,11 @@ async fn sync_actor(
     targets: Arc<Mutex<Targets>>,
     downloads: PathBuf,
 ) {
+    // Liveness: ping this often; reconnect if no frame arrives within the watchdog
+    // (the server pings every 30s, so 75s = ~2 missed pings = a dead link).
+    const WS_PING_EVERY: Duration = Duration::from_secs(30);
+    const WS_WATCHDOG: Duration = Duration::from_secs(75);
+
     let pin = match cfg.pin_bytes() {
         Ok(p) => p,
         Err(e) => {
@@ -691,21 +708,40 @@ async fn sync_actor(
     let mut recent_img: VecDeque<String> = VecDeque::new();
     let mut recent_files: VecDeque<String> = VecDeque::new();
     let mut on_demand: HashMap<String, Hold> = HashMap::new();
+    let reconnect = app.state::<AppState>().reconnect.clone();
+    let mut attempt: u32 = 0;
 
     loop {
         match ws::connect(&cfg.server_url, pin, &cfg.device_id, &cfg.device_name, &cfg.token).await {
             Ok((mut sock, hello)) => {
+                attempt = 0;
                 let threshold = hello.on_demand_threshold;
                 set_roster(&app, &roster, hello.roster.clone());
                 {
                     let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
                     s.pool = hello.pool.clone();
                     s.pools = hello.pools.clone();
+                    s.reconnecting = false;
                 }
                 set_connected(&app, &status, true);
                 rebuild_tray(&app);
+                // Liveness watchdog: ping every WS_PING_EVERY and reconnect if no
+                // frame arrives within WS_WATCHDOG (the server pings every 30s).
+                // Catches a silently dead TCP link — RDP/network drop, suspend.
+                let mut last_recv = Instant::now();
+                let mut ping_at = tokio::time::interval(WS_PING_EVERY);
+                ping_at.tick().await;
+                let mut watchdog = tokio::time::interval(Duration::from_secs(15));
+                watchdog.tick().await;
                 loop {
                     tokio::select! {
+                        _ = ping_at.tick() => {
+                            if ws::ping(&mut sock).await.is_err() { break; }
+                        }
+                        _ = watchdog.tick() => {
+                            if last_recv.elapsed() > WS_WATCHDOG { break; }
+                        }
+                        _ = reconnect.notified() => break,
                         cmd = rx.recv() => match cmd {
                             None => return,
                             Some(Cmd::LocalText { text, html }) => {
@@ -754,7 +790,10 @@ async fn sync_actor(
                         },
                         frame = ws::recv(&mut sock) => match frame {
                             Ok(Some((t, d))) => {
-                                if t == protocol::T_TOKEN_ROTATE {
+                                last_recv = Instant::now();
+                                if t == ws::KEEPALIVE {
+                                    // ping/pong — liveness only.
+                                } else if t == protocol::T_TOKEN_ROTATE {
                                     // Stage-3: persist the re-issued bearer token; the next
                                     // reconnect uses it and the server retires the old one.
                                     if let Ok(tr) = serde_json::from_value::<protocol::TokenRotate>(d) {
@@ -774,10 +813,39 @@ async fn sync_actor(
                 }
                 set_connected(&app, &status, false);
             }
-            Err(e) => eprintln!("connect failed: {e}"),
+            Err(e) => {
+                eprintln!("connect failed: {e}");
+                let _ = app.emit("error", format!("연결 실패 — 재시도 중: {e}"));
+            }
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Exponential backoff with jitter (1→2→4…→30s), surfaced to the UI; a
+        // manual "재연결" (reconnect.notified) skips the wait.
+        attempt = attempt.saturating_add(1);
+        let delay = backoff_delay(attempt);
+        let snap = {
+            let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
+            s.connected = false;
+            s.reconnecting = true;
+            s.clone()
+        };
+        let _ = app.emit("status", snap);
+        let _ = app.emit("reconnect", format!("{attempt}회 · {}초 후 재시도", delay.as_secs().max(1)));
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = reconnect.notified() => {}
+        }
     }
+}
+
+/// Reconnect backoff: 1, 2, 4, 8, 16, 30, 30… seconds, plus a little jitter so
+/// many clients don't retry in lockstep.
+fn backoff_delay(attempt: u32) -> Duration {
+    let secs = (1u64 << attempt.min(5)).min(30);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_millis() as u64) % 700)
+        .unwrap_or(0);
+    Duration::from_millis(secs * 1000 + jitter)
 }
 
 fn set_connected(app: &AppHandle, status: &Arc<Mutex<Status>>, on: bool) {
@@ -1282,6 +1350,7 @@ fn main() {
                 )),
                 auto_clear_secs: Arc::new(AtomicU64::new(0)),
                 mark_sensitive: Arc::new(AtomicBool::new(false)),
+                reconnect: Arc::new(Notify::new()),
             };
             let cfg_path = state.cfg_path.clone();
             app.manage(state);
@@ -1356,6 +1425,7 @@ fn main() {
             get_mark_sensitive,
             set_mark_sensitive,
             discover_servers,
+            reconnect,
             get_shortcut,
             set_shortcut,
             set_pool,
