@@ -19,4 +19,10 @@ object SyncState {
     /** Share pool: clips only sync among devices in the same pool. */
     val pools = MutableStateFlow<List<String>>(emptyList())
     val currentPool = MutableStateFlow("default")
+
+    /** A clip the privacy filter just blocked from syncing — drives the toast. */
+    val blockedToast = MutableStateFlow<BlockedClip?>(null)
 }
+
+/** Reason + content preview for a blocked-clip toast. `at` makes each emit distinct. */
+data class BlockedClip(val reason: String, val preview: String, val at: Long)

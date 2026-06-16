@@ -164,6 +164,8 @@ class SyncService : Service() {
                         val sens = Privacy.classify(c.text)
                         if (sens != null) {
                             SyncState.lastEvent.value = "🔒 민감(${sens.label}) — 동기화 안 함"
+                            SyncState.blockedToast.value =
+                                BlockedClip(sens.label, c.text.take(90), System.currentTimeMillis())
                             DebugLog.i("sensitive clip filtered (not synced): ${sens.label}")
                             return@launch
                         }

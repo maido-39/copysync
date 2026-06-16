@@ -183,11 +183,44 @@ listen("status", (ev) => {
   if (s.connected !== lastConn) { lastConn = s.connected; dbg("연결 " + (s.connected ? "됨" : "끊김")); }
   renderStatus(s);
 });
+// Pink translucent toast shown when the privacy filter blocks an outbound clip.
+const REASON_KO = {
+  "password-like": "비밀번호로 추정",
+  "payment card": "카드번호로 추정",
+  "private key": "개인 키",
+  "OTP secret": "OTP/2FA 비밀",
+  "custom pattern": "사용자 패턴",
+};
+function showBlockedToast(reasonLabel, content) {
+  const wrap = $("#toasts");
+  if (!wrap) return;
+  const el = document.createElement("div");
+  el.className = "toast";
+  const ico = document.createElement("span");
+  ico.className = "ico"; ico.textContent = "🔒";
+  const bodyEl = document.createElement("div"); bodyEl.className = "body";
+  const title = document.createElement("div"); title.className = "title";
+  title.textContent = "동기화 차단됨";
+  const reason = document.createElement("span");
+  reason.className = "reason";
+  reason.textContent = REASON_KO[reasonLabel] || reasonLabel || "민감 정보";
+  title.appendChild(reason);
+  const preview = document.createElement("div"); preview.className = "preview";
+  preview.textContent = (content || "").slice(0, 90); // textContent → safe vs clipboard HTML
+  bodyEl.appendChild(title); bodyEl.appendChild(preview);
+  const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
+  el.appendChild(ico); el.appendChild(bodyEl); el.appendChild(x);
+  wrap.appendChild(el);
+  const kill = () => { el.classList.add("out"); setTimeout(() => el.remove(), 300); };
+  x.addEventListener("click", kill);
+  setTimeout(kill, 5200);
+}
 listen("clip", (ev) => {
   const p = ev.payload || {};
   const arrow = p.direction === "out" ? "↑보냄" : "↓받음";
   const body = p.text ? p.text.slice(0, 60) : (p.name || "");
   dbg("클립 " + arrow + " " + (p.kind || "text") + " " + (p.sensitive ? "🔒 " : "") + body);
+  if (p.sensitive) showBlockedToast(p.sensitive, p.text || p.name);
   if ($("#history").classList.contains("active")) loadHistory();
 });
 listen("error", (ev) => { dbg("오류 " + ev.payload); console.warn("copysync:", ev.payload); });

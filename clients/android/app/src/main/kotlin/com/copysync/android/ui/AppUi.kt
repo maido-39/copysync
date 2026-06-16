@@ -90,8 +90,11 @@ import java.io.File
 fun AppRoot() {
     val ctx = LocalContext.current
     var paired by remember { mutableStateOf(Settings(ctx).isPaired) }
-    if (paired) MainScaffold(onUnpair = { paired = false })
-    else PairingScreen(onPaired = { paired = true })
+    Box(Modifier.fillMaxSize()) {
+        if (paired) MainScaffold(onUnpair = { paired = false })
+        else PairingScreen(onPaired = { paired = true })
+        BlockedToastOverlay()
+    }
 }
 
 // ---------------------------------------------------------------- Pairing
