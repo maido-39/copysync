@@ -20,7 +20,7 @@ object Privacy {
         val t = text.trim()
         if (t.isEmpty()) return null
         if (t.contains("-----BEGIN") && t.contains("PRIVATE KEY")) return Sensitivity.PRIVATE_KEY
-        if (t.length >= 10 && t.substring(0, 10).equals("otpauth://", ignoreCase = true)) return Sensitivity.OTP_AUTH
+        if (t.startsWith("otpauth://", ignoreCase = true)) return Sensitivity.OTP_AUTH
         if (isCardNumber(t)) return Sensitivity.CREDIT_CARD
         for (re in custom) if (re.containsMatchIn(t)) return Sensitivity.CUSTOM
         if (isPasswordLike(t)) return Sensitivity.PASSWORD_LIKE
@@ -68,6 +68,8 @@ object Privacy {
         val n = t.length
         if (n < 8 || n > 64 || t.any { it.isWhitespace() }) return false
         if (looksLikeUrl(t) || looksLikeEmail(t) || looksLikePath(t)) return false
+        // CJK / natural-language scripts are essentially never passwords.
+        if (t.any { isCjk(it) }) return false
         var lo = false
         var up = false
         var di = false
@@ -77,11 +79,24 @@ object Privacy {
                 c in 'a'..'z' -> lo = true
                 c in 'A'..'Z' -> up = true
                 c in '0'..'9' -> di = true
-                !c.isLetterOrDigit() -> sy = true
+                isStrongSymbol(c) -> sy = true
             }
         }
-        val classes = listOf(lo, up, di, sy).count { it }
-        return classes >= 3 && shannonBitsPerChar(t) >= 2.5
+        // Require a strong special char (not just '-'/'.' separators) plus ≥2 of
+        // lower/upper/digit — conservative, so normal copies aren't dropped.
+        val alnum = (if (lo) 1 else 0) + (if (up) 1 else 0) + (if (di) 1 else 0)
+        return sy && alnum >= 2 && shannonBitsPerChar(t) >= 2.5
+    }
+
+    /** A "password" special char — excludes separators common in filenames/IDs. */
+    private fun isStrongSymbol(c: Char): Boolean =
+        !c.isLetterOrDigit() && c !in "-_./:,"
+
+    /** Hangul / Kana / CJK ideographs — natural-language text, not credentials. */
+    private fun isCjk(c: Char): Boolean {
+        val u = c.code
+        return u in 0x1100..0x11FF || u in 0x3130..0x318F || u in 0xAC00..0xD7A3 ||
+            u in 0x3040..0x30FF || u in 0x3400..0x4DBF || u in 0x4E00..0x9FFF
     }
 
     private fun shannonBitsPerChar(s: String): Double {
