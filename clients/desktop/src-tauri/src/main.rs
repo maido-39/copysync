@@ -550,7 +550,8 @@ fn start_sync(app: &AppHandle, cfg: Config) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
     *state.tx.lock().unwrap() = Some(tx.clone());
 
-    std::thread::spawn(move || clipboard_loop(tx));
+    let app_cb = app.clone();
+    std::thread::spawn(move || clipboard_loop(tx, app_cb));
 
     let app2 = app.clone();
     let hist = state.hist.clone();
@@ -564,22 +565,36 @@ fn start_sync(app: &AppHandle, cfg: Config) {
     });
 }
 
-fn clipboard_loop(tx: UnboundedSender<Cmd>) {
+fn clipboard_loop(tx: UnboundedSender<Cmd>, app: AppHandle) {
+    let mut last_seq: Option<u32> = None;
     let mut last_text = String::new();
     let mut last_img = String::new();
     let mut last_files = String::new();
     loop {
-        match clipboard::get_text() {
-            Ok(t) if !t.is_empty() => {
-                if t != last_text {
-                    last_text = t.clone();
-                    last_img.clear();
-                    last_files.clear();
-                    let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
-                    let _ = tx.send(Cmd::LocalText { text: t, html });
+        // On Windows, only touch the clipboard when its sequence number changes —
+        // re-opening it every tick contends with RDP's redirector and drops copies.
+        // Elsewhere seq_num() is None, so we keep polling content every tick.
+        let seq = clipboard::seq_num();
+        let changed = seq.map_or(true, |s| Some(s) != last_seq);
+        if changed {
+            if let Some(s) = seq {
+                last_seq = Some(s);
+            }
+            let text = clipboard::get_text();
+            let mut handled = false;
+            if let Ok(t) = &text {
+                if !t.is_empty() {
+                    if *t != last_text {
+                        last_text = t.clone();
+                        last_img.clear();
+                        last_files.clear();
+                        let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
+                        let _ = tx.send(Cmd::LocalText { text: t.clone(), html });
+                    }
+                    handled = true;
                 }
             }
-            _ => {
+            if !handled {
                 if let Ok(img) = clipboard::get_image() {
                     let h = sha_hex(&img.rgba);
                     if h != last_img {
@@ -588,6 +603,7 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>) {
                         last_files.clear();
                         let _ = tx.send(Cmd::LocalImage(img));
                     }
+                    handled = true;
                 } else if let Some(files) = clipboard::get_files() {
                     // Windows Explorer file copy (CF_HDROP).
                     let key = files.join("\u{1}");
@@ -597,6 +613,33 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>) {
                         last_img.clear();
                         let _ = tx.send(Cmd::LocalFiles(files));
                     }
+                    handled = true;
+                }
+            }
+            // A clipboard change we couldn't turn into a normal text/image/file
+            // event — surface what was actually there (this is where RDP file
+            // copies and odd formats land). Shows up in the 디버깅 event log.
+            if !handled && seq.is_some() {
+                let formats = clipboard::list_formats();
+                if let Some(names) = clipboard::get_virtual_file_names() {
+                    let _ = app.emit(
+                        "cliplog",
+                        format!(
+                            "RDP/가상 파일 복사 감지: {} — CF_HDROP가 아닌 스트리밍 파일(FileContents)이라 아직 동기화하지 못합니다. 포맷=[{}]",
+                            names.join(", "),
+                            formats.join(", ")
+                        ),
+                    );
+                } else if text.is_err() {
+                    let _ = app.emit(
+                        "cliplog",
+                        format!("클립보드 읽기 실패 (RDP가 점유 중일 수 있음) · 포맷=[{}]", formats.join(", ")),
+                    );
+                } else if !formats.is_empty() {
+                    let _ = app.emit(
+                        "cliplog",
+                        format!("처리하지 못한 클립보드 변경 · 포맷=[{}]", formats.join(", ")),
+                    );
                 }
             }
         }

@@ -79,6 +79,87 @@ pub fn get_files() -> Option<Vec<String>> {
     None
 }
 
+/// Clipboard change counter (Windows `GetClipboardSequenceNumber`); None elsewhere.
+/// The watcher uses it to avoid re-opening an unchanged clipboard — on RDP/remote
+/// sessions, repeatedly opening the clipboard contends with the redirector
+/// (`rdpclip`) and drops copies.
+#[cfg(windows)]
+pub fn seq_num() -> Option<u32> {
+    clipboard_win::raw::seq_num().map(|n| n.get())
+}
+#[cfg(not(windows))]
+pub fn seq_num() -> Option<u32> {
+    None
+}
+
+/// Names of the clipboard formats currently present (diagnostics) — e.g. spotting
+/// that an RDP file copy offers `FileGroupDescriptorW`/`FileContents` instead of
+/// `CF_HDROP`. Empty off Windows.
+#[cfg(windows)]
+pub fn list_formats() -> Vec<String> {
+    let _clip = match clipboard_win::Clipboard::new_attempts(5) {
+        Ok(c) => c,
+        Err(_) => return vec!["<clipboard busy>".to_string()],
+    };
+    clipboard_win::raw::EnumFormats::new()
+        .map(|f| clipboard_win::raw::format_name_big(f).unwrap_or_else(|| format!("#{f}")))
+        .collect()
+}
+#[cfg(not(windows))]
+pub fn list_formats() -> Vec<String> {
+    Vec::new()
+}
+
+/// File names offered as virtual/streamed clipboard files (RDP, Outlook, archives)
+/// via `CFSTR_FILEDESCRIPTORW` — which the `CF_HDROP`-based [`get_files`] cannot
+/// see. Returns just the names; the bytes are streamed separately (via
+/// `CFSTR_FILECONTENTS`) and are not pulled yet. None off Windows / when absent.
+#[cfg(windows)]
+pub fn get_virtual_file_names() -> Option<Vec<String>> {
+    use clipboard_win::raw;
+    let fmt = raw::register_format("FileGroupDescriptorW")?.get();
+    let _clip = clipboard_win::Clipboard::new_attempts(5).ok()?;
+    if !raw::is_format_avail(fmt) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    raw::get_vec(fmt, &mut buf).ok()?;
+    if buf.len() < 4 {
+        return None;
+    }
+    // FILEGROUPDESCRIPTORW = u32 count, then count * FILEDESCRIPTORW (592 bytes
+    // each; cFileName is 260 WCHARs at offset 72).
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    const DESC: usize = 592;
+    const NAME_OFF: usize = 72;
+    let mut names = Vec::new();
+    for i in 0..count.min(64) {
+        let base = 4 + i * DESC + NAME_OFF;
+        let mut wide = Vec::new();
+        let mut j = base;
+        while j + 1 < buf.len() && (j - base) < 260 * 2 {
+            let c = u16::from_le_bytes([buf[j], buf[j + 1]]);
+            if c == 0 {
+                break;
+            }
+            wide.push(c);
+            j += 2;
+        }
+        if !wide.is_empty() {
+            names.push(String::from_utf16_lossy(&wide));
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+#[cfg(not(windows))]
+pub fn get_virtual_file_names() -> Option<Vec<String>> {
+    None
+}
+
 /// Put file paths on the clipboard (Windows Explorer paste = CF_HDROP), so a
 /// received file is immediately pasteable. No-op off Windows.
 #[cfg(windows)]

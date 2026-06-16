@@ -191,6 +191,8 @@ listen("clip", (ev) => {
   if ($("#history").classList.contains("active")) loadHistory();
 });
 listen("error", (ev) => { dbg("오류 " + ev.payload); console.warn("copysync:", ev.payload); });
+// Clipboard-watcher diagnostics (e.g. RDP/virtual file copies that aren't CF_HDROP).
+listen("cliplog", (ev) => dbg("📋 " + ev.payload));
 
 // ---- autostart
 async function loadAutostart() {
