@@ -140,7 +140,7 @@ fn register_quick_panel(app: &AppHandle, accel: &str) -> Result<(), String> {
 /// The currently-registered Quick Panel hotkey (accelerator string; empty = none).
 #[tauri::command]
 fn get_shortcut(state: State<'_, AppState>) -> String {
-    state.quick_panel_shortcut.lock().unwrap().clone()
+    state.quick_panel_shortcut.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Change the Quick Panel hotkey live: validate, swap the OS registration, and
@@ -152,7 +152,7 @@ fn set_shortcut(app: AppHandle, state: State<'_, AppState>, accel: String) -> Re
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
     let accel = accel.trim().to_string();
-    let old = state.quick_panel_shortcut.lock().unwrap().clone();
+    let old = state.quick_panel_shortcut.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if accel == old {
         return Ok(());
     }
@@ -169,7 +169,7 @@ fn set_shortcut(app: AppHandle, state: State<'_, AppState>, accel: String) -> Re
         let _ = register_quick_panel(&app, &old);
         return Err(e);
     }
-    *state.quick_panel_shortcut.lock().unwrap() = accel.clone();
+    *state.quick_panel_shortcut.lock().unwrap_or_else(|e| e.into_inner()) = accel.clone();
     if let Ok(mut cfg) = Config::load(&state.cfg_path) {
         cfg.quick_panel_shortcut = accel;
         let _ = cfg.save(&state.cfg_path);
@@ -232,7 +232,7 @@ fn preview(s: &str) -> String {
 fn show_toast(app: &AppHandle, origin: &str, body: &str, image: Option<String>) {
     let name = {
         let st = app.state::<AppState>();
-        let r = st.roster.lock().unwrap();
+        let r = st.roster.lock().unwrap_or_else(|e| e.into_inner());
         r.iter()
             .find(|d| d.id == origin)
             .map(|d| d.name.clone())
@@ -328,7 +328,7 @@ fn mime_of(path: &str) -> String {
 
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> Status {
-    state.status.lock().unwrap().clone()
+    state.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn build_tray_menu(app: &AppHandle, current: &str, pools: &[String]) -> Option<Menu<tauri::Wry>> {
@@ -353,11 +353,11 @@ fn build_tray_menu(app: &AppHandle, current: &str, pools: &[String]) -> Option<M
 fn rebuild_tray(app: &AppHandle) {
     let state = app.state::<AppState>();
     let (pool, pools) = {
-        let s = state.status.lock().unwrap();
+        let s = state.status.lock().unwrap_or_else(|e| e.into_inner());
         (s.pool.clone(), s.pools.clone())
     };
     if let Some(menu) = build_tray_menu(app, &pool, &pools) {
-        if let Some(tray) = state.tray.lock().unwrap().as_ref() {
+        if let Some(tray) = state.tray.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = tray.set_menu(Some(menu));
         }
     }
@@ -440,7 +440,7 @@ async fn discover_servers() -> Result<Vec<copysync_core::discovery::Found>, Stri
 
 #[tauri::command]
 fn get_roster(state: State<'_, AppState>) -> Vec<RosterDevice> {
-    state.roster.lock().unwrap().clone()
+    state.roster.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[tauri::command]
@@ -450,12 +450,12 @@ fn set_targets(state: State<'_, AppState>, ids: Vec<String>) {
     } else {
         Targets::Devices(ids)
     };
-    *state.targets.lock().unwrap() = t;
+    *state.targets.lock().unwrap_or_else(|e| e.into_inner()) = t;
 }
 
 #[tauri::command]
 fn get_history(state: State<'_, AppState>, query: Option<String>) -> Result<Vec<Entry>, String> {
-    let h = state.hist.lock().unwrap();
+    let h = state.hist.lock().unwrap_or_else(|e| e.into_inner());
     match query {
         Some(q) if !q.trim().is_empty() => h.search(q.trim(), 200),
         _ => h.recent(200),
@@ -508,9 +508,11 @@ fn set_pool(state: State<'_, AppState>, pool: String) -> Result<(), String> {
 }
 
 fn enqueue(state: &State<'_, AppState>, cmd: Cmd) -> Result<(), String> {
-    match state.tx.lock().unwrap().as_ref() {
-        Some(tx) => tx.send(cmd).map_err(|_| "sync not running".into()),
-        None => Err("not paired".into()),
+    match state.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(tx) => tx
+            .send(cmd)
+            .map_err(|_| "동기화가 중단됨 — 설정 → 기기 페어링에서 다시 연결하세요".into()),
+        None => Err("페어링이 필요합니다 — 설정 → 기기 페어링".into()),
     }
 }
 
@@ -529,7 +531,7 @@ async fn pair(
     let path = app.state::<AppState>().cfg_path.clone();
     cfg.save(&path).map_err(|e| e.to_string())?;
     start_sync(&app, cfg);
-    Ok(app.state::<AppState>().status.lock().unwrap().clone())
+    Ok(app.state::<AppState>().status.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 // ----------------------------------------------------------------- sync wiring
@@ -540,7 +542,7 @@ fn start_sync(app: &AppHandle, cfg: Config) {
     state.auto_clear_secs.store(cfg.auto_clear_secs, Ordering::Relaxed);
     state.mark_sensitive.store(cfg.mark_received_sensitive, Ordering::Relaxed);
     {
-        let mut s = state.status.lock().unwrap();
+        let mut s = state.status.lock().unwrap_or_else(|e| e.into_inner());
         s.paired = true;
         s.server_name = cfg.server_name.clone();
         s.device_name = cfg.device_name.clone();
@@ -548,7 +550,7 @@ fn start_sync(app: &AppHandle, cfg: Config) {
         s.e2e = !cfg.e2e_pass.is_empty();
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
-    *state.tx.lock().unwrap() = Some(tx.clone());
+    *state.tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
     let app_cb = app.clone();
     std::thread::spawn(move || clipboard_loop(tx, app_cb));
@@ -560,8 +562,12 @@ fn start_sync(app: &AppHandle, cfg: Config) {
     let targets = state.targets.clone();
     let downloads = state.downloads.clone();
     let cfg_path = state.cfg_path.clone();
+    let app_sup = app.clone();
     tauri::async_runtime::spawn(async move {
         sync_actor(app2, cfg, cfg_path, rx, hist, status, roster, targets, downloads).await;
+        // The sync engine stopped (bad config / fatal error). Surface it instead of
+        // letting later actions fail silently with "sync not running".
+        let _ = app_sup.emit("error", "동기화가 멈췄습니다 — 설정 → 기기 페어링에서 다시 연결하거나 앱을 재시작하세요.");
     });
 }
 
@@ -651,7 +657,7 @@ fn clipboard_loop(tx: UnboundedSender<Cmd>, app: AppHandle) {
 }
 
 fn current_targets(t: &Arc<Mutex<Targets>>) -> Targets {
-    t.lock().unwrap().clone()
+    t.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -670,6 +676,8 @@ async fn sync_actor(
         Ok(p) => p,
         Err(e) => {
             eprintln!("bad pin: {e}");
+            set_connected(&app, &status, false);
+            let _ = app.emit("error", "잘못된 SPKI 핀입니다 — 설정 → 기기 페어링에서 다시 연결하세요.");
             return;
         }
     };
@@ -690,7 +698,7 @@ async fn sync_actor(
                 let threshold = hello.on_demand_threshold;
                 set_roster(&app, &roster, hello.roster.clone());
                 {
-                    let mut s = status.lock().unwrap();
+                    let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
                     s.pool = hello.pool.clone();
                     s.pools = hello.pools.clone();
                 }
@@ -707,7 +715,7 @@ async fn sync_actor(
                                 if exclude_flag.load(Ordering::Relaxed) {
                                     if let Some(reason) = privacy::classify(&text, &custom_res) {
                                         // Privacy filter: never sync; record locally + auto-purge.
-                                        let id = hist.lock().unwrap()
+                                        let id = hist.lock().unwrap_or_else(|e| e.into_inner())
                                             .add(&protocol::now_ts(), "text", "me", "out", &text, "text/plain", text.len() as i64, "", "")
                                             .unwrap_or(-1);
                                         schedule_purge(hist.clone(), id, cfg.sensitive_ttl_secs);
@@ -739,7 +747,7 @@ async fn sync_actor(
                             }
                             Some(Cmd::SetPool(name)) => {
                                 if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break; }
-                                let snap = { let mut s = status.lock().unwrap(); s.pool = name; s.clone() };
+                                let snap = { let mut s = status.lock().unwrap_or_else(|e| e.into_inner()); s.pool = name; s.clone() };
                                 let _ = app.emit("status", snap);
                                 rebuild_tray(&app);
                             }
@@ -774,7 +782,7 @@ async fn sync_actor(
 
 fn set_connected(app: &AppHandle, status: &Arc<Mutex<Status>>, on: bool) {
     let snapshot = {
-        let mut s = status.lock().unwrap();
+        let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
         s.connected = on;
         s.clone()
     };
@@ -790,13 +798,13 @@ fn set_roster(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, devices: 
             online: d.online,
         })
         .collect();
-    *roster.lock().unwrap() = list.clone();
+    *roster.lock().unwrap_or_else(|e| e.into_inner()) = list.clone();
     let _ = app.emit("roster", list);
 }
 
 fn apply_presence(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, p: Presence) {
     let snapshot = {
-        let mut r = roster.lock().unwrap();
+        let mut r = roster.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = r.iter_mut().find(|x| x.id == p.device.id) {
             d.online = p.online;
             d.name = p.device.name.clone();
@@ -1281,7 +1289,7 @@ fn main() {
             // Adopt the saved Quick Panel hotkey (an old config without the field
             // deserializes to the default); unpaired clients keep the literal default.
             if let Some(accel) = loaded.as_ref().map(|c| c.quick_panel_shortcut.clone()) {
-                *app.state::<AppState>().quick_panel_shortcut.lock().unwrap() = accel;
+                *app.state::<AppState>().quick_panel_shortcut.lock().unwrap_or_else(|e| e.into_inner()) = accel;
             }
             if let Some(cfg) = loaded {
                 start_sync(app.handle(), cfg);
@@ -1314,7 +1322,7 @@ fn main() {
                     }
                 })
                 .build(app)?;
-            *app.state::<AppState>().tray.lock().unwrap() = Some(tray);
+            *app.state::<AppState>().tray.lock().unwrap_or_else(|e| e.into_inner()) = Some(tray);
 
             // Quick Panel: a configurable global hotkey (default Ctrl/Cmd+Shift+V,
             // editable in 설정 → 단축키) toggles a small always-on-top history
