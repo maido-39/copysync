@@ -23,6 +23,10 @@ services:
       COPYSYNC_ADMIN_USER: "${COPYSYNC_ADMIN_USER:-admin}"
       # You are FORCED to change this on first admin login.
       COPYSYNC_ADMIN_PASS: "${COPYSYNC_ADMIN_PASS:-changeme}"
+      # Optional programmatic admin auth. When set (>=24 chars), the admin API
+      # also accepts `Authorization: Bearer <key>` / `X-API-Key`. Full-access
+      # credential — treat like the admin password. Empty = disabled.
+      COPYSYNC_API_KEY: "${COPYSYNC_API_KEY:-}"
       # Extra TLS SANs (comma-separated LAN IPs / hostnames). Auto-detected LAN
       # IPs + localhost are always included.
       COPYSYNC_TLS_HOSTS: "${COPYSYNC_TLS_HOSTS:-}"

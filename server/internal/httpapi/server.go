@@ -28,6 +28,7 @@ type Server struct {
 	serverName string
 	spkiPin    string
 	secret     string
+	apiKey     string
 
 	wsHandler http.Handler
 	webui     http.Handler
@@ -52,6 +53,7 @@ type Config struct {
 	ServerName        string
 	SPKIPin           string
 	Secret            string
+	APIKey            string
 	WSHandler         http.Handler
 	WebUI             http.Handler
 	BlobStore         *blob.FsBlobStore
@@ -65,6 +67,18 @@ func New(c Config) *Server {
 	if now == nil {
 		now = time.Now
 	}
+	// Optional programmatic admin auth. Refuse a too-short key rather than enable
+	// a weak credential; the key itself is never logged.
+	apiKey := c.APIKey
+	if apiKey != "" && len(apiKey) < 24 {
+		if c.Log != nil {
+			c.Log.Warn("COPYSYNC_API_KEY ignored: too short (need at least 24 chars)")
+		}
+		apiKey = ""
+	}
+	if apiKey != "" && c.Log != nil {
+		c.Log.Info("API-key admin auth enabled")
+	}
 	return &Server{
 		store:             c.Store,
 		hub:               c.Hub,
@@ -74,6 +88,7 @@ func New(c Config) *Server {
 		serverName:        c.ServerName,
 		spkiPin:           c.SPKIPin,
 		secret:            c.Secret,
+		apiKey:            apiKey,
 		wsHandler:         c.WSHandler,
 		webui:             c.WebUI,
 		blobStore:         c.BlobStore,

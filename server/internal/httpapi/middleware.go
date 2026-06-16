@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 func (s *Server) recoverer(next http.Handler) http.Handler {
@@ -27,11 +29,36 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// apiKeyOK reports whether the request bears the configured admin API key, sent
+// as `Authorization: Bearer <key>` or `X-API-Key`. Always false when no key is
+// configured (feature disabled). Constant-time compare to avoid timing leaks.
+func (s *Server) apiKeyOK(r *http.Request) bool {
+	if s.apiKey == "" {
+		return false
+	}
+	got := r.Header.Get("X-API-Key")
+	if got == "" {
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			got = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		}
+	}
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.apiKey)) == 1
+}
+
 // withSession requires a valid admin session and, on mutating requests, the CSRF
 // header. When enforcePWGate is true it also blocks until the first-run password
-// change is complete.
+// change is complete. A valid admin API key bypasses all three (non-cookie
+// credential, immune to CSRF, deliberately provisioned).
 func (s *Server) withSession(next http.HandlerFunc, enforcePWGate bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKeyOK(r) {
+			s.log.Info("admin API authorized via API key", "method", r.Method, "path", r.URL.Path, "remote", clientIP(r))
+			next(w, r)
+			return
+		}
 		if _, ok := s.currentSession(r); !ok {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized", "login required")
 			return

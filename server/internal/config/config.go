@@ -15,6 +15,7 @@ type Config struct {
 	TLSHosts   []string // COPYSYNC_TLS_HOSTS (comma-separated extra SAN entries)
 	AdminUser  string   // COPYSYNC_ADMIN_USER (seed only)
 	AdminPass  string   // COPYSYNC_ADMIN_PASS (seed only; forces change on first login)
+	APIKey     string   // COPYSYNC_API_KEY (programmatic admin auth; empty = disabled)
 	LogLevel   string   // COPYSYNC_LOG_LEVEL
 }
 
@@ -37,6 +38,7 @@ func Load() Config {
 		ServerName: getenv("COPYSYNC_SERVER_NAME", hostname),
 		AdminUser:  getenv("COPYSYNC_ADMIN_USER", "admin"),
 		AdminPass:  getenv("COPYSYNC_ADMIN_PASS", "changeme"),
+		APIKey:     getenv("COPYSYNC_API_KEY", ""),
 		LogLevel:   getenv("COPYSYNC_LOG_LEVEL", "info"),
 	}
 	if hosts := os.Getenv("COPYSYNC_TLS_HOSTS"); hosts != "" {

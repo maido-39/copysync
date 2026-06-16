@@ -150,6 +150,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		ServerName:        cfg.ServerName,
 		SPKIPin:           tlsRes.SPKIPin,
 		Secret:            secret,
+		APIKey:            cfg.APIKey,
 		WSHandler:         wsHandler,
 		WebUI:             webui.Handler(),
 		BlobStore:         blobStore,
