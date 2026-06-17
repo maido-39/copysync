@@ -1,14 +1,16 @@
 :root {
-  --bg: #0f1216;
-  --bg-rgb: 15,18,22;
-  --panel-rgb: 23,28,35;
-  --panel2-rgb: 30,37,46;
-  --line: #2a323d;
+  --bg: #0d1117;
+  --bg-rgb: 13,17,23;
+  --panel-rgb: 22,27,34;       /* #161b22 — cards / list items */
+  --panel2-rgb: 33,38,45;      /* #21262d — inputs / inner boxes (clearly lighter) */
+  --line: #30363d;
   --fg: #e6edf3;
-  --muted: #8b97a6;
+  --muted: #8b949e;
   --accent: #3fb950;
   --accent-dim: #2ea043;
-  --blue: #4493f8;
+  --blue: #58a6ff;
+  --tag-img: #c77dff;
+  --tag-file: #e3b341;
 
   /* theme controls — overwritten live from JS (localStorage-backed) */
   --card-opacity: 1;
@@ -19,21 +21,25 @@
   --bg-x: 50%;
   --bg-y: 50%;
 
-  /* derived surfaces — transparency follows --card-opacity */
+  /* Derived surfaces — BOTH tiers honor --card-opacity so the "박스 투명도"
+     slider applies to every surface (cards, list items, inputs, buttons…).
+     panel2 sits on top of panel, so when nested it stays readable via blending. */
   --panel: rgba(var(--panel-rgb), var(--card-opacity));
-  --panel2: rgba(var(--panel2-rgb), calc(0.4 + var(--card-opacity) * 0.6));
+  --panel2: rgba(var(--panel2-rgb), var(--card-opacity));
 }
 [data-theme="light"] {
-  --bg: #eef1f5;
-  --bg-rgb: 238,241,245;
+  --bg: #f6f8fa;
+  --bg-rgb: 246,248,250;
   --panel-rgb: 255,255,255;
-  --panel2-rgb: 236,240,244;
-  --line: #d3dae2;
-  --fg: #1b2230;
-  --muted: #57637a;
-  --accent: #1f883d;
+  --panel2-rgb: 237,241,245;   /* #edf1f5 */
+  --line: #d0d7de;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --accent: #1a7f37;
   --accent-dim: #1a7f37;
-  --blue: #2563eb;
+  --blue: #0969da;
+  --tag-img: #8250df;
+  --tag-file: #9a6700;
 }
 /* ---- blocked-clip toast (privacy filter) — pink translucent glass ---- */
 .toasts {
@@ -113,7 +119,7 @@ textarea, input, select {
 label { display: block; margin: 8px 0; color: var(--muted); font-size: 13px; }
 label input { margin-top: 4px; }
 
-button.primary { background: var(--accent-dim); color: #04150a; border: 0; border-radius: 8px;
+button.primary { background: var(--accent-dim); color: #fff; border: 0; border-radius: 8px;
   padding: 9px 16px; font-weight: 600; cursor: pointer; }
 button.primary:hover { background: var(--accent); }
 .row { display: flex; gap: 8px; margin-top: 10px; }
@@ -141,9 +147,9 @@ label.dev { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor
 .item { display: flex; gap: 10px; align-items: flex-start; background: var(--panel);
   border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 .item .tag { font-size: 11px; padding: 2px 8px; border-radius: 6px; white-space: nowrap; }
-.tag.text { background: rgba(68,147,248,.15); color: var(--blue); }
-.tag.image { background: rgba(219,109,255,.15); color: #db6dff; }
-.tag.file { background: rgba(240,180,60,.15); color: #f0b43c; }
+.tag.text { background: rgba(88,166,255,.16); color: var(--blue); }
+.tag.image { background: rgba(199,125,255,.16); color: var(--tag-img); }
+.tag.file { background: rgba(227,179,65,.16); color: var(--tag-file); }
 .item .ic { font-size: 22px; width: 28px; text-align: center; flex: none; }
 .item img.thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 8px; flex: none; background: var(--panel2); }
 .item .snip { margin: 0; max-width: 240px; max-height: 60px; overflow: hidden; flex: none;
@@ -170,7 +176,7 @@ header, nav#tabs, .card, .item { -webkit-backdrop-filter: blur(10px); backdrop-f
 .modebar { display: flex; gap: 6px; margin: 2px 0 10px; }
 .modebar button { flex: 1; padding: 8px 0; border-radius: 8px; cursor: pointer;
   background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
-.modebar button.sel { background: var(--accent-dim); color: #04150a; border-color: transparent; font-weight: 600; }
+.modebar button.sel { background: var(--accent-dim); color: #fff; border-color: transparent; font-weight: 600; }
 .slider { display: grid; grid-template-columns: 84px 1fr 46px; align-items: center; gap: 8px; margin: 9px 0; }
 .slider label { margin: 0; color: var(--fg); }
 .slider .val { color: var(--muted); font-size: 12px; text-align: right; }
