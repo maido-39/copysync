@@ -11,6 +11,7 @@ pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod e2e;
+pub mod engine;
 pub mod history;
 pub mod pairing;
 pub mod pinning;
