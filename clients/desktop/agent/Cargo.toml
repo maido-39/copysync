@@ -1,0 +1,16 @@
+[package]
+name = "copysync-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless CopySync background sync daemon (IPC server over a local socket)."
+
+[[bin]]
+name = "copysync-agent"
+path = "src/main.rs"
+
+[dependencies]
+copysync-ipc = { path = "../ipc" }
+serde_json.workspace = true
+anyhow.workspace = true
+interprocess = "2"
