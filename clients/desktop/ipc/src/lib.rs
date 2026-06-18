@@ -38,14 +38,42 @@ pub struct HistRow {
     pub size: i64,
 }
 
-/// A clip event surfaced to the UI (drives toasts + the live feed).
+/// A clip event surfaced to the UI (drives toasts + the live feed). The trailing
+/// fields are optional so the GUI has enough to render a rich feed entry without
+/// the agent always populating them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipInfo {
     pub direction: String,
     pub kind: String,
+    #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub sensitive: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub on_demand: Option<bool>,
+}
+
+/// One roster device (mirrors the engine's `RosterDevice`) surfaced to the GUI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RosterDevice {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+}
+
+/// A CopySync server found on the LAN via mDNS discovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FoundServer {
+    pub name: String,
+    pub url: String,
 }
 
 /// GUI → agent.
@@ -54,9 +82,22 @@ pub struct ClipInfo {
 pub enum Request {
     GetStatus,
     GetHistory { query: Option<String> },
+    GetRoster,
     SendText { text: String },
     SendFile { path: String },
     SetPool { pool: String },
+    SetTargets { ids: Vec<String> },
+    SetPrivacyFilter { on: bool },
+    SetAutoClear { secs: u64 },
+    SetMarkSensitive { on: bool },
+    DiscoverServers,
+    Pair {
+        server: String,
+        otp: String,
+        name: String,
+        pin: String,
+        e2e_pass: String,
+    },
     Reconnect,
     /// Ask the agent to push [`Event`]s on this connection from now on.
     Subscribe,
@@ -68,6 +109,9 @@ pub enum Request {
 pub enum Response {
     Status(Status),
     History(Vec<HistRow>),
+    Roster(Vec<RosterDevice>),
+    Found(Vec<FoundServer>),
+    Paired(Status),
     Ok,
     Error { message: String },
 }
@@ -78,8 +122,11 @@ pub enum Response {
 pub enum Event {
     Status(Status),
     Clip(ClipInfo),
+    Roster(Vec<RosterDevice>),
     Error { message: String },
     Reconnect { info: String },
+    Notify { title: String, body: String },
+    Cliplog { msg: String },
 }
 
 /// Everything the agent writes to a client, tagged so replies and pushed events

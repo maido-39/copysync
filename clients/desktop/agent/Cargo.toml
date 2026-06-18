@@ -10,7 +10,14 @@ name = "copysync-agent"
 path = "src/main.rs"
 
 [dependencies]
+copysync-core = { path = "../core" }
 copysync-ipc = { path = "../ipc" }
 serde_json.workspace = true
 anyhow.workspace = true
-interprocess = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+interprocess = { version = "2", features = ["tokio"] }
+futures-util = "0.3"
+dirs = "5"
+keyring = "3"
+notify-rust = "4"
+base64 = { workspace = true }
