@@ -40,6 +40,20 @@ use copysync_ipc::{
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericNamespaced, Stream};
 
+// M4 desktop-shell crates. Each exposes a *global* event channel via a
+// `receiver()` that we poll with `try_recv()` from `update()` — none of them
+// need to be threaded into the winit loop, they just need `update()` to keep
+// running while idle (see `request_repaint_after` in `update`).
+use auto_launch::AutoLaunchBuilder;
+use global_hotkey::{
+    hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+};
+use std::str::FromStr;
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem},
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
+
 // ============================================================ IPC transport
 
 /// Open a fresh socket connection, or `Err` if the agent isn't listening.
@@ -79,9 +93,10 @@ fn request_ok(req: &Request) -> Result<Response> {
     }
 }
 
-/// Spawn the sibling `copysync-agent` binary next to our own executable, then
-/// poll-connect for ~3s. Returns `Ok` once a connection succeeds.
-fn spawn_agent_and_wait() -> Result<()> {
+/// Resolve the sibling `copysync-agent` binary path next to our own executable
+/// (`copysync-agent.exe` on Windows). Used both for auto-spawn and for the
+/// login-autostart entry, so the daemon is what runs at boot — not the GUI.
+fn agent_path() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("locate own executable")?;
     let dir = exe.parent().context("executable has no parent dir")?;
     let agent_name = if cfg!(windows) {
@@ -89,7 +104,13 @@ fn spawn_agent_and_wait() -> Result<()> {
     } else {
         "copysync-agent"
     };
-    let agent = dir.join(agent_name);
+    Ok(dir.join(agent_name))
+}
+
+/// Spawn the sibling `copysync-agent` binary next to our own executable, then
+/// poll-connect for ~3s. Returns `Ok` once a connection succeeds.
+fn spawn_agent_and_wait() -> Result<()> {
+    let agent = agent_path()?;
     if !agent.exists() {
         return Err(anyhow!(
             "copysync-agent 실행 파일을 찾을 수 없습니다: {}",
@@ -118,6 +139,84 @@ fn ensure_agent() -> Result<()> {
         return Ok(());
     }
     spawn_agent_and_wait()
+}
+
+// ============================================================ login autostart
+
+/// Build an `AutoLaunch` targeting the **agent** binary (so sync survives reboot
+/// with no GUI). App name is "CopySync". We pass the agent `serve` arg so the
+/// boot launch behaves like our own auto-spawn. The `AutoLaunchBuilder` papers
+/// over the per-OS `AutoLaunch::new` signature differences for us.
+fn build_autolaunch() -> Result<auto_launch::AutoLaunch> {
+    let agent = agent_path()?;
+    let path = agent
+        .to_str()
+        .context("agent path is not valid UTF-8")?
+        .to_string();
+    AutoLaunchBuilder::new()
+        .set_app_name("CopySync")
+        .set_app_path(&path)
+        .set_args(&["serve"])
+        .build()
+        .map_err(|e| anyhow!("autostart 구성 실패: {e}"))
+}
+
+/// Whether the agent is currently registered to launch at login. Any error
+/// (e.g. unreadable registry/desktop entry) is treated as "not enabled".
+fn autostart_enabled() -> bool {
+    build_autolaunch()
+        .and_then(|al| al.is_enabled().map_err(|e| anyhow!("{e}")))
+        .unwrap_or(false)
+}
+
+/// Enable or disable the login-autostart entry for the agent.
+fn set_autostart(on: bool) -> Result<()> {
+    let al = build_autolaunch()?;
+    if on {
+        al.enable().map_err(|e| anyhow!("autostart 활성화 실패: {e}"))
+    } else {
+        al.disable().map_err(|e| anyhow!("autostart 비활성화 실패: {e}"))
+    }
+}
+
+// ============================================================ system tray
+
+/// Stable string ids for the tray menu items. `MenuEvent.id` is a `MenuId`
+/// wrapping a string, so we compare against these to dispatch.
+const TRAY_OPEN_ID: &str = "cs.tray.open";
+const TRAY_QUIT_ID: &str = "cs.tray.quit";
+
+/// A 16×16 solid-teal RGBA square — a no-asset tray icon. `from_rgba` wants a
+/// flat `width*height*4` byte buffer (RGBA), so we just fill one.
+fn tray_icon_image() -> Result<Icon> {
+    const W: u32 = 16;
+    const H: u32 = 16;
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for _ in 0..(W * H) {
+        // CopySync teal (matches the "연결됨" green-ish brand tone), fully opaque.
+        rgba.extend_from_slice(&[0x14, 0xB8, 0xA6, 0xFF]);
+    }
+    Icon::from_rgba(rgba, W, H).map_err(|e| anyhow!("tray icon: {e}"))
+}
+
+/// Build the tray icon + its "열기 / 종료" menu. Must be called *after* the event
+/// loop is live (on Windows the tray needs the message pump), so we do it lazily
+/// on the first `update()`. The two `MenuItem`s are kept alive inside the
+/// returned `Menu` (set on the builder), so we don't need to store them.
+fn build_tray() -> Result<TrayIcon> {
+    let menu = Menu::new();
+    let open = MenuItem::with_id(TRAY_OPEN_ID, "열기", true, None);
+    let quit = MenuItem::with_id(TRAY_QUIT_ID, "종료", true, None);
+    menu.append(&open)
+        .map_err(|e| anyhow!("tray menu(open): {e}"))?;
+    menu.append(&quit)
+        .map_err(|e| anyhow!("tray menu(quit): {e}"))?;
+    TrayIconBuilder::new()
+        .with_tooltip("CopySync")
+        .with_icon(tray_icon_image()?)
+        .with_menu(Box::new(menu))
+        .build()
+        .map_err(|e| anyhow!("tray build: {e}"))
 }
 
 /// The background event thread. Connects, `Subscribe`s, and forwards every pushed
@@ -196,31 +295,64 @@ impl ThemeMode {
     }
 }
 
-/// Small JSON prefs file at `dirs::config_dir()/copysync/gui.json`. We persist
-/// only the theme choice; everything else lives in the agent's config.
+/// The quick-panel global hotkey we register by default. Parsed via
+/// `HotKey::from_str`, which accepts the same "Ctrl+Shift+V" spelling.
+const DEFAULT_HOTKEY: &str = "Ctrl+Shift+V";
+
+/// The handful of GUI-local prefs we persist (everything else lives in the
+/// agent's config). Stored as a tiny JSON blob at
+/// `dirs::config_dir()/copysync/gui.json`.
+#[derive(Clone)]
+struct Prefs {
+    theme: ThemeMode,
+    /// Accelerator string for the quick-panel hotkey, e.g. "Ctrl+Shift+V".
+    hotkey: String,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            theme: ThemeMode::System,
+            hotkey: DEFAULT_HOTKEY.to_string(),
+        }
+    }
+}
+
 fn prefs_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("copysync").join("gui.json"))
 }
 
-fn load_theme() -> ThemeMode {
-    let Some(p) = prefs_path() else {
-        return ThemeMode::System;
-    };
+/// Load both prefs (theme + hotkey) from disk, falling back to defaults for any
+/// missing/garbled field. Backwards-compatible with the old theme-only file.
+fn load_prefs() -> Prefs {
+    let mut prefs = Prefs::default();
+    let Some(p) = prefs_path() else { return prefs };
     let Ok(text) = std::fs::read_to_string(&p) else {
-        return ThemeMode::System;
+        return prefs;
     };
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v.get("theme").and_then(|t| t.as_str()).map(ThemeMode::from_str))
-        .unwrap_or(ThemeMode::System)
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(t) = v.get("theme").and_then(|t| t.as_str()) {
+            prefs.theme = ThemeMode::from_str(t);
+        }
+        if let Some(h) = v.get("hotkey").and_then(|h| h.as_str()) {
+            if !h.trim().is_empty() {
+                prefs.hotkey = h.to_string();
+            }
+        }
+    }
+    prefs
 }
 
-fn save_theme(mode: ThemeMode) {
+/// Persist the full prefs blob (theme + hotkey). Called on any settings change.
+fn save_prefs(prefs: &Prefs) {
     let Some(p) = prefs_path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = serde_json::json!({ "theme": mode.as_str() });
+    let body = serde_json::json!({
+        "theme": prefs.theme.as_str(),
+        "hotkey": prefs.hotkey,
+    });
     let _ = std::fs::write(&p, serde_json::to_vec_pretty(&body).unwrap_or_default());
 }
 
@@ -299,14 +431,60 @@ struct App {
     // theme
     theme_mode: ThemeMode,
 
+    // ---- M4 desktop shell ----
+    // The tray is created lazily on the first `update()` (Windows needs the
+    // message loop running first); `None` until then. Owning it here keeps it
+    // alive for the app's lifetime — dropping a `TrayIcon` removes the icon.
+    tray: Option<TrayIcon>,
+    // Global-hotkey manager + the currently-registered `HotKey` (so we can
+    // unregister it before swapping to a new one). Dropping the manager
+    // unregisters everything, so it must live in `App`.
+    hotkey_mgr: Option<GlobalHotKeyManager>,
+    hotkey_current: Option<HotKey>,
+    // The accelerator string shown/edited in 설정, e.g. "Ctrl+Shift+V".
+    hotkey_input: String,
+    // Mirror of the OS login-autostart state for the agent (checkbox value).
+    autostart_on: bool,
+    // Set when the user picks the real-exit path (tray 종료); on the next frame
+    // `update()` issues `ViewportCommand::Close` so the window can actually quit.
+    really_quit: bool,
+
     // one-time post-connect bootstrap (initial history/roster pull)
     bootstrapped: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, events_rx: Receiver<Event>) -> Self {
-        let theme_mode = load_theme();
-        let app = Self {
+        let prefs = load_prefs();
+        let theme_mode = prefs.theme;
+
+        // Spin up the global-hotkey manager and register the saved (or default)
+        // accelerator. All of this is best-effort: a failure just leaves the
+        // quick-panel hotkey inactive and is surfaced in the debug log below.
+        let mut init_log: Vec<String> = Vec::new();
+        let (hotkey_mgr, hotkey_current) = match GlobalHotKeyManager::new() {
+            Ok(mgr) => match HotKey::from_str(&prefs.hotkey) {
+                Ok(hk) => match mgr.register(hk) {
+                    Ok(()) => (Some(mgr), Some(hk)),
+                    Err(e) => {
+                        init_log.push(format!("단축키 등록 실패: {e}"));
+                        (Some(mgr), None)
+                    }
+                },
+                Err(e) => {
+                    init_log.push(format!("단축키 파싱 실패 ({}): {e}", prefs.hotkey));
+                    (Some(mgr), None)
+                }
+            },
+            Err(e) => {
+                init_log.push(format!("단축키 매니저 생성 실패: {e}"));
+                (None, None)
+            }
+        };
+
+        let autostart_on = autostart_enabled();
+
+        let mut app = Self {
             status: Status::default(),
             history: Vec::new(),
             roster: Vec::new(),
@@ -332,10 +510,105 @@ impl App {
             discover_rx: None,
             discovering: false,
             theme_mode,
+            tray: None,
+            hotkey_mgr,
+            hotkey_current,
+            hotkey_input: prefs.hotkey,
+            autostart_on,
+            really_quit: false,
             bootstrapped: false,
         };
+        // Stash any init warnings so they show up once recording is on / forced.
+        for line in init_log {
+            app.logline(true, line);
+        }
         app.apply_theme(&cc.egui_ctx);
         app
+    }
+
+    /// Re-derive a `Prefs` snapshot from the current UI state for persistence.
+    fn prefs_snapshot(&self) -> Prefs {
+        Prefs {
+            theme: self.theme_mode,
+            hotkey: self.hotkey_input.clone(),
+        }
+    }
+
+    /// Bring the window back to the foreground (tray "열기", left-click, or the
+    /// quick-panel hotkey). Un-hides it and asks the WM for focus.
+    fn show_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Apply a new accelerator string: parse it, unregister the old hotkey, and
+    /// register the new one. On success updates `hotkey_current`/`hotkey_input`
+    /// and persists prefs. On failure the previous binding stays active.
+    fn apply_hotkey(&mut self, spec: &str) {
+        let Some(mgr) = self.hotkey_mgr.as_ref() else {
+            self.logline(true, "단축키 매니저가 없어 변경할 수 없습니다");
+            return;
+        };
+        let hk = match HotKey::from_str(spec.trim()) {
+            Ok(hk) => hk,
+            Err(e) => {
+                self.logline(true, format!("단축키 파싱 실패 ({spec}): {e}"));
+                return;
+            }
+        };
+        // Unregister the old one first; ignore errors (it may not be live).
+        if let Some(old) = self.hotkey_current.take() {
+            let _ = mgr.unregister(old);
+        }
+        match mgr.register(hk) {
+            Ok(()) => {
+                self.hotkey_current = Some(hk);
+                self.hotkey_input = spec.trim().to_string();
+                save_prefs(&self.prefs_snapshot());
+                self.logline(true, format!("단축키 변경: {}", self.hotkey_input));
+            }
+            Err(e) => {
+                self.logline(true, format!("단축키 등록 실패: {e}"));
+            }
+        }
+    }
+
+    /// Drain the three global desktop-shell channels (tray menu, tray icon,
+    /// global hotkey) and act on them. Polled every `update()`.
+    fn pump_shell_events(&mut self, ctx: &egui::Context) {
+        // Tray context-menu clicks (열기 / 종료).
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            match ev.id.as_ref() {
+                TRAY_OPEN_ID => self.show_window(ctx),
+                TRAY_QUIT_ID => {
+                    // Real exit: flag it so `update()` issues Close next frame.
+                    self.really_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.request_repaint();
+                }
+                _ => {}
+            }
+        }
+        // Tray icon clicks — a left-button release brings the window up.
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                self.show_window(ctx);
+            }
+        }
+        // Global quick-panel hotkey: only act on key-down (Pressed) so we don't
+        // fire twice per press. Land on the 기록 tab and surface the window.
+        while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+            if ev.state == HotKeyState::Pressed {
+                self.tab = Tab::History;
+                self.reload_history();
+                self.show_window(ctx);
+            }
+        }
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -518,6 +791,16 @@ fn chrono_lite_now() -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Create the tray lazily on the first frame: on Windows the tray needs a
+        // running message loop, which only exists once eframe's event loop is up
+        // (i.e. inside `update`), not at construction time. Best-effort.
+        if self.tray.is_none() {
+            match build_tray() {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => self.logline(true, format!("트레이 생성 실패: {e}")),
+            }
+        }
+
         // One-time bootstrap: pull initial status/history/roster after the first
         // frame (the event thread will keep them fresh from here on).
         if !self.bootstrapped {
@@ -529,8 +812,26 @@ impl eframe::App for App {
             self.logline(true, "GUI 시작");
         }
 
+        // Poll the three desktop-shell channels (tray menu/icon + global hotkey).
+        self.pump_shell_events(ctx);
+
+        // Real-exit path: the tray "종료" set `really_quit`, so close the window
+        // for good. The agent keeps running — only the GUI process exits.
+        if self.really_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if ctx.input(|i| i.viewport().close_requested()) {
+            // Close-to-tray: the user clicked the window's X. Cancel the close
+            // and just hide the window; reopen via tray "열기" or the hotkey.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         self.pump_events();
         self.poll_discovery(ctx);
+
+        // Keep `update()` ticking while idle so the tray/hotkey channels above
+        // are polled even with no input events (otherwise egui sleeps).
+        ctx.request_repaint_after(Duration::from_millis(200));
 
         // Expire toasts older than ~5s.
         self.toasts.retain(|t| t.spawned.elapsed() < Duration::from_secs(5));
@@ -873,9 +1174,55 @@ impl App {
                     if changed && mode != self.theme_mode {
                         self.theme_mode = mode;
                         self.apply_theme(ctx);
-                        save_theme(mode);
+                        save_prefs(&self.prefs_snapshot());
                     }
                 });
+            });
+
+            ui.add_space(8.0);
+
+            // ---- desktop shell (autostart + quick-panel hotkey)
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("시스템").strong());
+
+                // Login autostart — targets the *agent*, so sync runs at boot
+                // with no GUI. Reflects the OS state; errors go to the log.
+                let mut on = self.autostart_on;
+                if ui.checkbox(&mut on, "부팅 시 자동 시작").changed() {
+                    match set_autostart(on) {
+                        Ok(()) => {
+                            self.autostart_on = on;
+                            self.logline(true, format!("자동 시작: {on}"));
+                        }
+                        Err(e) => {
+                            // Leave the checkbox reflecting the real state.
+                            self.autostart_on = autostart_enabled();
+                            self.logline(true, format!("자동 시작 변경 실패: {e}"));
+                        }
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.label("빠른 패널 단축키");
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.hotkey_input)
+                            .hint_text("예: Ctrl+Shift+V")
+                            .desired_width(180.0),
+                    );
+                    let commit = (r.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ui.button("적용").clicked();
+                    if commit {
+                        let spec = self.hotkey_input.clone();
+                        self.apply_hotkey(&spec);
+                    }
+                });
+                let active = match &self.hotkey_current {
+                    Some(_) => format!("활성: {}", self.hotkey_input),
+                    None => "단축키 비활성 (등록 안 됨)".to_string(),
+                };
+                ui.weak(active);
             });
         });
     }
