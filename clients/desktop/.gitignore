@@ -7,3 +7,4 @@
 # Local runtime state
 *.db
 config.json
+.xdo-stub/
