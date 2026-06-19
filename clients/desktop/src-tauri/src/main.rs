@@ -3,65 +3,23 @@
 // same crate that is headlessly interop-tested against the Go server and copyctl.
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 
-use copysync_core::clipboard::{self, Image};
+use copysync_core::clipboard;
+use copysync_core::engine::{self, Cmd, Emitter as EngineEmitter, EngineState, RosterDevice, Status};
 use copysync_core::history::{Entry, History};
-use copysync_core::protocol::{
-    self, BlobRequest, ClipEvent, DeviceInfo, EncMeta, Presence, Roster, Targets,
-};
-use copysync_core::{blob, e2e, pairing, pinning, privacy, ws, Config};
-
-/// Commands flowing into the sync actor.
-enum Cmd {
-    LocalText { text: String, html: Option<String> }, // OS-clipboard text/rich-text change
-    LocalImage(Image),   // OS-clipboard image change (echo-guarded)
-    SendText(String),    // explicit text send from the UI
-    SendFile(String),    // explicit file send from the UI (path)
-    LocalFiles(Vec<String>), // OS-clipboard file copy (CF_HDROP); echo-guarded
-    SetPool(String),     // switch this device's share pool
-}
-
-/// A blob held for on-demand upload when the server asks (`blob_request`).
-enum Hold {
-    Sealed(Vec<u8>), // E2E: exact ciphertext (sha must match what was advertised)
-    Plain(PathBuf),  // plaintext: re-read on demand
-}
-
-#[derive(Clone, Serialize, Default)]
-struct Status {
-    paired: bool,
-    connected: bool,
-    server_name: String,
-    device_name: String,
-    server_id: String,
-    e2e: bool,
-    pool: String,
-    pools: Vec<String>,
-    /// True while disconnected-but-paired and actively retrying.
-    reconnecting: bool,
-}
-
-#[derive(Clone, Serialize, Default)]
-struct RosterDevice {
-    id: String,
-    name: String,
-    online: bool,
-}
+use copysync_core::protocol::Targets;
+use copysync_core::{pairing, Config};
 
 /// 32-byte key for at-rest history encryption. Uses the native OS keyring on
 /// macOS/Windows; elsewhere (e.g. Linux without a Secret Service) a 0600 key file
@@ -189,6 +147,8 @@ struct AppState {
     tray: Mutex<Option<tauri::tray::TrayIcon>>,
     cfg_path: PathBuf,
     downloads: PathBuf,
+    /// The app data dir (for the engine's outbound-image cache).
+    data_dir: PathBuf,
     exclude_sensitive: Arc<AtomicBool>,
     /// The Quick Panel global hotkey currently registered (accelerator string).
     quick_panel_shortcut: Arc<Mutex<String>>,
@@ -200,72 +160,35 @@ struct AppState {
     reconnect: Arc<Notify>,
 }
 
-fn sha_hex(b: &[u8]) -> String {
-    hex::encode(Sha256::digest(b))
-}
+/// The engine's UI sink, wired to Tauri's `app.emit` (the WebView listens to these
+/// exact event names) plus an OS notification for `notify`.
+struct TauriEmitter(AppHandle);
 
-fn remember(q: &mut VecDeque<String>, sha: String) {
-    if q.iter().any(|x| x == &sha) {
-        return;
+impl EngineEmitter for TauriEmitter {
+    fn status(&self, s: &Status) {
+        let _ = self.0.emit("status", s);
+        rebuild_tray(&self.0); // keep the tray's pool submenu in sync with status
     }
-    if q.len() >= 64 {
-        q.pop_front();
+    fn clip(&self, payload: serde_json::Value) {
+        let _ = self.0.emit("clip", payload);
     }
-    q.push_back(sha);
-}
-
-fn seen(q: &VecDeque<String>, sha: &str) -> bool {
-    q.iter().any(|x| x == sha)
-}
-
-fn notify(app: &AppHandle, title: &str, body: &str) {
-    dlog(app, format!("🔔 {title}: {body}")); // also land it in the Debug tab
-    let _ = app.notification().builder().title(title).body(body).show();
-}
-
-fn preview(s: &str) -> String {
-    let t: String = s.chars().take(80).collect();
-    if s.chars().count() > 80 {
-        format!("{t}…")
-    } else {
-        t
+    fn roster(&self, r: &[RosterDevice]) {
+        let _ = self.0.emit("roster", r);
     }
-}
-
-/// A reliable incoming-clip popup: a small always-on-top window shown bottom-right.
-/// Used instead of OS toasts, which don't appear for portable (uninstalled) Windows
-/// builds. Resolves the sender's friendly name from the roster.
-fn show_toast(app: &AppHandle, origin: &str, body: &str, image: Option<String>) {
-    let name = {
-        let st = app.state::<AppState>();
-        let r = st.roster.lock().unwrap_or_else(|e| e.into_inner());
-        r.iter()
-            .find(|d| d.id == origin)
-            .map(|d| d.name.clone())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "다른 기기".to_string())
-    };
-    if let Some(win) = app.get_webview_window("toast") {
-        if let (Ok(Some(mon)), Ok(ws)) = (win.primary_monitor(), win.outer_size()) {
-            let sz = mon.size();
-            let m = 16i32;
-            let x = sz.width as i32 - ws.width as i32 - m;
-            let y = sz.height as i32 - ws.height as i32 - 56 - m;
-            let _ = win.set_position(tauri::PhysicalPosition::new(x.max(0), y.max(0)));
-        }
-        let _ = win.emit("toast-show", serde_json::json!({ "title": name, "body": body, "image": image }));
-        let _ = win.show();
+    fn reconnect(&self, info: String) {
+        let _ = self.0.emit("reconnect", info);
     }
-}
-
-/// A small base64 PNG data-URI thumbnail from raw image bytes (for the toast).
-fn thumb_data_uri(data: &[u8]) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let img = image::load_from_memory(data).ok()?;
-    let thumb = img.thumbnail(128, 128);
-    let mut buf = std::io::Cursor::new(Vec::new());
-    thumb.write_to(&mut buf, image::ImageFormat::Png).ok()?;
-    Some(format!("data:image/png;base64,{}", STANDARD.encode(buf.into_inner())))
+    fn error(&self, msg: String) {
+        // dlog(): also land it on stderr + the Debug tab ("error" event).
+        eprintln!("copysync: {msg}");
+        let _ = self.0.emit("error", msg);
+    }
+    fn cliplog(&self, msg: String) {
+        let _ = self.0.emit("cliplog", msg);
+    }
+    fn notify(&self, title: &str, body: &str) {
+        let _ = self.0.notification().builder().title(title).body(body).show();
+    }
 }
 
 #[tauri::command]
@@ -273,61 +196,6 @@ fn hide_toast(app: AppHandle) {
     if let Some(win) = app.get_webview_window("toast") {
         let _ = win.hide();
     }
-}
-
-/// Delete a (sensitive) history row after a TTL so secrets don't linger.
-fn schedule_purge(hist: Arc<Mutex<History>>, id: i64, ttl_secs: u64) {
-    if id < 0 || ttl_secs == 0 {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
-        if let Ok(h) = hist.lock() {
-            let _ = h.delete(id);
-        }
-    });
-}
-
-/// Wipe the clipboard `secs` after a received clip — but only if it still holds
-/// that exact text, so a newer copy the user made is never clobbered.
-fn schedule_clear_text(expected: String, secs: u64) {
-    if secs == 0 {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(secs)).await;
-        if clipboard::get_text().map(|t| t == expected).unwrap_or(false) {
-            let _ = clipboard::clear();
-        }
-    });
-}
-
-fn file_name(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file")
-        .to_string()
-}
-
-fn mime_of(path: &str) -> String {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "pdf" => "application/pdf",
-        "txt" | "md" | "log" => "text/plain",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }
 
 // ----------------------------------------------------------------- commands
@@ -562,774 +430,52 @@ fn start_sync(app: &AppHandle, cfg: Config) {
         s.server_id = cfg.server_id.clone();
         s.e2e = !cfg.e2e_pass.is_empty();
     }
+
+    // Build the engine's shared state from the (re-used) AppState Arcs.
+    let engine_state = EngineState {
+        hist: state.hist.clone(),
+        status: state.status.clone(),
+        roster: state.roster.clone(),
+        targets: state.targets.clone(),
+        exclude_sensitive: state.exclude_sensitive.clone(),
+        auto_clear_secs: state.auto_clear_secs.clone(),
+        mark_sensitive: state.mark_sensitive.clone(),
+        reconnect: state.reconnect.clone(),
+        cfg_path: state.cfg_path.clone(),
+        downloads: state.downloads.clone(),
+        data_dir: state.data_dir.clone(),
+    };
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
     *state.tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
-    let app_cb = app.clone();
-    std::thread::spawn(move || clipboard_loop(tx, app_cb));
+    // The engine's UI sink: maps its callbacks onto the same Tauri events the
+    // WebView already listens to (status/clip/roster/reconnect/error/cliplog).
+    let emit: Arc<dyn EngineEmitter> = Arc::new(TauriEmitter(app.clone()));
 
-    let app2 = app.clone();
-    let hist = state.hist.clone();
+    // OS-clipboard watcher on its own std thread (the engine API requires it).
+    {
+        let emit_cb = emit.clone();
+        std::thread::spawn(move || engine::clipboard_loop(tx, emit_cb));
+    }
+
+    let emit_sup = emit.clone();
     let status = state.status.clone();
-    let roster = state.roster.clone();
-    let targets = state.targets.clone();
-    let downloads = state.downloads.clone();
-    let cfg_path = state.cfg_path.clone();
-    let app_sup = app.clone();
     tauri::async_runtime::spawn(async move {
-        sync_actor(app2, cfg, cfg_path, rx, hist, status, roster, targets, downloads).await;
+        engine::run(cfg, engine_state, emit, rx).await;
         // The sync engine stopped (bad config / fatal error). Surface it instead of
         // letting later actions fail silently with "sync not running".
-        let _ = app_sup.emit("error", "동기화가 멈췄습니다 — 설정 → 기기 페어링에서 다시 연결하거나 앱을 재시작하세요.");
-    });
-}
-
-fn clipboard_loop(tx: UnboundedSender<Cmd>, app: AppHandle) {
-    let mut last_seq: Option<u32> = None;
-    let mut last_text = String::new();
-    let mut last_img = String::new();
-    let mut last_files = String::new();
-    loop {
-        // On Windows, only touch the clipboard when its sequence number changes —
-        // re-opening it every tick contends with RDP's redirector and drops copies.
-        // Elsewhere seq_num() is None, so we keep polling content every tick.
-        let seq = clipboard::seq_num();
-        let changed = seq.map_or(true, |s| Some(s) != last_seq);
-        if changed {
-            if let Some(s) = seq {
-                last_seq = Some(s);
-            }
-            let text = clipboard::get_text();
-            let mut handled = false;
-            if let Ok(t) = &text {
-                if !t.is_empty() {
-                    if *t != last_text {
-                        last_text = t.clone();
-                        last_img.clear();
-                        last_files.clear();
-                        let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
-                        let _ = tx.send(Cmd::LocalText { text: t.clone(), html });
-                    }
-                    handled = true;
-                }
-            }
-            if !handled {
-                if let Ok(img) = clipboard::get_image() {
-                    let h = sha_hex(&img.rgba);
-                    if h != last_img {
-                        last_img = h;
-                        last_text.clear();
-                        last_files.clear();
-                        let _ = tx.send(Cmd::LocalImage(img));
-                    }
-                    handled = true;
-                } else if let Some(files) = clipboard::get_files() {
-                    // Windows Explorer file copy (CF_HDROP).
-                    let key = files.join("\u{1}");
-                    if key != last_files {
-                        last_files = key;
-                        last_text.clear();
-                        last_img.clear();
-                        let _ = tx.send(Cmd::LocalFiles(files));
-                    }
-                    handled = true;
-                }
-            }
-            // A clipboard change we couldn't turn into a normal text/image/file
-            // event — surface what was actually there (this is where RDP file
-            // copies and odd formats land). Shows up in the 디버깅 event log.
-            if !handled && seq.is_some() {
-                let formats = clipboard::list_formats();
-                if let Some(names) = clipboard::get_virtual_file_names() {
-                    let _ = app.emit(
-                        "cliplog",
-                        format!(
-                            "RDP/가상 파일 복사 감지: {} — CF_HDROP가 아닌 스트리밍 파일(FileContents)이라 아직 동기화하지 못합니다. 포맷=[{}]",
-                            names.join(", "),
-                            formats.join(", ")
-                        ),
-                    );
-                } else if text.is_err() {
-                    let _ = app.emit(
-                        "cliplog",
-                        format!("클립보드 읽기 실패 (RDP가 점유 중일 수 있음) · 포맷=[{}]", formats.join(", ")),
-                    );
-                } else if !formats.is_empty() {
-                    let _ = app.emit(
-                        "cliplog",
-                        format!("처리하지 못한 클립보드 변경 · 포맷=[{}]", formats.join(", ")),
-                    );
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(800));
-        if tx.is_closed() {
-            return;
-        }
-    }
-}
-
-fn current_targets(t: &Arc<Mutex<Targets>>) -> Targets {
-    t.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn sync_actor(
-    app: AppHandle,
-    mut cfg: Config,
-    cfg_path: PathBuf,
-    mut rx: UnboundedReceiver<Cmd>,
-    hist: Arc<Mutex<History>>,
-    status: Arc<Mutex<Status>>,
-    roster: Arc<Mutex<Vec<RosterDevice>>>,
-    targets: Arc<Mutex<Targets>>,
-    downloads: PathBuf,
-) {
-    // Liveness: ping this often; reconnect if no frame arrives within the watchdog
-    // (the server pings every 30s, so 75s = ~2 missed pings = a dead link).
-    const WS_PING_EVERY: Duration = Duration::from_secs(30);
-    const WS_WATCHDOG: Duration = Duration::from_secs(75);
-
-    let pin = match cfg.pin_bytes() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("bad pin: {e}");
-            set_connected(&app, &status, false);
-            let _ = app.emit("error", "잘못된 SPKI 핀입니다 — 설정 → 기기 페어링에서 다시 연결하세요.");
-            return;
-        }
-    };
-    let key = cfg.e2e_key();
-    let custom_res = cfg.custom_regexes();
-    let exclude_flag = app.state::<AppState>().exclude_sensitive.clone();
-    let http = pinning::http_client(pin);
-    let pull = blob::pull_client(pin);
-    let mut seq: u64 = 0;
-    let mut recent_text: VecDeque<String> = VecDeque::new();
-    let mut recent_img: VecDeque<String> = VecDeque::new();
-    let mut recent_files: VecDeque<String> = VecDeque::new();
-    let mut on_demand: HashMap<String, Hold> = HashMap::new();
-    let reconnect = app.state::<AppState>().reconnect.clone();
-    let mut attempt: u32 = 0;
-
-    loop {
-        match ws::connect(&cfg.server_url, pin, &cfg.device_id, &cfg.device_name, &cfg.token).await {
-            Ok((mut sock, hello)) => {
-                attempt = 0;
-                let threshold = hello.on_demand_threshold;
-                set_roster(&app, &roster, hello.roster.clone());
-                {
-                    let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
-                    s.pool = hello.pool.clone();
-                    s.pools = hello.pools.clone();
-                    s.reconnecting = false;
-                }
-                set_connected(&app, &status, true);
-                rebuild_tray(&app);
-                // Liveness watchdog: ping every WS_PING_EVERY and reconnect if no
-                // frame arrives within WS_WATCHDOG (the server pings every 30s).
-                // Catches a silently dead TCP link — RDP/network drop, suspend.
-                let mut last_recv = Instant::now();
-                let mut ping_at = tokio::time::interval(WS_PING_EVERY);
-                ping_at.tick().await;
-                let mut watchdog = tokio::time::interval(Duration::from_secs(15));
-                watchdog.tick().await;
-                let why: String = 'inner: loop {
-                    tokio::select! {
-                        _ = ping_at.tick() => {
-                            if let Err(e) = ws::ping(&mut sock).await {
-                                break 'inner format!("핑(keepalive) 전송 실패: {e}");
-                            }
-                        }
-                        _ = watchdog.tick() => {
-                            if last_recv.elapsed() > WS_WATCHDOG {
-                                break 'inner format!(
-                                    "{}초 동안 서버 프레임 없음 — watchdog({}s) 초과로 연결 끊김 판단",
-                                    last_recv.elapsed().as_secs(), WS_WATCHDOG.as_secs()
-                                );
-                            }
-                        }
-                        _ = reconnect.notified() => break 'inner "사용자가 재연결을 요청함".to_string(),
-                        cmd = rx.recv() => match cmd {
-                            None => return,
-                            Some(Cmd::LocalText { text, html }) => {
-                                let sha = sha_hex(text.as_bytes());
-                                if seen(&recent_text, &sha) { continue; }
-                                remember(&mut recent_text, sha);
-                                if exclude_flag.load(Ordering::Relaxed) {
-                                    if let Some(reason) = privacy::classify(&text, &custom_res) {
-                                        // Privacy filter: never sync; record locally + auto-purge.
-                                        let id = hist.lock().unwrap_or_else(|e| e.into_inner())
-                                            .add(&protocol::now_ts(), "text", "me", "out", &text, "text/plain", text.len() as i64, "", "")
-                                            .unwrap_or(-1);
-                                        schedule_purge(hist.clone(), id, cfg.sensitive_ttl_secs);
-                                        let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"text","text":text,"sensitive":reason.label()}));
-                                        continue;
-                                    }
-                                }
-                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&targets), &app, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
-                            }
-                            Some(Cmd::SendText(t)) => {
-                                remember(&mut recent_text, sha_hex(t.as_bytes()));
-                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&targets), &app, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
-                            }
-                            Some(Cmd::LocalImage(img)) => {
-                                let sha = sha_hex(&img.rgba);
-                                if seen(&recent_img, &sha) { continue; }
-                                remember(&mut recent_img, sha);
-                                if !send_image_clip(&mut sock, &mut seq, &img, &key, current_targets(&targets), &app, &hist, &http, &cfg).await { break 'inner "이미지 전송 실패 — 제어 채널 끊김".to_string(); }
-                            }
-                            Some(Cmd::SendFile(p)) => {
-                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
-                            }
-                            Some(Cmd::LocalFiles(files)) => {
-                                for p in files {
-                                    // Skip a file we just placed on the clipboard from an inbound clip (echo).
-                                    if seen(&recent_files, &p) { continue; }
-                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&targets), threshold, &mut on_demand, &app, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
-                                }
-                            }
-                            Some(Cmd::SetPool(name)) => {
-                                if ws::send(&mut sock, protocol::T_SET_POOL, &protocol::SetPool { pool: name.clone() }).await.is_err() { break 'inner "풀 설정 전송 실패".to_string(); }
-                                let snap = { let mut s = status.lock().unwrap_or_else(|e| e.into_inner()); s.pool = name; s.clone() };
-                                let _ = app.emit("status", snap);
-                                rebuild_tray(&app);
-                            }
-                        },
-                        frame = ws::recv(&mut sock) => match frame {
-                            Ok(Some((t, d))) => {
-                                last_recv = Instant::now();
-                                if t == ws::KEEPALIVE {
-                                    // ping/pong — liveness only.
-                                } else if t == protocol::T_TOKEN_ROTATE {
-                                    // Stage-3: persist the re-issued bearer token; the next
-                                    // reconnect uses it and the server retires the old one.
-                                    if let Ok(tr) = serde_json::from_value::<protocol::TokenRotate>(d) {
-                                        if !tr.token.is_empty() {
-                                            cfg.token = tr.token;
-                                            let _ = cfg.save(&cfg_path);
-                                            dlog(&app, "토큰 회전 — 새 인증 토큰 저장됨");
-                                        }
-                                    }
-                                } else {
-                                    handle_frame(t, d, &key, &pull, &http, &cfg, &app, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &mut recent_files, &on_demand).await;
-                                }
-                            }
-                            Ok(None) => break 'inner "서버가 연결을 종료함".to_string(),
-                            Err(e) => break 'inner format!("수신 오류: {e}"),
-                        }
-                    }
-                };
-                dlog(&app, format!("연결 종료 — {why} · 자동 재연결 시도"));
-                set_connected(&app, &status, false);
-            }
-            Err(e) => {
-                eprintln!("connect failed: {e}");
-                let _ = app.emit("error", format!("연결 실패 — 재시도 중: {e}"));
-            }
-        }
-        // Exponential backoff with jitter (1→2→4…→30s), surfaced to the UI; a
-        // manual "재연결" (reconnect.notified) skips the wait.
-        attempt = attempt.saturating_add(1);
-        let delay = backoff_delay(attempt);
+        emit_sup.error(
+            "동기화가 멈췄습니다 — 설정 → 기기 페어링에서 다시 연결하거나 앱을 재시작하세요.".to_string(),
+        );
         let snap = {
             let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
             s.connected = false;
-            s.reconnecting = true;
+            s.reconnecting = false;
             s.clone()
         };
-        let _ = app.emit("status", snap);
-        let _ = app.emit("reconnect", format!("{attempt}회 · {}초 후 재시도", delay.as_secs().max(1)));
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = reconnect.notified() => {}
-        }
-    }
-}
-
-/// Reconnect backoff: 1, 2, 4, 8, 16, 30, 30… seconds, plus a little jitter so
-/// many clients don't retry in lockstep.
-fn backoff_delay(attempt: u32) -> Duration {
-    let secs = (1u64 << attempt.min(5)).min(30);
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_millis() as u64) % 700)
-        .unwrap_or(0);
-    Duration::from_millis(secs * 1000 + jitter)
-}
-
-fn set_connected(app: &AppHandle, status: &Arc<Mutex<Status>>, on: bool) {
-    let snapshot = {
-        let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
-        s.connected = on;
-        s.clone()
-    };
-    let _ = app.emit("status", snapshot);
-}
-
-fn set_roster(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, devices: Vec<DeviceInfo>) {
-    let list: Vec<RosterDevice> = devices
-        .iter()
-        .map(|d| RosterDevice {
-            id: d.device.id.clone(),
-            name: d.device.name.clone(),
-            online: d.online,
-        })
-        .collect();
-    *roster.lock().unwrap_or_else(|e| e.into_inner()) = list.clone();
-    let _ = app.emit("roster", list);
-}
-
-fn apply_presence(app: &AppHandle, roster: &Arc<Mutex<Vec<RosterDevice>>>, p: Presence) {
-    let snapshot = {
-        let mut r = roster.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(d) = r.iter_mut().find(|x| x.id == p.device.id) {
-            d.online = p.online;
-            d.name = p.device.name.clone();
-        } else {
-            r.push(RosterDevice {
-                id: p.device.id.clone(),
-                name: p.device.name.clone(),
-                online: p.online,
-            });
-        }
-        r.clone()
-    };
-    let _ = app.emit("roster", snapshot);
-}
-
-// ----------------------------------------------------------------- outbound
-
-/// Append a line to the Debug-tab recorder (always captured there now, even with
-/// the verbose "이벤트 기록" toggle off) plus stderr — for failures the user should
-/// be able to see after the fact.
-fn dlog(app: &AppHandle, msg: impl Into<String>) {
-    let m = msg.into();
-    eprintln!("copysync: {m}");
-    let _ = app.emit("error", m);
-}
-
-async fn send_text_clip(
-    sock: &mut ws::Ws,
-    seq: &mut u64,
-    text: &str,
-    html: Option<&str>,
-    key: &Option<(Vec<u8>, String)>,
-    targets: Targets,
-    app: &AppHandle,
-    hist: &Arc<Mutex<History>>,
-) -> bool {
-    *seq += 1;
-    let ev = match ClipEvent::new_text(
-        *seq,
-        text,
-        html,
-        key.as_ref().map(|(k, i)| (k.as_slice(), i.as_str())),
-        targets,
-    ) {
-        Ok(e) => e,
-        Err(e) => { dlog(app, format!("텍스트 클립 생성 실패(E2E 암호화?) — 전송 안 함: {e}")); return true; }
-    };
-    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
-        return false;
-    }
-    add_history(hist, &ev.ts, "text", "me", "out", text, "text/plain", text.len() as i64, "", "");
-    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"text","text":text}));
-    true
-}
-
-/// Cache an outbound clipboard image locally so the history can render its
-/// thumbnail (inbound images already persist a file; outbound only kept a label).
-fn cache_outbound_image(app: &AppHandle, png: &[u8]) -> Option<String> {
-    let dir = app.path().app_data_dir().ok()?.join("clip-out");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{}.png", sha_hex(png)));
-    if !path.exists() {
-        std::fs::write(&path, png).ok()?;
-    }
-    Some(path.to_string_lossy().into_owned())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_image_clip(
-    sock: &mut ws::Ws,
-    seq: &mut u64,
-    img: &Image,
-    key: &Option<(Vec<u8>, String)>,
-    targets: Targets,
-    app: &AppHandle,
-    hist: &Arc<Mutex<History>>,
-    http: &reqwest::Client,
-    cfg: &Config,
-) -> bool {
-    let png = match clipboard::encode_png(img) {
-        Ok(p) => p,
-        Err(e) => { dlog(app, format!("이미지 PNG 인코딩 실패 — 전송 안 함: {e}")); return true; }
-    };
-    let payload = match key {
-        Some((k, _)) => match e2e::seal(k, &png) {
-            Ok(c) => c,
-            Err(e) => { dlog(app, format!("이미지 E2E 암호화 실패 — 전송 안 함: {e}")); return true; }
-        },
-        None => png.clone(),
-    };
-    let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
-        Ok(b) => b,
-        Err(e) => {
-            dlog(app, format!("이미지 blob 업로드 실패 — 전송 안 함: {e}"));
-            return true; // blob channel issue, not the control channel
-        }
-    };
-    *seq += 1;
-    let ev = ClipEvent {
-        id: protocol::new_id(),
-        seq: *seq,
-        ts: protocol::now_ts(),
-        mime: vec!["image/png".into()],
-        name: "clipboard.png".into(),
-        blob_id: bid,
-        size: png.len() as i64,
-        sha256: sha_hex(&payload),
-        targets,
-        enc: key.as_ref().map(|(_, kid)| EncMeta {
-            alg: e2e::ALG.into(),
-            key_id: kid.clone(),
-            nonce: String::new(),
-        }),
-        ..Default::default()
-    };
-    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
-        return false;
-    }
-    let prev = cache_outbound_image(app, &png).unwrap_or_else(|| "(클립보드 이미지)".into());
-    add_history(hist, &ev.ts, "image", "me", "out", &prev, "image/png", png.len() as i64, &ev.blob_id, "clipboard.png");
-    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":"image","name":"clipboard.png","size":png.len()}));
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_file_clip(
-    sock: &mut ws::Ws,
-    seq: &mut u64,
-    path: &str,
-    key: &Option<(Vec<u8>, String)>,
-    targets: Targets,
-    threshold: i64,
-    on_demand: &mut HashMap<String, Hold>,
-    app: &AppHandle,
-    hist: &Arc<Mutex<History>>,
-    http: &reqwest::Client,
-    cfg: &Config,
-) -> bool {
-    let p = Path::new(path);
-    let meta = match std::fs::metadata(p) {
-        Ok(m) => m,
-        Err(e) => {
-            notify(app, "CopySync", &format!("파일을 열 수 없습니다: {e}"));
-            return true;
-        }
-    };
-    let size = meta.len() as i64;
-    let name = file_name(path);
-    let mime = mime_of(path);
-    let kind = if mime.starts_with("image/") { "image" } else { "file" };
-
-    *seq += 1;
-    let ev = if threshold > 0 && size > threshold {
-        // On-demand: advertise now, upload when the server asks.
-        let (bid, sha) = match key {
-            Some((k, _)) => {
-                let data = match std::fs::read(p) {
-                    Ok(d) => d,
-                    Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
-                };
-                let ct = match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog(app, format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } };
-                let sha = sha_hex(&ct);
-                let bid = format!("sha256:{sha}");
-                on_demand.insert(bid.clone(), Hold::Sealed(ct));
-                (bid, sha)
-            }
-            None => {
-                let sha = match file_sha_hex(p) { Ok(s) => s, Err(e) => { notify(app,"CopySync",&format!("읽기 실패: {e}")); return true; } };
-                let bid = format!("sha256:{sha}");
-                on_demand.insert(bid.clone(), Hold::Plain(p.to_path_buf()));
-                (bid, sha)
-            }
-        };
-        ClipEvent {
-            id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
-            mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
-            sha256: sha, on_demand: true, targets,
-            enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
-            ..Default::default()
-        }
-    } else {
-        // Eager: upload the (encrypted) bytes immediately.
-        let data = match std::fs::read(p) {
-            Ok(d) => d,
-            Err(e) => { notify(app, "CopySync", &format!("읽기 실패: {e}")); return true; }
-        };
-        let payload = match key {
-            Some((k, _)) => match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog(app, format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } },
-            None => data,
-        };
-        let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
-            Ok(b) => b,
-            Err(e) => { notify(app, "CopySync", &format!("업로드 실패: {e}")); return true; }
-        };
-        ClipEvent {
-            id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
-            mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
-            sha256: sha_hex(&payload), targets,
-            enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
-            ..Default::default()
-        }
-    };
-    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
-        return false;
-    }
-    add_history(hist, &ev.ts, kind, "me", "out", &name, &mime, size, &ev.blob_id, &name);
-    let _ = app.emit("clip", serde_json::json!({"direction":"out","kind":kind,"name":name,"size":size,"onDemand":ev.on_demand}));
-    true
-}
-
-fn file_sha_hex(p: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(p)?;
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(hex::encode(h.finalize()))
-}
-
-// ----------------------------------------------------------------- inbound
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_frame(
-    t: String,
-    d: serde_json::Value,
-    key: &Option<(Vec<u8>, String)>,
-    pull: &reqwest::Client,
-    http: &reqwest::Client,
-    cfg: &Config,
-    app: &AppHandle,
-    hist: &Arc<Mutex<History>>,
-    downloads: &Path,
-    roster: &Arc<Mutex<Vec<RosterDevice>>>,
-    recent_text: &mut VecDeque<String>,
-    recent_img: &mut VecDeque<String>,
-    recent_files: &mut VecDeque<String>,
-    on_demand: &HashMap<String, Hold>,
-) {
-    match t.as_str() {
-        protocol::T_CLIP => {
-            match serde_json::from_value::<ClipEvent>(d) {
-                Ok(ev) => handle_incoming(ev, key, pull, cfg, app, hist, downloads, recent_text, recent_img, recent_files).await,
-                Err(e) => dlog(app, format!("받은 클립 디코딩 실패: {e}")),
-            }
-        }
-        protocol::T_BLOB_REQUEST => {
-            if let Ok(br) = serde_json::from_value::<BlobRequest>(d) {
-                if let Some(hold) = on_demand.get(&br.id) {
-                    let bytes = match hold {
-                        Hold::Sealed(b) => b.clone(),
-                        Hold::Plain(p) => match std::fs::read(p) {
-                            Ok(b) => b,
-                            Err(e) => { dlog(app, format!("요청받은 파일 읽기 실패: {e}")); return; }
-                        },
-                    };
-                    let _ = blob::put_blob(http, &cfg.server_url, &cfg.token, bytes).await;
-                }
-            }
-        }
-        protocol::T_ROSTER => {
-            if let Ok(r) = serde_json::from_value::<Roster>(d) {
-                set_roster(app, roster, r.devices);
-            }
-        }
-        protocol::T_PRESENCE => {
-            if let Ok(p) = serde_json::from_value::<Presence>(d) {
-                apply_presence(app, roster, p);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_incoming(
-    ev: ClipEvent,
-    key: &Option<(Vec<u8>, String)>,
-    pull: &reqwest::Client,
-    cfg: &Config,
-    app: &AppHandle,
-    hist: &Arc<Mutex<History>>,
-    downloads: &Path,
-    recent_text: &mut VecDeque<String>,
-    recent_img: &mut VecDeque<String>,
-    recent_files: &mut VecDeque<String>,
-) {
-    if ev.is_blob() {
-        let data = match blob::get_blob(pull, &cfg.server_url, &cfg.token, &ev.blob_id).await {
-            Ok(d) => d,
-            Err(e) => {
-                notify(app, "CopySync", &format!("파일 받기 실패: {e}"));
-                return;
-            }
-        };
-        let plain = match (&ev.enc, key) {
-            (Some(_), Some((k, _))) => match e2e::open(k, &data) {
-                Ok(p) => p,
-                Err(_) => {
-                    notify(app, "CopySync", "받은 파일을 복호화할 수 없습니다 (암호문?)");
-                    return;
-                }
-            },
-            (Some(_), None) => {
-                notify(app, "CopySync", "암호화된 파일을 받았지만 암호문이 설정되지 않았습니다");
-                return;
-            }
-            (None, _) => data,
-        };
-        let _ = std::fs::create_dir_all(downloads);
-        let name = if ev.name.is_empty() {
-            ev.blob_id.trim_start_matches("sha256:").to_string()
-        } else {
-            ev.name.clone()
-        };
-        let path = downloads.join(&name);
-        let _ = std::fs::write(&path, &plain);
-        let is_image = ev.mime.first().map(|m| m.starts_with("image/")).unwrap_or(false);
-        if is_image {
-            match clipboard::decode_image(&plain) {
-                Ok(img) => {
-                    remember(recent_img, sha_hex(&img.rgba));
-                    if let Err(e) = clipboard::set_image(&img) {
-                        dlog(app, format!("받은 이미지 클립보드 적용 실패(RDP 경합?): {e}"));
-                    }
-                }
-                Err(e) => dlog(app, format!("받은 이미지 디코딩 실패: {e}")),
-            }
-            show_toast(app, &ev.origin_device, &format!("🖼 {name} · {}", human(plain.len())), thumb_data_uri(&plain));
-        } else {
-            // Eager (≤ threshold) file: put it on the clipboard so it's pasteable.
-            if !ev.on_demand {
-                let p = path.to_string_lossy().to_string();
-                remember(recent_files, p.clone());
-                if let Err(e) = clipboard::set_files(&[p]) {
-                    dlog(app, format!("받은 파일 클립보드 적용 실패(RDP 경합?): {e}"));
-                }
-            }
-            show_toast(app, &ev.origin_device, &format!("📎 {name} · {}", human(plain.len())), None);
-        }
-        add_history(hist, &ev.ts, ev.kind(), &ev.origin_device, "in", &path.to_string_lossy(),
-            ev.mime.first().map(|s| s.as_str()).unwrap_or(""), plain.len() as i64, &ev.blob_id, &name);
-        let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":ev.kind(),"name":name,"size":plain.len(),"path":path.to_string_lossy()}));
-        return;
-    }
-
-    // Text.
-    let text = match (&ev.enc, key) {
-        (Some(_), Some((k, _))) => {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            let raw = match STANDARD.decode(&ev.inline_text) {
-                Ok(r) => r,
-                Err(e) => { dlog(app, format!("받은 텍스트 base64 디코딩 실패: {e}")); return; }
-            };
-            match e2e::open(k, &raw) {
-                Ok(p) => String::from_utf8_lossy(&p).to_string(),
-                Err(_) => {
-                    notify(app, "CopySync", "받은 텍스트를 복호화할 수 없습니다 (암호문?)");
-                    return;
-                }
-            }
-        }
-        (Some(_), None) => {
-            notify(app, "CopySync", "암호화된 텍스트를 받았지만 암호문이 설정되지 않았습니다");
-            return;
-        }
-        (None, _) => ev.inline_text.clone(),
-    };
-    // Optional rich-text (HTML) variant.
-    let html: Option<String> = if ev.html.is_empty() {
-        None
-    } else {
-        match (&ev.enc, key) {
-            (Some(_), Some((k, _))) => {
-                use base64::{engine::general_purpose::STANDARD, Engine};
-                STANDARD
-                    .decode(&ev.html)
-                    .ok()
-                    .and_then(|raw| e2e::open(k, &raw).ok())
-                    .map(|p| String::from_utf8_lossy(&p).to_string())
-            }
-            (Some(_), None) => None,
-            (None, _) => Some(ev.html.clone()),
-        }
-    };
-    remember(recent_text, sha_hex(text.as_bytes()));
-    let st = app.state::<AppState>();
-    let mark = st.mark_sensitive.load(Ordering::Relaxed);
-    let auto_clear = st.auto_clear_secs.load(Ordering::Relaxed);
-    let applied = match &html {
-        Some(h) => clipboard::set_html(h, &text),
-        None if mark => clipboard::set_text_sensitive(&text),
-        None => clipboard::set_text(&text),
-    };
-    if let Err(e) = applied {
-        dlog(app, format!("받은 텍스트 클립보드 적용 실패(RDP 경합?): {e}"));
-    }
-    if auto_clear > 0 {
-        schedule_clear_text(text.clone(), auto_clear);
-    }
-    let row = add_history(hist, &ev.ts, "text", &ev.origin_device, "in", &text, "text/plain", text.len() as i64, "", "");
-    if privacy::classify(&text, &[]).is_some() {
-        // Received password-like clip: purge from local history after the TTL.
-        schedule_purge(hist.clone(), row, cfg.sensitive_ttl_secs);
-    }
-    show_toast(app, &ev.origin_device, &preview(&text), None);
-    let _ = app.emit("clip", serde_json::json!({"direction":"in","kind":"text","text":text,"origin":ev.origin_device}));
-}
-
-fn human(n: usize) -> String {
-    let units = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < units.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", units[i])
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_history(
-    hist: &Arc<Mutex<History>>,
-    ts: &str,
-    kind: &str,
-    origin: &str,
-    dir: &str,
-    preview: &str,
-    mime: &str,
-    size: i64,
-    blob_id: &str,
-    name: &str,
-) -> i64 {
-    if let Ok(h) = hist.lock() {
-        h.add(ts, kind, origin, dir, preview, mime, size, blob_id, name).unwrap_or(-1)
-    } else {
-        -1
-    }
+        emit_sup.status(&snap);
+    });
 }
 
 // ----------------------------------------------------------------- entrypoint
@@ -1374,6 +520,7 @@ fn main() {
                 tray: Mutex::new(None),
                 cfg_path: dir.join("config.json"),
                 downloads: data.join("downloads"),
+                data_dir: data.clone(),
                 exclude_sensitive: Arc::new(AtomicBool::new(true)),
                 quick_panel_shortcut: Arc::new(Mutex::new(
                     copysync_core::config::DEFAULT_QUICK_PANEL_SHORTCUT.to_string(),
