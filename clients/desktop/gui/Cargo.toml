@@ -1,0 +1,24 @@
+[package]
+name = "copysync-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native eframe/egui CopySync desktop GUI — a pure IPC client to copysync-agent."
+
+[[bin]]
+name = "copysync-gui"
+path = "src/main.rs"
+
+[dependencies]
+copysync-ipc = { path = "../ipc" }
+# egui's default glow (OpenGL) backend — explicitly NO wgpu, smaller link surface
+# and works on the conda GL/X stack. `persistence` gives us eframe storage for the
+# saved theme preference.
+eframe = { version = "0.29", default-features = false, features = ["glow", "persistence", "default_fonts"] }
+egui = "0.29"
+interprocess = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+dirs = "5"
+rfd = "0.15"
