@@ -86,7 +86,31 @@ fun CopySyncTheme(content: @Composable () -> Unit) {
         "dark" -> true
         else -> isSystemInDarkTheme()
     }
-    var scheme = if (dark) darkColorScheme() else lightColorScheme()
+    // "Warm Trust" design system (see clients/desktop/DESIGN.md): warm-neutral
+    // tiered surfaces + a single teal action accent, shared with the desktop GUI.
+    var scheme = if (dark) darkColorScheme(
+        primary = Color(0xFF0E8C84), onPrimary = Color.White,
+        secondary = Color(0xFF34D399), tertiary = Color(0xFFA78BFA),
+        background = Color(0xFF1A1816), onBackground = Color(0xFFEDE8DF),
+        surface = Color(0xFF222019), onSurface = Color(0xFFEDE8DF),
+        surfaceVariant = Color(0xFF2B2823), onSurfaceVariant = Color(0xFFA39C8E),
+        surfaceContainerLowest = Color(0xFF1A1816), surfaceContainerLow = Color(0xFF222019),
+        surfaceContainer = Color(0xFF222019), surfaceContainerHigh = Color(0xFF2B2823),
+        surfaceContainerHighest = Color(0xFF332F29),
+        outline = Color(0xFF3A362F), outlineVariant = Color(0xFF3A362F),
+        error = Color(0xFFF87171),
+    ) else lightColorScheme(
+        primary = Color(0xFF0B7C72), onPrimary = Color.White,
+        secondary = Color(0xFF15803D), tertiary = Color(0xFF7E22CE),
+        background = Color(0xFFF6F3EC), onBackground = Color(0xFF23201B),
+        surface = Color(0xFFFFFFFF), onSurface = Color(0xFF23201B),
+        surfaceVariant = Color(0xFFEFEBE1), onSurfaceVariant = Color(0xFF6E685C),
+        surfaceContainerLowest = Color(0xFFFFFFFF), surfaceContainerLow = Color(0xFFF6F3EC),
+        surfaceContainer = Color(0xFFEFEBE1), surfaceContainerHigh = Color(0xFFEAE5DA),
+        surfaceContainerHighest = Color(0xFFE3DDD0),
+        outline = Color(0xFFDAD3C5), outlineVariant = Color(0xFFDAD3C5),
+        error = Color(0xFFC81E1E),
+    )
     if (bgPath.isNotEmpty() && cardOp < 1f) {
         fun Color.a() = copy(alpha = cardOp)
         scheme = scheme.copy(
