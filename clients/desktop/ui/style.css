@@ -12,6 +12,9 @@
   --tag-text: #3fb94f;
   --tag-img: #a78bfa;
   --tag-file: #5b9cf6;
+  --success: #34d399;   /* 연결됨 (status — per DESIGN.md, distinct from teal actions) */
+  --warn: #fbbf24;      /* 재연결 중 */
+  --danger: #f87171;    /* 연결 끊김 / 오류 */
 
   /* theme controls — overwritten live from JS (localStorage-backed) */
   --card-opacity: 1;
@@ -43,6 +46,9 @@
   --tag-text: #117a33;
   --tag-img: #7e22ce;
   --tag-file: #1d4ed8;
+  --success: #15803d;
+  --warn: #9a6406;
+  --danger: #c81e1e;
 }
 /* ---- blocked-clip toast (privacy filter) — pink translucent glass ---- */
 .toasts {
@@ -91,9 +97,11 @@ header {
   padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
 .brand { font-weight: 700; letter-spacing: .3px; }
-.pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
-.pill.on { background: rgba(63,185,80,.15); color: var(--accent); }
-.pill.off { background: rgba(139,151,166,.15); color: var(--muted); }
+.pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.pill::before { content: "●"; font-size: 9px; line-height: 1; }  /* dot+word — more glanceable (DESIGN.md §status pill) */
+.pill.on   { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }  /* 연결됨 */
+.pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent);    color: var(--warn); }     /* 재연결 중 */
+.pill.off  { background: color-mix(in srgb, var(--danger) 16%, transparent);  color: var(--danger); }   /* 연결 끊김 */
 
 nav#tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
 nav#tabs button {
@@ -139,7 +147,7 @@ label.dev { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor
 .hint { color: var(--muted); font-size: 12px; }
 .msg { font-size: 13px; min-height: 18px; }
 .msg.ok { color: var(--accent); }
-.msg.err { color: #f85149; }
+.msg.err { color: var(--danger); }
 
 .searchbar { display: flex; gap: 8px; margin-bottom: 12px; }
 .searchbar input { flex: 1; }

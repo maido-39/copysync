@@ -45,8 +45,8 @@ function renderStatus(s) {
   $("#s-e2e").textContent = s.e2e ? "켜짐" : "꺼짐";
   $("#set-sid").textContent = s.server_id || "—";
   const c = $("#conn");
-  c.textContent = s.connected ? "연결됨" : "연결 끊김";
-  c.className = "pill " + (s.connected ? "on" : "off");
+  c.textContent = s.connected ? "연결됨" : s.paired ? "재연결 중…" : "연결 끊김";
+  c.className = "pill " + (s.connected ? "on" : s.paired ? "warn" : "off");
   const sel = $("#pool");
   if (sel) {
     const pools = s.pools && s.pools.length ? s.pools : ["default"];
