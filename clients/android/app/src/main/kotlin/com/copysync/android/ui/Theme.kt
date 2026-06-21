@@ -50,6 +50,31 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.File
 import java.io.FileOutputStream
 
+/**
+ * Theme-aware semantic colors that Material 3 has no slot for (see DESIGN.md).
+ * "Warm Trust" success green: #34D399 (dark) / #15803D (light); warn amber:
+ * #FBBF24 (dark) / #9A6406 (light); danger uses [androidx.compose.material3.ColorScheme.error].
+ * These are kept hue-separated from the teal `primary` accent on purpose.
+ */
+/** True when the effective theme is dark, honoring the [ThemeState.mode] override. */
+@Composable
+fun isDarkTheme(): Boolean {
+    val mode by ThemeState.mode.collectAsState()
+    return when (mode) {
+        "light" -> false
+        "dark" -> true
+        else -> isSystemInDarkTheme()
+    }
+}
+
+@Composable
+fun successColor(): Color =
+    if (isDarkTheme()) Color(0xFF34D399) else Color(0xFF15803D)
+
+@Composable
+fun warnColor(): Color =
+    if (isDarkTheme()) Color(0xFFFBBF24) else Color(0xFF9A6406)
+
 /** Reactive theme state (persisted via [Settings]). Mirrors the desktop theme. */
 object ThemeState {
     val mode = MutableStateFlow("system") // dark | light | system
@@ -202,7 +227,7 @@ fun ThemeSettingsCard() {
                 ThemeSlider("밝기", bright, 0.3f, 1.3f) { ThemeState.brightness.value = it; settings.bgBrightness = it }
                 ThemeSlider("흐림(블러)", blurR, 0f, 24f) { ThemeState.blur.value = it; settings.bgBlur = it }
                 ThemeSlider("박스 투명도", cardOp, 0.3f, 1f) { ThemeState.cardOpacity.value = it; settings.cardOpacity = it }
-                Text("미리보기를 드래그해 위치를 조정하세요.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("미리보기를 드래그해 위치를 조정하세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }

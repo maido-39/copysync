@@ -80,17 +80,20 @@ function itemPath(e) {
 function itemHtml(e, i) {
   const label = e.kind === "image" ? "이미지" : e.kind === "file" ? "파일" : "텍스트";
   const head = e.kind === "text" ? esc(e.preview) : esc(e.name || e.preview);
-  const dir = e.direction === "out" ? "보냄" : "받음";
-  const meta = [dir, e.origin && e.origin !== "me" ? e.origin : null, fmtSize(e.size), e.ts]
-    .filter(Boolean).join(" · ");
+  const out = e.direction === "out";
+  // Direction coded by the word itself (보냄 strong / 받음 muted), not a colored stripe.
+  const dirHtml = `<span class="${out ? "sent" : "recv"}">${out ? "보냄" : "받음"}</span>`;
+  const rest = [e.origin && e.origin !== "me" ? e.origin : null, fmtSize(e.size), e.ts]
+    .filter(Boolean).map(esc).join(" · ");
+  const meta = dirHtml + (rest ? " · " + rest : "");
   const path = itemPath(e);
   let media = `<span class="ic">${e.kind === "image" ? "🖼️" : e.kind === "file" ? "📄" : "🔤"}</span>`;
   if (e.kind === "image" && path) media = `<img class="thumb" data-i="${i}" alt=""/>`;
   else if (e.kind === "file" && path && (e.mime || "").startsWith("text/")) media = `<pre class="snip" data-i="${i}">…</pre>`;
-  return `<div class="item dir-${e.direction}">
+  return `<div class="item">
     <span class="tag ${e.kind}">${label}</span>
     ${media}
-    <div class="body"><div class="preview">${head}</div><div class="meta">${esc(meta)}</div></div>
+    <div class="body"><div class="preview">${head}</div><div class="meta">${meta}</div></div>
   </div>`;
 }
 function hydrate() {

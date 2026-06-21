@@ -194,8 +194,9 @@ fn tray_icon_image() -> Result<Icon> {
     const H: u32 = 16;
     let mut rgba = Vec::with_capacity((W * H * 4) as usize);
     for _ in 0..(W * H) {
-        // CopySync teal (matches the "연결됨" green-ish brand tone), fully opaque.
-        rgba.extend_from_slice(&[0x14, 0xB8, 0xA6, 0xFF]);
+        // CopySync teal ACCENT (#0E8C84 — the actions/active token, distinct from
+        // the green "연결됨" success tone), fully opaque.
+        rgba.extend_from_slice(&[0x0E, 0x8C, 0x84, 0xFF]);
     }
     Icon::from_rgba(rgba, W, H).map_err(|e| anyhow!("tray icon: {e}"))
 }
@@ -1142,6 +1143,39 @@ impl App {
         ui.add(btn)
     }
 
+    /// One item in a segmented control (자동 지우기 / 화면 / 전송 대상). Selected =
+    /// accent@18% fill + strong fg label + 1px accent@45% stroke; unselected =
+    /// transparent + muted label with egui's built-in hover highlight. Returns the
+    /// clickable `Response`; callers keep their own selection logic.
+    fn seg_item(
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        selected: bool,
+        label: &str,
+    ) -> egui::Response {
+        if selected {
+            egui::Frame::none()
+                .fill(tint(pal.accent, 0.18))
+                .stroke(Stroke::new(1.0, tint(pal.accent, 0.45)))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(10.0, 4.0))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(label).strong().color(pal.fg),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                })
+                .inner
+        } else {
+            // Transparent, clickable; muted by default. `selectable_label(false,..)`
+            // gives a transparent ground + egui's built-in hover highlight, and we
+            // tint the text muted so it reads as the inactive segment.
+            ui.selectable_label(false, egui::RichText::new(label).color(pal.muted))
+        }
+    }
+
     /// The connection status pill: dot + word. An 8px filled circle in
     /// statusColor + the label in statusColor, on a statusColor@~20% frame with a
     /// 1px statusColor@~50% stroke, rounding 8.
@@ -1167,14 +1201,14 @@ impl App {
     }
 
     /// A kind-tag chip: tinted frame (tagColor@18% dark / @14% light), rounding
-    /// 10, small inner margin, label in tagColor at ~11.5px medium.
+    /// 8, small inner margin, label in tagColor at ~11.5px medium.
     fn kind_chip(ui: &mut egui::Ui, pal: &Palette, kind: &str) {
         let color = pal.tag_color(kind);
         let label = kind_tag_label(kind);
         let fill_a = if pal.dark { 0.18 } else { 0.14 };
         egui::Frame::none()
             .fill(tint(color, fill_a))
-            .rounding(Rounding::same(10.0))
+            .rounding(Rounding::same(8.0))
             .inner_margin(Margin::symmetric(7.0, 2.0))
             .show(ui, |ui| {
                 ui.label(egui::RichText::new(label).size(11.5).color(color));
@@ -1360,8 +1394,18 @@ impl App {
                 Self::card_title(ui, &pal, "전송 대상");
                 let mut changed = false;
                 ui.horizontal(|ui| {
-                    changed |= ui.radio_value(&mut self.target_all, true, "전체").changed();
-                    changed |= ui.radio_value(&mut self.target_all, false, "선택").changed();
+                    if Self::seg_item(ui, &pal, self.target_all, "전체").clicked()
+                        && !self.target_all
+                    {
+                        self.target_all = true;
+                        changed = true;
+                    }
+                    if Self::seg_item(ui, &pal, !self.target_all, "선택").clicked()
+                        && self.target_all
+                    {
+                        self.target_all = false;
+                        changed = true;
+                    }
                 });
                 if !self.target_all {
                     if self.roster.is_empty() {
@@ -1495,7 +1539,7 @@ impl App {
                     let mut sel = self.auto_clear_secs;
                     let opts = [(0u64, "끔"), (30, "30초"), (60, "1분"), (300, "5분")];
                     for (secs, lbl) in opts {
-                        if ui.selectable_label(sel == secs, lbl).clicked() {
+                        if Self::seg_item(ui, &pal, sel == secs, lbl).clicked() {
                             sel = secs;
                         }
                     }
@@ -1570,9 +1614,19 @@ impl App {
                 Self::card_title(ui, &pal, "화면");
                 ui.horizontal(|ui| {
                     let mut mode = self.theme_mode;
-                    let changed = ui.selectable_value(&mut mode, ThemeMode::Dark, "다크").clicked()
-                        | ui.selectable_value(&mut mode, ThemeMode::Light, "라이트").clicked()
-                        | ui.selectable_value(&mut mode, ThemeMode::System, "시스템").clicked();
+                    let mut changed = false;
+                    if Self::seg_item(ui, &pal, mode == ThemeMode::Dark, "다크").clicked() {
+                        mode = ThemeMode::Dark;
+                        changed = true;
+                    }
+                    if Self::seg_item(ui, &pal, mode == ThemeMode::Light, "라이트").clicked() {
+                        mode = ThemeMode::Light;
+                        changed = true;
+                    }
+                    if Self::seg_item(ui, &pal, mode == ThemeMode::System, "시스템").clicked() {
+                        mode = ThemeMode::System;
+                        changed = true;
+                    }
                     if changed && mode != self.theme_mode {
                         self.theme_mode = mode;
                         self.apply_theme(ctx);

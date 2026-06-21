@@ -13,7 +13,6 @@
   --ok: #34d399;
   --warn: #fbbf24;
   --radius: 12px;
-  --shadow: 0 6px 24px rgba(0,0,0,.35);
 
   /* theme controls (set live from JS, localStorage-backed) */
   --card-opacity: 1;
@@ -41,7 +40,6 @@
   --danger: #c81e1e;
   --ok: #15803d;
   --warn: #9a6406;
-  --shadow: 0 6px 24px rgba(60,50,30,.12);
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -66,7 +64,7 @@ a { color: var(--accent2); }
 .small { font-size: 12.5px; }
 .mon-list { display: flex; flex-direction: column; max-height: 62vh; overflow: auto; }
 .mon-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 6px; border-bottom: 1px solid var(--border); font-size: 13px; }
-.mon-chip { background: color-mix(in srgb, var(--accent2) 16%, transparent); color: var(--accent2); padding: 2px 8px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.mon-chip { background: var(--panel2); color: var(--muted); border: 1px solid var(--border); padding: 2px 8px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
 .mon-kind { color: var(--muted); width: 44px; flex: none; }
 .mon-prev { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mon-meta { color: var(--muted); font-size: 11px; white-space: nowrap; flex: none; }
@@ -102,7 +100,7 @@ a { color: var(--accent2); }
 .sidebar .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 16px; }
 .sidebar .brand .mark {
   width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
-  background: linear-gradient(135deg, var(--accent), var(--accent2)); font-size: 18px;
+  background: var(--accent); font-size: 18px;
 }
 .sidebar .brand b { font-size: 16px; }
 .sidebar .brand .srv { font-size: 12px; color: var(--muted); }
@@ -113,7 +111,7 @@ a { color: var(--accent2); }
   padding: 10px 12px; border-radius: 9px; font-size: 14px; font-weight: 600;
 }
 .nav button:hover { background: var(--panel2); color: var(--text); }
-.nav button.active { background: color-mix(in srgb, var(--accent) 22%, transparent); color: #fff; }
+.nav button.active { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text); border-left: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); }
 .nav button .ic { width: 20px; text-align: center; }
 .sidebar .foot { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .sidebar .who { font-size: 12px; color: var(--muted); padding: 0 8px; }
@@ -145,7 +143,7 @@ input[type=text], input[type=password], input[type=number] {
   width: 100%; padding: 10px 12px; background: var(--panel2); color: var(--text);
   border: 1px solid var(--border); border-radius: 9px; font-size: 14px;
 }
-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+input:focus { outline: none; border-width: 1.5px; border-color: var(--accent); box-shadow: none; }
 .help { font-size: 12px; color: var(--muted); margin-top: 5px; }
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 20px; }
 .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
@@ -164,12 +162,12 @@ input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px 
 /* ---------- buttons ---------- */
 button.btn, .btn {
   cursor: pointer; border: none; border-radius: 9px; padding: 10px 16px;
-  font-size: 14px; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent-press)); color: #fff;
+  font-size: 14px; font-weight: 700; background: var(--accent); color: #fff;
 }
 .btn:hover { filter: brightness(1.08); }
 .btn:disabled { opacity: .5; cursor: default; filter: none; }
 .btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
-.btn.ghost:hover { background: #232c3d; filter: none; }
+.btn.ghost:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--panel2); filter: none; }
 .btn.danger { background: transparent; color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); }
 .btn.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); filter: none; }
 .btn.sm { padding: 6px 11px; font-size: 12.5px; }
@@ -202,14 +200,14 @@ pre.payload {
 .toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 10px; z-index: 50; }
 .toast {
   background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
-  border-radius: 10px; padding: 12px 16px; box-shadow: var(--shadow); max-width: 340px;
+  border-radius: 10px; padding: 12px 16px; max-width: 340px;
   animation: slidein .18s ease; font-size: 13.5px;
 }
 .toast.ok { border-left-color: var(--ok); }
 .toast.err { border-left-color: var(--danger); }
 @keyframes slidein { from { transform: translateY(8px); opacity: 0; } }
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 60; padding: 20px; }
-.modal { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; max-width: 420px; width: 100%; box-shadow: var(--shadow); }
+.modal { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; max-width: 420px; width: 100%; }
 .modal h3 { margin: 0 0 8px; }
 .modal p { color: var(--muted); margin: 0 0 18px; }
 .modal .row { justify-content: flex-end; }
@@ -234,7 +232,7 @@ pre.payload {
 /* ---------- theme controls ---------- */
 .modebar { display: flex; gap: 6px; margin: 4px 0 12px; }
 .modebar button { flex: 1; padding: 9px 0; border-radius: 9px; cursor: pointer; background: var(--panel2); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
-.modebar button.sel { background: linear-gradient(135deg, var(--accent), var(--accent-press)); color: #fff; border-color: transparent; }
+.modebar button.sel { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 .slider { display: grid; grid-template-columns: 96px 1fr 48px; align-items: center; gap: 10px; margin: 10px 0; }
 .slider label { margin: 0; }
 .slider .val { color: var(--muted); font-size: 12px; text-align: right; }

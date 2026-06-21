@@ -11,6 +11,7 @@ import android.provider.Settings as AndroidSettings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,6 +27,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -63,6 +65,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.copysync.android.data.ClipEntity
@@ -243,6 +246,7 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
     val settings = remember { Settings(ctx) }
     val status by SyncState.status.collectAsState()
     val connected by SyncState.connected.collectAsState()
+    val running by SyncState.running.collectAsState()
     val lastEvent by SyncState.lastEvent.collectAsState()
 
     Column(
@@ -250,19 +254,36 @@ private fun ConnectionTab(onUnpair: () -> Unit) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("CopySync", style = MaterialTheme.typography.headlineMedium)
+        // Status pill (DESIGN.md): tinted container + leading colored dot + label
+        // drawn in the status color. connected=success, running-but-not-connected
+        // =warn (재연결 중), stopped/offline=danger. Never white-on-fill.
+        val statusColor = when {
+            connected -> successColor()
+            running -> warnColor()
+            else -> MaterialTheme.colorScheme.error
+        }
+        val statusLabel = when {
+            connected -> "연결됨"
+            running -> "재연결 중"
+            else -> "연결 끊김"
+        }
         Card(
-            Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
-                containerColor = if (connected) Color(0xFF16A34A) else Color(0xFF9E9E9E),
-                contentColor = Color.White,
+                containerColor = statusColor.copy(alpha = 0.16f),
+                contentColor = statusColor,
             ),
         ) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(if (connected) "● 연결됨" else "○ 오프라인", style = MaterialTheme.typography.titleMedium)
-                Text(status, style = MaterialTheme.typography.bodyMedium)
-                if (lastEvent.isNotEmpty()) Text("최근: $lastEvent", style = MaterialTheme.typography.bodySmall)
+            Row(
+                Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                StatusDot(statusColor)
+                Text(statusLabel, color = statusColor, style = MaterialTheme.typography.titleMedium)
             }
         }
+        Text(status, style = MaterialTheme.typography.bodyMedium)
+        if (lastEvent.isNotEmpty()) Text("최근: $lastEvent", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         InfoRow("서버", "${settings.serverName ?: "?"}")
         InfoRow("주소", "${settings.serverUrl ?: "?"}")
         InfoRow("기기 이름", "${settings.deviceName ?: "?"}")
@@ -293,7 +314,7 @@ private fun PoolCard() {
             Text("공유 풀", style = MaterialTheme.typography.titleSmall)
             Text(
                 "같은 풀의 기기끼리만 동기화됩니다 · 현재: $current",
-                style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             val list = if (pools.isEmpty()) listOf("default") else pools
             Row(
@@ -318,11 +339,11 @@ private fun RoutingCard() {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("전송 대상", style = MaterialTheme.typography.titleSmall)
             if (roster.isEmpty()) {
-                Text("연결된 다른 기기가 없습니다 · 전체 전송", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("연결된 다른 기기가 없습니다 · 전체 전송", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 Text(
                     if (targets.isEmpty()) "전체 기기로 브로드캐스트" else "${targets.size}개 기기로만 전송",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 roster.forEach { d ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -334,8 +355,12 @@ private fun RoutingCard() {
                                 SyncState.targets.value = s
                             },
                         )
+                        // Presence dot: success when online, muted when offline
+                        // (replaces the monochrome ●/○ glyph inheriting text color).
+                        StatusDot(if (d.online) successColor() else MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp))
                         Text(
-                            "${if (d.online) "● " else "○ "}${d.name.ifEmpty { d.id.take(8) }}",
+                            d.name.ifEmpty { d.id.take(8) },
                             Modifier.weight(1f),
                             style = MaterialTheme.typography.bodyMedium,
                         )
@@ -352,9 +377,15 @@ private fun RoutingCard() {
 @Composable
 private fun InfoRow(label: String, value: String) {
     Row(Modifier.fillMaxWidth()) {
-        Text(label, modifier = Modifier.width(80.dp), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        Text(label, modifier = Modifier.width(80.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium)
     }
+}
+
+/** A solid colored status/presence dot (replaces monochrome ●/○ bullet glyphs). */
+@Composable
+private fun StatusDot(color: Color, size: Dp = 8.dp) {
+    Box(Modifier.size(size).clip(CircleShape).background(color))
 }
 
 // ---------------------------------------------------------------- 기록
@@ -384,7 +415,7 @@ private fun HistoryTab() {
         )
         Spacer(Modifier.size(8.dp))
         if (history.isEmpty()) {
-            Text("기록이 없습니다.", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            Text("기록이 없습니다.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(history, key = { it.rowid }) { e -> HistoryCard(e) }
@@ -404,7 +435,7 @@ private fun HistoryCard(e: ClipEntity) {
                 .setPrimaryClip(ClipData.newPlainText("CopySync", e.text))
             Toast.makeText(ctx, "클립보드에 복사됨", Toast.LENGTH_SHORT).show()
         },
-        colors = CardDefaults.cardColors(containerColor = categoryColor(e)),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
@@ -423,12 +454,15 @@ private fun HistoryCard(e: ClipEntity) {
             Column(Modifier.weight(1f)) {
                 val dir = if (e.direction == "in") "←" else "→"
                 val title = if (e.kind == "text") e.text.replace("\n", " ").trim() else e.name.ifEmpty { e.text }
-                Text("$dir $title", maxLines = 2, style = MaterialTheme.typography.bodyMedium)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    KindTag(e)
+                    Text("$dir $title", maxLines = 2, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                }
                 if (e.kind == "file" && e.mime.startsWith("text/") && e.localPath != null) {
                     val snip = rememberTextSnippet(ctx, e.localPath)
                     if (!snip.isNullOrEmpty()) Text(
                         snip.trim(), maxLines = 3,
-                        style = MaterialTheme.typography.bodySmall, color = Color(0xFF455A64),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 val meta = buildString {
@@ -439,7 +473,7 @@ private fun HistoryCard(e: ClipEntity) {
                     }
                     append(relTime(e.ts))
                 }
-                Text(meta, style = MaterialTheme.typography.bodySmall, color = Color(0xFF607D8B))
+                Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             val canDownload = e.direction == "in" && e.blobId.isNotEmpty() &&
                 (e.kind == "file" || e.kind == "image") && e.localPath == null
@@ -447,9 +481,33 @@ private fun HistoryCard(e: ClipEntity) {
                 canDownload -> TextButton(onClick = {
                     PendingDownload.req.value = DownloadReq(e.blobId, e.name.ifEmpty { "file" }, e.mime, e.rowid, e.enc)
                 }) { Text("⬇ 받기") }
-                e.localPath != null -> Text("✓ 저장됨", style = MaterialTheme.typography.bodySmall, color = Color(0xFF16A34A))
+                e.localPath != null -> Text("✓ 저장됨", style = MaterialTheme.typography.bodySmall, color = successColor())
             }
         }
+    }
+}
+
+/**
+ * Small kind-tag chip (DESIGN.md): container = tagColor @ 18% (dark) / 14% (light),
+ * label drawn in tagColor. Three reserved hues — text/image/file.
+ */
+@Composable
+private fun KindTag(e: ClipEntity) {
+    val dark = isDarkTheme()
+    val m = e.mime.lowercase()
+    val (label, tagColor) = when {
+        e.kind == "text" -> "📝 텍스트" to (if (dark) Color(0xFF3FB94F) else Color(0xFF117A33))
+        e.kind == "image" || m.startsWith("image/") || m.startsWith("video/") ->
+            "🖼 이미지" to (if (dark) Color(0xFFA78BFA) else Color(0xFF7E22CE))
+        else -> "📎 파일" to (if (dark) Color(0xFF5B9CF6) else Color(0xFF1D4ED8))
+    }
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(tagColor.copy(alpha = if (dark) 0.18f else 0.14f))
+            .padding(horizontal = 7.dp, vertical = 2.dp),
+    ) {
+        Text(label, color = tagColor, fontSize = 11.5.sp)
     }
 }
 
@@ -476,7 +534,7 @@ private fun SettingsTab() {
                 Text("E2E 암호화 (선택)", style = MaterialTheme.typography.titleSmall)
                 Text(
                     "모든 기기에 같은 패스프레이즈를 입력하면 서버가 클립 내용을 볼 수 없습니다(영지식). 비우면 끔.",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedTextField(e2ePass, { e2ePass = it }, label = { Text("패스프레이즈") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -505,7 +563,7 @@ private fun SettingsTab() {
                 }
                 Text(
                     "백그라운드에서 다른 앱의 복사를 잡으려면 READ_LOGS도 필요합니다 (디버깅 탭의 ADB/Shizuku 명령 참고).",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -516,12 +574,12 @@ private fun SettingsTab() {
                     Text("민감 클립 동기화 제외", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                     Switch(checked = excludeSens, onCheckedChange = { excludeSens = it; settings.excludeSensitive = it })
                 }
-                Text("비밀번호·카드·키 등으로 추정되는 클립은 다른 기기로 보내지 않습니다.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("비밀번호·카드·키 등으로 추정되는 클립은 다른 기기로 보내지 않습니다.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Text("받은 항목 민감 표시", modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                     Switch(checked = sensitive, onCheckedChange = { sensitive = it; settings.sensitiveMark = it })
                 }
-                Text("자동 삭제 (받은 뒤 클립보드 비우기)", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("자동 삭제 (받은 뒤 클립보드 비우기)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(0 to "끔", 30 to "30초", 60 to "1분", 300 to "5분").forEach { (s, label) ->
                         if (autoClear == s) {
@@ -545,7 +603,7 @@ private fun SettingsTab() {
         }
         Text(
             "큰 파일은 클립보드로 못 보냅니다 — 다른 앱에서 공유 → CopySync 로 보내세요.",
-            style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -584,7 +642,7 @@ private fun DebugTab() {
                 Text(
                     if (dbgOn) "모든 동기화·캡처 이벤트 기록 중 (${dbgLines.size}줄). 문제를 재현한 뒤 공유하세요."
                     else "켜면 모든 이벤트를 기록합니다 (개발/디버깅용).",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(enabled = dbgLines.isNotEmpty(), onClick = {
@@ -622,7 +680,7 @@ private fun DebugTab() {
                 }
                 Text(
                     "부여 후 앱을 완전히 종료했다가 다시 여세요 (logcat 권한 적용).",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -630,20 +688,6 @@ private fun DebugTab() {
 }
 
 // ---------------------------------------------------------------- helpers
-
-private fun categoryColor(e: ClipEntity): Color {
-    val m = e.mime.lowercase()
-    val ext = e.name.substringAfterLast('.', "").lowercase()
-    return when {
-        e.kind == "text" -> Color(0xFFF1F3F4)
-        m.startsWith("image/") -> Color(0xFFE3F2FD)
-        m.startsWith("video/") -> Color(0xFFF3E5F5)
-        m.startsWith("audio/") -> Color(0xFFE0F2F1)
-        m.contains("pdf") || ext in setOf("doc", "docx", "txt", "md", "rtf", "odt", "hwp") -> Color(0xFFFFF3E0)
-        ext in setOf("zip", "rar", "7z", "tar", "gz", "apk") -> Color(0xFFFFF8E1)
-        else -> Color(0xFFECEFF1)
-    }
-}
 
 private fun iconFor(e: ClipEntity): String {
     val m = e.mime.lowercase()

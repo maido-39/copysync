@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,7 +36,7 @@ import com.copysync.android.sync.BlockedClip
 import com.copysync.android.sync.SyncState
 import kotlinx.coroutines.delay
 
-private val Pink = Color(0xFFEC4899)
+private val Pink = Color(0xFFE0588F) // blocked_pink token (DESIGN.md)
 
 private fun reasonKo(label: String): String = when (label) {
     "password-like" -> "비밀번호로 추정"
@@ -74,10 +73,18 @@ fun BlockedToastOverlay() {
             exit = fadeOut() + slideOutVertically { it / 2 },
         ) {
             last.value?.let { t ->
+                // Paint an OPAQUE backing surface first, then the pink tint on top —
+                // egui's Area / Compose overlay has no backdrop, so a translucent fill
+                // would composite over whatever screen is behind it (DESIGN.md fix).
+                val dark = isDarkTheme()
+                val surface = if (dark) Color(0xFF482B31) else Color(0xFFFDE7F1)
+                val title = if (dark) Color(0xFFFBCFE8) else Color(0xFF9D174D)
+                val preview = if (dark) Color(0xFFEDE8DF) else Color(0xFF831843)
+                val chipText = if (dark) Color(0xFFFCE7F3) else Color(0xFF9D174D)
                 Row(
                     Modifier.fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Pink.copy(alpha = 0.22f))
+                        .background(surface)
                         .border(1.dp, Pink.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
                         .padding(14.dp),
                     verticalAlignment = Alignment.Top,
@@ -86,16 +93,16 @@ fun BlockedToastOverlay() {
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("동기화 차단됨", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("동기화 차단됨", color = title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                             Spacer(Modifier.width(6.dp))
                             Text(
                                 reasonKo(t.reason),
-                                color = Color.White,
+                                color = chipText,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(999.dp))
-                                    .background(Pink.copy(alpha = 0.92f))
+                                    .background(Pink.copy(alpha = 0.40f))
                                     .padding(horizontal = 8.dp, vertical = 1.dp),
                             )
                         }
@@ -105,7 +112,7 @@ fun BlockedToastOverlay() {
                             fontSize = 12.sp,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
-                            color = LocalContentColor.current.copy(alpha = 0.72f),
+                            color = preview,
                         )
                     }
                 }
