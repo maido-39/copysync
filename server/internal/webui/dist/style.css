@@ -23,6 +23,7 @@
   --bg-zoom: 1;
   --bg-x: 50%;
   --bg-y: 50%;
+  --scrim: 0; /* readability wash over a bg image; flipped on by JS when one is set */
   --panel: rgba(var(--panel-rgb), var(--card-opacity));
   --panel2: rgba(var(--panel2-rgb), calc(0.4 + var(--card-opacity) * 0.6));
 }
@@ -57,6 +58,8 @@ body {
   filter: blur(var(--bg-blur)) brightness(var(--bg-bright));
   transform: scale(calc(var(--bg-zoom) * 1.06)); transform-origin: center;
 }
+/* Readability scrim over the wallpaper — see clients/desktop/ui/style.css. */
+.app-bg::after { content: ""; position: absolute; inset: 0; background: rgba(var(--bg-rgb), var(--scrim)); }
 .sidebar, .card, .tile { -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
 a { color: var(--accent2); }
 .muted { color: var(--muted); }

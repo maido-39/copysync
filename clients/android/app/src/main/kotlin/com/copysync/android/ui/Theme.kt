@@ -125,7 +125,7 @@ fun CopySyncTheme(content: @Composable () -> Unit) {
     }
     MaterialTheme(colorScheme = scheme) {
         androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-            if (bgPath.isNotEmpty()) ThemeBackground()
+            if (bgPath.isNotEmpty()) ThemeBackground(dark)
             Surface(color = Color.Transparent, contentColor = MaterialTheme.colorScheme.onBackground, modifier = Modifier.fillMaxSize()) {
                 content()
             }
@@ -134,7 +134,7 @@ fun CopySyncTheme(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun ThemeBackground() {
+private fun ThemeBackground(dark: Boolean) {
     val path by ThemeState.bgPath.collectAsState()
     val bright by ThemeState.brightness.collectAsState()
     val blurR by ThemeState.blur.collectAsState()
@@ -150,9 +150,12 @@ private fun ThemeBackground() {
         contentScale = ContentScale.Crop,
         alignment = BiasAlignment(bx.coerceIn(-1f, 1f), by.coerceIn(-1f, 1f)),
     )
-    val dim = (1f - bright).coerceIn(0f, 1f)
+    // Readability scrim: with a wallpaper set, always wash it toward the theme
+    // (darken in dark mode / lighten in light mode) so translucent surfaces keep
+    // enough contrast even over a bright photo — regardless of the brightness slider.
+    val dim = maxOf(if (dark) 0.45f else 0f, 1f - bright).coerceIn(0f, 1f)
     if (dim > 0f) androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = dim)))
-    val lighten = ((bright - 1f) * 0.6f).coerceIn(0f, 0.6f)
+    val lighten = maxOf(if (!dark) 0.40f else 0f, (bright - 1f) * 0.6f).coerceIn(0f, 0.6f)
     if (lighten > 0f) androidx.compose.foundation.layout.Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = lighten)))
 }
 

@@ -577,6 +577,7 @@
     r.setAttribute("data-theme", mode === "light" ? "light" : "dark");
     if (!document.querySelector(".app-bg")) document.body.appendChild(el("div", { class: "app-bg" }));
     r.style.setProperty("--bg-img", theme.img ? 'url("' + theme.img + '")' : "none");
+    r.style.setProperty("--scrim", theme.img ? "0.62" : "0"); // readability wash over a wallpaper
     r.style.setProperty("--bg-x", theme.x + "%");
     r.style.setProperty("--bg-y", theme.y + "%");
     r.style.setProperty("--bg-zoom", theme.zoom);

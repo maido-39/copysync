@@ -401,6 +401,7 @@ function applyTheme() {
   const resolved = theme.mode === "system" ? (darkMql && !darkMql.matches ? "light" : "dark") : theme.mode;
   root.dataset.theme = resolved === "light" ? "light" : "dark";
   root.style.setProperty("--bg-img", theme.img ? `url("${theme.img}")` : "none");
+  root.style.setProperty("--scrim", theme.img ? "0.62" : "0"); // readability wash over a wallpaper
   root.style.setProperty("--bg-x", theme.x + "%");
   root.style.setProperty("--bg-y", theme.y + "%");
   root.style.setProperty("--bg-zoom", theme.zoom);

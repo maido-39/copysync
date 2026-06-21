@@ -21,6 +21,7 @@
   --bg-zoom: 1;
   --bg-x: 50%;
   --bg-y: 50%;
+  --scrim: 0; /* readability wash over a bg image; flipped on by JS when one is set */
 
   /* Derived surfaces — BOTH tiers honor --card-opacity so the "박스 투명도"
      slider applies to every surface (cards, list items, inputs, buttons…).
@@ -172,6 +173,10 @@ label.dev { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor
   filter: blur(var(--bg-blur)) brightness(var(--bg-bright));
   transform: scale(calc(var(--bg-zoom) * 1.06)); transform-origin: center;
 }
+/* Readability scrim: a theme-colored wash over the wallpaper so glassy surfaces
+   always sit on a dark-enough (dark mode) / light-enough (light mode) backdrop.
+   --scrim is 0 (invisible) unless a bg image is set, so the no-image UI is untouched. */
+.app-bg::after { content: ""; position: absolute; inset: 0; background: rgba(var(--bg-rgb), var(--scrim)); }
 header, nav#tabs, .card, .item { -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
 
 /* ---- theme controls ------------------------------------------------------ */
