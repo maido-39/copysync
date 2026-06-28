@@ -101,6 +101,10 @@ pub enum Request {
     Reconnect,
     /// Ask the agent to push [`Event`]s on this connection from now on.
     Subscribe,
+    /// Ask the agent to stop the engine and terminate its own process. Sent by
+    /// the GUI's tray "종료" before it exits itself, so nothing lingers. The agent
+    /// best-effort replies [`Response::Ok`] then `process::exit(0)`s.
+    Shutdown,
 }
 
 /// agent → GUI: a direct reply to a [`Request`].

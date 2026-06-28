@@ -634,6 +634,17 @@ struct Prefs {
     theme: ThemeMode,
     /// Accelerator string for the quick-panel hotkey, e.g. "Ctrl+Shift+V".
     hotkey: String,
+    /// Absolute path to the background wallpaper image, or empty for none.
+    bg_path: String,
+    /// Wallpaper zoom (1.0 = cover the panel). Mirrors the web "확대" slider.
+    bg_zoom: f32,
+    /// Brightness multiplier applied to the wallpaper pixels (1.0 = unchanged).
+    bg_brightness: f32,
+    /// Gaussian blur sigma in pixels applied once at decode time (0 = none).
+    bg_blur: f32,
+    /// Card/panel fill opacity (1.0 = opaque). Lowered so the wallpaper shows
+    /// through the cards; only meaningful when a wallpaper is set.
+    card_opacity: f32,
 }
 
 impl Default for Prefs {
@@ -641,6 +652,12 @@ impl Default for Prefs {
         Self {
             theme: ThemeMode::System,
             hotkey: DEFAULT_HOTKEY.to_string(),
+            // Mirrors the web client's `themeDefaults`.
+            bg_path: String::new(),
+            bg_zoom: 1.0,
+            bg_brightness: 1.0,
+            bg_blur: 0.0,
+            card_opacity: 1.0,
         }
     }
 }
@@ -666,6 +683,23 @@ fn load_prefs() -> Prefs {
                 prefs.hotkey = h.to_string();
             }
         }
+        // Wallpaper controls — each is optional and falls back to its default,
+        // so an old theme-only/hotkey-only file still loads cleanly.
+        if let Some(p) = v.get("bg_path").and_then(|p| p.as_str()) {
+            prefs.bg_path = p.to_string();
+        }
+        if let Some(z) = v.get("bg_zoom").and_then(|z| z.as_f64()) {
+            prefs.bg_zoom = z as f32;
+        }
+        if let Some(b) = v.get("bg_brightness").and_then(|b| b.as_f64()) {
+            prefs.bg_brightness = b as f32;
+        }
+        if let Some(b) = v.get("bg_blur").and_then(|b| b.as_f64()) {
+            prefs.bg_blur = b as f32;
+        }
+        if let Some(o) = v.get("card_opacity").and_then(|o| o.as_f64()) {
+            prefs.card_opacity = o as f32;
+        }
     }
     prefs
 }
@@ -679,8 +713,129 @@ fn save_prefs(prefs: &Prefs) {
     let body = serde_json::json!({
         "theme": prefs.theme.as_str(),
         "hotkey": prefs.hotkey,
+        "bg_path": prefs.bg_path,
+        "bg_zoom": prefs.bg_zoom,
+        "bg_brightness": prefs.bg_brightness,
+        "bg_blur": prefs.bg_blur,
+        "card_opacity": prefs.card_opacity,
     });
     let _ = std::fs::write(&p, serde_json::to_vec_pretty(&body).unwrap_or_default());
+}
+
+// ============================================================ background image
+//
+// Mirrors the web/Android clients' 화면 wallpaper feature. The picked image is
+// decoded once, brightness-scaled, gaussian-blurred, and uploaded as a single
+// egui texture cached here; we only rebuild it when the path / brightness / blur
+// change (NOT per-frame — those ops are far too costly for the render loop). The
+// `zoom` and `card_opacity` are cheap, applied live at paint time, so they don't
+// trigger a rebuild.
+
+/// Cap the decoded wallpaper's longest edge so a huge photo doesn't blow up GPU
+/// memory or the one-off blur cost (the web client caps at 1600 too).
+const BG_MAX_EDGE: u32 = 1600;
+
+/// All wallpaper state: the persisted controls plus the lazily-built texture and
+/// the inputs it was built from (so we can detect when a rebuild is needed).
+struct BgImage {
+    path: String,
+    zoom: f32,
+    brightness: f32,
+    blur: f32,
+    card_opacity: f32,
+    /// The cached processed texture (None when there's no/failed image).
+    texture: Option<egui::TextureHandle>,
+    /// The (path, brightness, blur) the current `texture` was built from. A change
+    /// vs. the live controls means we must rebuild; zoom/opacity are excluded
+    /// because they're applied at paint time, not baked into the texture.
+    built_from: Option<(String, u32, u32)>,
+}
+
+impl BgImage {
+    fn from_prefs(p: &Prefs) -> Self {
+        Self {
+            path: p.bg_path.clone(),
+            zoom: p.bg_zoom,
+            brightness: p.bg_brightness,
+            blur: p.bg_blur,
+            card_opacity: p.card_opacity,
+            texture: None,
+            built_from: None,
+        }
+    }
+
+    /// A stable key for the current decode inputs. Floats are quantized to whole
+    /// units (brightness ×100, blur ×10) so tiny slider jitter doesn't thrash the
+    /// rebuild, matching how the sliders step.
+    fn decode_key(&self) -> (String, u32, u32) {
+        (
+            self.path.clone(),
+            (self.brightness.clamp(0.0, 4.0) * 100.0).round() as u32,
+            (self.blur.clamp(0.0, 40.0) * 10.0).round() as u32,
+        )
+    }
+
+    /// Whether the cached texture still matches the live decode inputs.
+    fn needs_rebuild(&self) -> bool {
+        match (&self.built_from, self.path.is_empty()) {
+            // No image wanted: stale only if a texture is still cached.
+            (_, true) => self.texture.is_some(),
+            // Image wanted: rebuild if never built or inputs changed.
+            (None, false) => true,
+            (Some(key), false) => *key != self.decode_key(),
+        }
+    }
+
+    /// Clear the path + cached texture ("제거").
+    fn clear(&mut self) {
+        self.path.clear();
+        self.texture = None;
+        self.built_from = None;
+    }
+}
+
+/// Decode `path`, apply `brightness` then a one-off gaussian `blur`, and return a
+/// `(rgba_bytes, [w,h])` pair ready for `ColorImage::from_rgba_unmultiplied`.
+/// Returns `Err` (never panics) on a missing/unreadable/undecodable file so the
+/// caller can just log it and show no wallpaper. Runs entirely on `image`'s pure-
+/// Rust PNG/JPEG codecs — no system libs, so it cross-compiles to windows-gnu.
+fn decode_wallpaper(path: &str, brightness: f32, blur: f32) -> Result<(Vec<u8>, [usize; 2])> {
+    let img = image::ImageReader::open(path)
+        .with_context(|| format!("배경 이미지 열기 실패: {path}"))?
+        .with_guessed_format()
+        .context("배경 이미지 형식 추정 실패")?
+        .decode()
+        .context("배경 이미지 디코드 실패")?;
+
+    // Downscale the longest edge to BG_MAX_EDGE to bound texture/blur cost.
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    let mut rgba = if longest > BG_MAX_EDGE {
+        let scale = BG_MAX_EDGE as f32 / longest as f32;
+        let nw = (w as f32 * scale).round().max(1.0) as u32;
+        let nh = (h as f32 * scale).round().max(1.0) as u32;
+        image::imageops::resize(&img.to_rgba8(), nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        img.to_rgba8()
+    };
+
+    // Brightness: scale each RGB channel (leave alpha), saturating at 255. 1.0 is
+    // a no-op so we skip the per-pixel loop in the common case.
+    if (brightness - 1.0).abs() > f32::EPSILON {
+        for px in rgba.pixels_mut() {
+            for c in 0..3 {
+                px[c] = (px[c] as f32 * brightness).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    // Gaussian blur ONCE here (not per-frame). `blur` is the sigma in px.
+    if blur > 0.05 {
+        rgba = image::imageops::blur(&rgba, blur);
+    }
+
+    let dims = [rgba.width() as usize, rgba.height() as usize];
+    Ok((rgba.into_raw(), dims))
 }
 
 // ============================================================ app state
@@ -772,9 +927,12 @@ struct App {
     hotkey_input: String,
     // Mirror of the OS login-autostart state for the agent (checkbox value).
     autostart_on: bool,
-    // Set when the user picks the real-exit path (tray 종료); on the next frame
-    // `update()` issues `ViewportCommand::Close` so the window can actually quit.
-    really_quit: bool,
+
+    // ---- background wallpaper (parity with the web/Android clients) ----
+    // Persisted controls + the cached, pre-processed texture. The texture is
+    // (re)built ONLY when an input below changes (see `refresh_wallpaper`), never
+    // per-frame — decode + brightness + gaussian blur are too costly for that.
+    bg: BgImage,
 
     // one-time post-connect bootstrap (initial history/roster pull)
     bootstrapped: bool,
@@ -846,7 +1004,7 @@ impl App {
             hotkey_current,
             hotkey_input: prefs.hotkey,
             autostart_on,
-            really_quit: false,
+            bg: BgImage::from_prefs(&prefs),
             bootstrapped: false,
         };
         // Stash any init warnings so they show up once recording is on / forced.
@@ -862,6 +1020,11 @@ impl App {
         Prefs {
             theme: self.theme_mode,
             hotkey: self.hotkey_input.clone(),
+            bg_path: self.bg.path.clone(),
+            bg_zoom: self.bg.zoom,
+            bg_brightness: self.bg.brightness,
+            bg_blur: self.bg.blur,
+            card_opacity: self.bg.card_opacity,
         }
     }
 
@@ -870,6 +1033,19 @@ impl App {
     fn show_window(&self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Full quit (tray "종료"): tell the agent to shut down (best-effort), then
+    /// hard-exit this process. We use `process::exit` rather than the normal
+    /// `ViewportCommand::Close` because eframe leaves daemon threads (the event
+    /// thread, tray, and global-hotkey pumps) alive after `run_native` returns,
+    /// which is exactly why `copysync-gui` was lingering in the background.
+    /// `process::exit(0)` guarantees every thread is torn down.
+    fn really_quit(&mut self) {
+        self.logline(true, "종료 요청 — 에이전트 정지 후 GUI 종료");
+        // Best-effort: ignore any IPC error (agent already gone, etc.).
+        let _ = request(&Request::Shutdown);
+        std::process::exit(0);
     }
 
     /// Apply a new accelerator string: parse it, unregister the old hotkey, and
@@ -911,12 +1087,7 @@ impl App {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             match ev.id.as_ref() {
                 TRAY_OPEN_ID => self.show_window(ctx),
-                TRAY_QUIT_ID => {
-                    // Real exit: flag it so `update()` issues Close next frame.
-                    self.really_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.request_repaint();
-                }
+                TRAY_QUIT_ID => self.really_quit(),
                 _ => {}
             }
         }
@@ -952,8 +1123,99 @@ impl App {
     /// Install the custom `Visuals` for the active theme (DESIGN.md §3), replacing
     /// the raw `dark()/light()` defaults. Called on theme change and every frame
     /// from `update()` (the build is cheap and keeps "system" tracking the OS).
+    /// When a wallpaper is active we lower the card/panel/window fill alpha by
+    /// `card_opacity` so the image shows through; with no wallpaper (or opacity 1)
+    /// the surfaces stay fully opaque, preserving the original look.
     fn apply_theme(&self, ctx: &egui::Context) {
-        ctx.set_visuals(self.palette(ctx).visuals());
+        let pal = self.palette(ctx);
+        let mut v = pal.visuals();
+        let has_bg = !self.bg.path.is_empty() && self.bg.texture.is_some();
+        if has_bg && self.bg.card_opacity < 0.999 {
+            let a = (self.bg.card_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let translucent = |c: Color32| {
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+            };
+            // Panel/window/input surfaces become translucent over the wallpaper.
+            // The central panel fill stays fully transparent (see `paint_wallpaper`)
+            // so the image is visible; cards/top-bar/inputs ride at `card_opacity`.
+            v.window_fill = translucent(v.window_fill);
+            v.extreme_bg_color = translucent(v.extreme_bg_color);
+            v.faint_bg_color = translucent(v.faint_bg_color);
+            for ws in [
+                &mut v.widgets.noninteractive,
+                &mut v.widgets.inactive,
+                &mut v.widgets.hovered,
+                &mut v.widgets.open,
+            ] {
+                ws.bg_fill = translucent(ws.bg_fill);
+                ws.weak_bg_fill = translucent(ws.weak_bg_fill);
+            }
+        }
+        ctx.set_visuals(v);
+    }
+
+    /// Rebuild the cached wallpaper texture if (and only if) its decode inputs
+    /// changed since last time — debounced by `BgImage::needs_rebuild`, so slider
+    /// drags recompute on change, never per-frame. A missing/unreadable image just
+    /// logs and leaves no wallpaper; it never panics.
+    fn refresh_wallpaper(&mut self, ctx: &egui::Context) {
+        if !self.bg.needs_rebuild() {
+            return;
+        }
+        if self.bg.path.is_empty() {
+            self.bg.texture = None;
+            self.bg.built_from = None;
+            return;
+        }
+        let key = self.bg.decode_key();
+        match decode_wallpaper(&self.bg.path, self.bg.brightness, self.bg.blur) {
+            Ok((rgba, dims)) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied(dims, &rgba);
+                let tex = ctx.load_texture("cs_wallpaper", img, egui::TextureOptions::LINEAR);
+                self.bg.texture = Some(tex);
+                self.bg.built_from = Some(key);
+                self.logline(false, format!("배경 이미지 적용 {}×{}", dims[0], dims[1]));
+            }
+            Err(e) => {
+                // Robust: drop the broken image, log, show no wallpaper.
+                self.bg.texture = None;
+                self.bg.built_from = Some(key); // don't retry until inputs change
+                self.logline(true, format!("배경 이미지 실패: {e}"));
+            }
+        }
+    }
+
+    /// Paint the cached wallpaper as the background of the central-panel `rect`,
+    /// honoring `zoom`, centered, beneath all content. No-op when no texture is
+    /// loaded. Drawn first inside the central panel so every card sits on top.
+    fn paint_wallpaper(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(tex) = self.bg.texture.as_ref() else {
+            return;
+        };
+        let tex_size = tex.size_vec2();
+        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+            return;
+        }
+        // "cover" the panel: scale so the image fills `rect` on both axes, then
+        // apply the user zoom on top. UVs are derived from the centered overlap so
+        // we crop (not letterbox) — matching the web client's background-size/cover.
+        let base = (rect.width() / tex_size.x).max(rect.height() / tex_size.y);
+        let scale = base * self.bg.zoom.max(0.05);
+        let drawn = tex_size * scale; // image size in screen px at this scale
+        // Fraction of the image actually visible inside `rect`, on each axis.
+        let u = (rect.width() / drawn.x).min(1.0);
+        let v = (rect.height() / drawn.y).min(1.0);
+        // Center the crop window.
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.5 - u / 2.0, 0.5 - v / 2.0),
+            egui::pos2(0.5 + u / 2.0, 0.5 + v / 2.0),
+        );
+        ui.painter().image(
+            tex.id(),
+            rect,
+            uv,
+            Color32::WHITE,
+        );
     }
 
     fn logline(&mut self, force: bool, msg: impl Into<String>) {
@@ -1128,9 +1390,15 @@ fn chrono_lite_now() -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Rebuild the wallpaper texture first if its decode inputs changed (debounced
+        // — never per-frame). Done before `apply_theme` so the card-opacity decision
+        // below sees whether a wallpaper is actually loaded this frame.
+        self.refresh_wallpaper(ctx);
+
         // Re-assert the "Warm Trust" visuals every frame. It's cheap (a const
         // palette pick) and keeps "system" mode tracking the OS dark/light flag,
-        // which eframe can flip out from under us between frames.
+        // which eframe can flip out from under us between frames. When a wallpaper
+        // is set it also lowers card/panel fill alpha by `card_opacity`.
         self.apply_theme(ctx);
 
         // Create the tray lazily on the first frame: on Windows the tray needs a
@@ -1155,15 +1423,15 @@ impl eframe::App for App {
         }
 
         // Poll the three desktop-shell channels (tray menu/icon + global hotkey).
+        // The tray "종료" handler calls `really_quit()`, which `process::exit`s
+        // directly, so there's no quit flag to check here.
         self.pump_shell_events(ctx);
 
-        // Real-exit path: the tray "종료" set `really_quit`, so close the window
-        // for good. The agent keeps running — only the GUI process exits.
-        if self.really_quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) {
-            // Close-to-tray: the user clicked the window's X. Cancel the close
-            // and just hide the window; reopen via tray "열기" or the hotkey.
+        // Close-to-tray: the user clicked the window's X. Cancel the close and
+        // just hide the window — sync keeps running via the agent. Reopen via the
+        // tray ("열기" / left-click) or the quick-panel hotkey. A plain X must NOT
+        // end the process; only the tray "종료" does.
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -1183,11 +1451,27 @@ impl eframe::App for App {
 
         self.top_bar(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Connect => self.tab_connect(ui),
-            Tab::History => self.tab_history(ui),
-            Tab::Settings => self.tab_settings(ui, ctx),
-            Tab::Debug => self.tab_debug(ui),
+        // When a wallpaper is loaded, give the central panel a TRANSPARENT fill so
+        // the image (painted first, below) shows through behind the cards; without
+        // one we keep egui's opaque panel fill (the original look).
+        let has_bg = self.bg.texture.is_some();
+        let central = if has_bg {
+            egui::CentralPanel::default().frame(egui::Frame::none())
+        } else {
+            egui::CentralPanel::default()
+        };
+        central.show(ctx, |ui| {
+            // Paint the wallpaper beneath all content, covering the panel rect.
+            if has_bg {
+                let rect = ui.max_rect();
+                self.paint_wallpaper(ui, rect);
+            }
+            match self.tab {
+                Tab::Connect => self.tab_connect(ui),
+                Tab::History => self.tab_history(ui),
+                Tab::Settings => self.tab_settings(ui, ctx),
+                Tab::Debug => self.tab_debug(ui),
+            }
         });
 
         self.blocked_toasts(ctx);
@@ -1384,10 +1668,14 @@ impl App {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            self.tab_button(ui, &pal, Tab::Debug, "🐞 디버깅");
-                            self.tab_button(ui, &pal, Tab::Settings, "⚙️ 설정");
-                            self.tab_button(ui, &pal, Tab::History, "📋 기록");
-                            self.tab_button(ui, &pal, Tab::Connect, "🔗 연결");
+                            // Text-only labels: egui's bundled emoji font renders
+                            // the U+FE0F variation selector (and several emoji) as a
+                            // □ tofu, which showed up before "설정"/etc. Plain Korean
+                            // glyphs (covered by the embedded Nanum font) never tofu.
+                            self.tab_button(ui, &pal, Tab::Debug, "디버깅");
+                            self.tab_button(ui, &pal, Tab::Settings, "설정");
+                            self.tab_button(ui, &pal, Tab::History, "기록");
+                            self.tab_button(ui, &pal, Tab::Connect, "연결");
                         },
                     );
                 });
@@ -1762,6 +2050,80 @@ impl App {
                         save_prefs(&self.prefs_snapshot());
                     }
                 });
+
+                // ---- background wallpaper (parity with the web/Android clients)
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("배경 이미지").size(13.0).color(pal.fg),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if Self::secondary_button(ui, &pal, "배경 이미지 선택…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("이미지", &["png", "jpg", "jpeg"])
+                            .pick_file()
+                        {
+                            self.bg.path = path.to_string_lossy().to_string();
+                            // A new image invalidates the cache; refresh_wallpaper
+                            // rebuilds on the next frame and persists via snapshot.
+                            self.bg.texture = None;
+                            self.bg.built_from = None;
+                            save_prefs(&self.prefs_snapshot());
+                            self.logline(true, "배경 이미지 선택");
+                        }
+                    }
+                    // "제거" only matters when an image is set.
+                    if !self.bg.path.is_empty()
+                        && Self::secondary_button(ui, &pal, "제거").clicked()
+                    {
+                        self.bg.clear();
+                        save_prefs(&self.prefs_snapshot());
+                        self.logline(true, "배경 이미지 제거");
+                    }
+                });
+
+                // Sliders only make sense once an image is chosen; mirror the web
+                // ranges. Persist on release so we don't rewrite the file each frame
+                // of a drag. zoom/brightness/blur change the *texture* inputs
+                // (debounced rebuild); card_opacity is applied live in `apply_theme`.
+                if !self.bg.path.is_empty() {
+                    ui.add_space(4.0);
+                    // Each row: label + slider. `changed` keeps the frame repainting
+                    // (so the debounced texture rebuild / live opacity follow the
+                    // drag); `drag_stopped` (release) is when we persist, avoiding a
+                    // file write per drag frame.
+                    let mut touched = false;
+                    let mut released = false;
+                    let row = |ui: &mut egui::Ui, label: &str, val: &mut f32,
+                                   range: std::ops::RangeInclusive<f32>,
+                                   touched: &mut bool, released: &mut bool| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(label).size(12.5).color(pal.muted));
+                            let r = ui.add(egui::Slider::new(val, range).show_value(true));
+                            if r.changed() {
+                                *touched = true;
+                            }
+                            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                                *released = true;
+                            }
+                        });
+                    };
+                    row(ui, "확대", &mut self.bg.zoom, 1.0..=3.0, &mut touched, &mut released);
+                    row(ui, "밝기", &mut self.bg.brightness, 0.3..=2.0, &mut touched, &mut released);
+                    row(ui, "흐림", &mut self.bg.blur, 0.0..=20.0, &mut touched, &mut released);
+                    row(ui, "박스 투명도", &mut self.bg.card_opacity, 0.2..=1.0, &mut touched, &mut released);
+                    // Persist when a drag finishes (or on a discrete keyboard step).
+                    if released {
+                        save_prefs(&self.prefs_snapshot());
+                    }
+                    // Keep repainting while the user is actively dragging a slider so
+                    // the debounced texture rebuild / live opacity track the value.
+                    if touched {
+                        ctx.request_repaint();
+                    }
+                }
             });
 
             ui.add_space(12.0);

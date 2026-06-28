@@ -505,6 +505,26 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
 
         // The streaming is handled in the connection loop; this is just an ack.
         Request::Subscribe => Outbound::Reply(Response::Ok),
+
+        // Real shutdown: stop the engine and terminate this process. We schedule
+        // the `process::exit(0)` on a short delay so the `Ok` reply below has a
+        // chance to flush back to the caller (the GUI's tray "종료") before the
+        // daemon dies; the GUI ignores the reply either way. Dropping the command
+        // sender closes the actor's channel so `engine::run` shuts down cleanly.
+        Request::Shutdown => {
+            dlog("Shutdown requested — stopping engine and exiting process");
+            // Drop the command sender so the running actor's `rx.recv()` returns
+            // None and it (plus the clipboard thread) winds down.
+            *engine.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Some(prev) = engine.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                prev.abort();
+            }
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::process::exit(0);
+            });
+            Outbound::Reply(Response::Ok)
+        }
     }
 }
 

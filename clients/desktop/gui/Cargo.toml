@@ -23,6 +23,11 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 dirs = "5"
 rfd = "0.15"
+# Background-image wallpaper feature (parity with the web/Android clients): decode
+# the picked PNG/JPEG, apply brightness + a one-off gaussian blur, then upload the
+# result as an egui texture. Pure-Rust codecs only (no system libs) so it cross-
+# compiles cleanly to x86_64-pc-windows-gnu.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # M4: tray + global hotkey + login-autostart. Versions pinned to what the
 # workspace already resolves (the Tauri side pulls the same crates via its
