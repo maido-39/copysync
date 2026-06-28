@@ -31,6 +31,9 @@ services:
       # IPs + localhost are always included.
       COPYSYNC_TLS_HOSTS: "${COPYSYNC_TLS_HOSTS:-}"
       COPYSYNC_LOG_LEVEL: "${COPYSYNC_LOG_LEVEL:-info}"
+      # Verbose WS connection-lifecycle logging (grep 'ws-debug'). Off by default;
+      # set COPYSYNC_DEBUG=1 in the environment to capture a debugging session.
+      COPYSYNC_DEBUG: "${COPYSYNC_DEBUG:-}"
 
     # PORTABLE STATE — everything that makes this server *this* server (identity
     # /TLS pin, paired devices, settings, queued blobs) lives in one host folder.
