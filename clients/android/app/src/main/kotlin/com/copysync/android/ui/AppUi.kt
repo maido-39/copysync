@@ -632,6 +632,7 @@ private fun DebugTab() {
         }) { Text("클립보드 테스트 복사") }
 
         val dbgOn by DebugLog.enabled.collectAsState()
+        val verboseOn by DebugLog.verbose.collectAsState()
         val dbgLines by DebugLog.lines.collectAsState()
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -644,6 +645,18 @@ private fun DebugTab() {
                     else "켜면 모든 이벤트를 기록합니다 (개발/디버깅용).",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("상세 디버깅", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    Switch(checked = verboseOn, onCheckedChange = {
+                        DebugLog.verbose.value = it
+                        Settings(ctx).verboseDebug = it // persist across restarts/crashes
+                    })
+                }
+                Text(
+                    if (verboseOn) "모든 이벤트를 ms·스레드·태그와 함께 파일(filesDir/logs/)에 영구 기록 중 — 크래시/강제종료 후에도 남습니다."
+                    else "켜면 WS 연결·끊김·재연결·핑/퐁·네트워크 변화·캡처/전송/수신·서비스 수명주기·웨이크락·blob 전송을 빠짐없이 파일에 기록합니다.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(enabled = dbgLines.isNotEmpty(), onClick = {
                         val send = Intent(Intent.ACTION_SEND).apply {
@@ -654,6 +667,18 @@ private fun DebugTab() {
                             Intent.createChooser(send, "CopySync 로그 공유").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                         )
                     }) { Text("로그 공유") }
+                    OutlinedButton(onClick = {
+                        // Export/share the persisted rotating file (survives crash/kill).
+                        val body = DebugLog.fileContents().ifEmpty { dbgLines.joinToString("\n") }
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_SUBJECT, "CopySync 상세 로그")
+                            putExtra(Intent.EXTRA_TEXT, body)
+                        }
+                        ctx.startActivity(
+                            Intent.createChooser(send, "CopySync 로그 내보내기").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }) { Text("로그 내보내기") }
                     OutlinedButton(onClick = { DebugLog.clear() }) { Text("지우기") }
                 }
                 if (dbgLines.isNotEmpty()) {

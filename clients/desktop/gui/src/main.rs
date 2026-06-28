@@ -41,6 +41,115 @@ use copysync_ipc::{
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericNamespaced, Stream};
 
+// ============================================================ crash/debug log
+//
+// The GUI compiles with `windows_subsystem = "windows"` in release, so it has NO
+// console: any `eprintln!` is invisible and a panic kills `gui.exe` with no
+// window and no trace. To make launch failures *analyzable* we (1) append every
+// diagnostic line to a persistent file at
+// `dirs::config_dir()/copysync/logs/gui.log`, and (2) install a panic hook that
+// records the panic + a full backtrace there and, on Windows, pops a MessageBox
+// so a user actually sees the failure. See `install_crash_handler`.
+
+/// Resolve the GUI crash/debug log path: `dirs::config_dir()/copysync/logs/gui.log`.
+/// Falls back to the system temp dir if there's no config dir, so we *always*
+/// have somewhere to write.
+fn gui_log_path() -> std::path::PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("copysync").join("logs").join("gui.log")
+}
+
+/// Append one timestamped line to `gui.log`, creating the directory if needed.
+/// Best-effort and panic-free (it's called from the panic hook): every error is
+/// swallowed because there is nowhere safer to report a logging failure.
+fn gui_log_line(msg: &str) {
+    let path = gui_log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // `chrono_lite_now()` is wall-clock HH:MM:SS only; good enough to order
+        // events within a session without pulling in a date crate.
+        let _ = writeln!(f, "[{}] {}", chrono_lite_now(), msg);
+    }
+}
+
+/// Minimal `user32!MessageBoxW` FFI so we can surface a fatal error to the user
+/// on Windows *without* adding a heavy new crate. Linked only on Windows; a
+/// no-op everywhere else. `title`/`body` are shown UTF-16-encoded, NUL-terminated.
+#[cfg(windows)]
+fn message_box(title: &str, body: &str) {
+    // MB_OK | MB_ICONERROR | MB_SETFOREGROUND so the dialog steals focus even
+    // though the main window never opened.
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let body_w = wide(body);
+    let title_w = wide(title);
+    // SAFETY: both buffers are valid, NUL-terminated UTF-16; `hwnd` null is the
+    // documented "no owner window" value.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn message_box(_title: &str, _body: &str) {}
+
+/// Install a process-wide panic hook that appends the panic message, source
+/// location, and a full `std::backtrace::Backtrace` to `gui.log`, then (on
+/// Windows) pops a MessageBox so the user sees that the GUI died. Chains the
+/// previous hook so default stderr behavior is preserved in debug builds.
+///
+/// Call this as the *very first* thing in `main()` so even a panic during
+/// option/window construction is captured.
+fn install_crash_handler() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        // `Backtrace::force_capture` ignores RUST_BACKTRACE so we always get a
+        // trace in the file even when the env var is unset.
+        let bt = std::backtrace::Backtrace::force_capture();
+        let full = format!(
+            "PANIC at {location}: {payload}\nbacktrace:\n{bt}"
+        );
+        gui_log_line(&full);
+        message_box("CopySync GUI failed", &format!("{payload}\n\n위치: {location}\n\n자세한 내용: {}", gui_log_path().display()));
+        // Preserve prior behavior (stderr in debug, etc.).
+        previous(info);
+    }));
+}
+
 // M4 desktop-shell crates. Each exposes a *global* event channel via a
 // `receiver()` that we poll with `try_recv()` from `update()` — none of them
 // need to be threaded into the winit loop, they just need `update()` to keep
@@ -839,8 +948,16 @@ impl App {
         if !force && !self.recording {
             return;
         }
+        let msg = msg.into();
+        // Mirror the always-important (`force`) lines — init warnings
+        // (hotkey/tray/autostart failures), errors, and lifecycle events — to the
+        // persistent gui.log immediately, so they survive past the in-memory
+        // Debug tab (and exist even if the Debug tab is never opened). The full
+        // verbose stream (`recording`) is mirrored too so the file is a complete
+        // diagnostic when the user has recording on.
+        gui_log_line(&msg);
         let now = chrono_lite_now();
-        self.log.push_back(format!("[{now}] {}", msg.into()));
+        self.log.push_back(format!("[{now}] {}", msg));
         while self.log.len() > 800 {
             self.log.pop_front();
         }
@@ -1863,10 +1980,18 @@ fn truncate(s: &str, max: usize) -> String {
 // ============================================================ main
 
 fn main() -> eframe::Result<()> {
+    // FIRST thing: install the panic hook so even a crash during option/window
+    // construction is written to gui.log (+ a MessageBox on Windows). Under
+    // `windows_subsystem = "windows"` there is no console, so this file is the
+    // only way a silent launch failure becomes visible/analyzable.
+    install_crash_handler();
+    gui_log_line("GUI 프로세스 시작");
+
     // Best-effort: make sure the agent is up before the window opens. The UI
-    // still launches (showing "연결 끊김") if this fails.
+    // still launches (showing "연결 끊김") if this fails. Route the error to
+    // gui.log — `eprintln!` is invisible under the windows subsystem.
     if let Err(e) = ensure_agent() {
-        eprintln!("copysync-gui: agent not reachable: {e}");
+        gui_log_line(&format!("에이전트에 연결할 수 없음: {e}"));
     }
 
     let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
@@ -1876,10 +2001,15 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([520.0, 680.0])
             .with_min_inner_size([420.0, 480.0])
             .with_title("CopySync"),
+        // Prefer (not Require) hardware acceleration: if the GL driver can't give
+        // us an accelerated context (headless/RDP/old GPU), eframe falls back to
+        // a software/less-capable path instead of failing to open a window. This
+        // is a common silent `gui.exe` launch failure on Windows.
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "CopySync",
         options,
         Box::new(move |cc| {
@@ -1888,5 +2018,17 @@ fn main() -> eframe::Result<()> {
             std::thread::spawn(move || event_loop(events_tx, ctx));
             Ok(Box::new(App::new(cc, events_rx)))
         }),
-    )
+    );
+
+    // eframe can return Err without ever panicking (e.g. GL/winit init failure).
+    // Log it and show the MessageBox so this path is just as visible as a panic.
+    if let Err(e) = &result {
+        let msg = format!("eframe::run_native 실패: {e}");
+        gui_log_line(&msg);
+        message_box(
+            "CopySync GUI failed",
+            &format!("{msg}\n\n자세한 내용: {}", gui_log_path().display()),
+        );
+    }
+    result
 }

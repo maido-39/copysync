@@ -22,10 +22,12 @@ class WsClient(private val client: OkHttpClient) {
     val connected = MutableStateFlow(false)
 
     fun connect(wsUrl: String, listener: Listener) {
+        DebugLog.v("ws") { "connect start → $wsUrl" }
         val req = Request.Builder().url(wsUrl).build()
         ws = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connected.value = true
+                DebugLog.v("ws") { "connect success (HTTP ${response.code} ${response.message})" }
                 listener.onOpen()
             }
 
@@ -34,13 +36,23 @@ class WsClient(private val client: OkHttpClient) {
                 when {
                     env == null -> DebugLog.w("프레임 파싱 실패: ${text.take(80)}")
                     !incoming.tryEmit(env) -> DebugLog.w("수신 버퍼 가득 — 프레임 누락(${env.t})")
+                    else -> DebugLog.v("ws") { "recv frame t=${env.t} (${text.length} chars)" }
                 }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // SAFE FIX: do NOT echo webSocket.close(1000, null) here. Echoing a
+                // normal-closure code masked an unexpected liveness death as a clean
+                // "code 1000". Just mark disconnected and report the server's actual
+                // code + reason verbatim so the real cause is visible in the log.
                 connected.value = false
-                webSocket.close(1000, null)
+                DebugLog.v("ws") { "disconnect (onClosing) — server code=$code reason='${reason}' (server-initiated)" }
                 listener.onClosed(if (reason.isNotEmpty()) "$reason (code $code)" else "code $code")
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                connected.value = false
+                DebugLog.v("ws") { "disconnect (onClosed) — code=$code reason='${reason}'" }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -48,6 +60,7 @@ class WsClient(private val client: OkHttpClient) {
                 // Include the exception type + any HTTP status so pin/token/handshake
                 // failures are distinguishable in the Debug tab.
                 val http = response?.let { " (HTTP ${it.code})" } ?: ""
+                DebugLog.e("ws", "connect/socket failure$http", t)
                 listener.onClosed("${t.javaClass.simpleName}: ${t.message ?: "connection failure"}$http")
             }
         })
@@ -60,6 +73,7 @@ class WsClient(private val client: OkHttpClient) {
     private fun sendRaw(frame: String): Boolean = ws?.send(frame) ?: false
 
     fun close() {
+        DebugLog.v("ws") { "disconnect (close) — client-initiated, sending code 1000" }
         ws?.close(1000, null)
         ws = null
         connected.value = false

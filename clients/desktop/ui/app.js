@@ -9,33 +9,68 @@ document.querySelectorAll("nav#tabs button").forEach((b) => {
     document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
     b.classList.add("active");
     $("#" + b.dataset.tab).classList.add("active");
+    dbg("탭 전환 → " + b.dataset.tab);
     if (b.dataset.tab === "history") loadHistory();
   });
 });
 
 // ---- debug log (event recorder for the 디버깅 tab)
+// Detailed debug mode: enable via the "이벤트 기록" checkbox (#dbg-record) on the
+// 디버깅 tab. When ON, every relevant UI event (status/clip/roster/reconnect/theme/
+// invoke calls) is recorded verbosely. Failures, reconnects and connection changes
+// are ALWAYS recorded (dbgForce) regardless of the toggle, so a problem is captured
+// even if recording wasn't enabled beforehand. The log lives in-memory (ring buffer,
+// 800 lines) and is shown in #dbg-log; "복사" copies it to the clipboard and the
+// browser/WebView devtools console mirrors every line for external capture.
 let dbgRecording = false;
 const dbgLines = [];
 // Always recorded — failures, reconnects, connection changes — so they're in
 // the Debug tab even if the user never turned "이벤트 기록" on before the problem.
 function dbgForce(msg) {
   const t = new Date().toLocaleTimeString();
-  dbgLines.push("[" + t + "] " + msg);
+  const line = "[" + t + "] " + msg;
+  dbgLines.push(line);
   if (dbgLines.length > 800) dbgLines.shift();
   const el = $("#dbg-log");
   if (el) el.textContent = dbgLines.join("\n");
+  // Mirror to the console so it's also captured by external WebView log sinks.
+  try { console.log("copysync.dbg", line); } catch (e) {}
 }
 // Verbose per-event lines — only when recording is enabled.
 function dbg(msg) {
   if (!dbgRecording) return;
   dbgForce(msg);
 }
+// Structured error logger — every catch routes here so no error is swallowed.
+// Records the operation that failed, the stringified error, and a JS stack trace
+// where available. Always recorded (dbgForce), and mirrored to console.error.
+function dbgErr(op, err, extra) {
+  let detail = "";
+  try { detail = err instanceof Error ? (err.message || String(err)) : String(err); }
+  catch (e) { detail = "<unstringifiable error>"; }
+  const ctx = extra ? " | " + extra : "";
+  dbgForce("⚠️ [" + op + "] " + detail + ctx);
+  // Stack trace where the language/runtime supports it.
+  let stack = err && err.stack ? err.stack : null;
+  if (!stack) { try { stack = new Error().stack; } catch (e) {} }
+  if (stack) dbgForce("    ↳ " + String(stack).replace(/\n/g, "\n    "));
+  try { console.error("copysync.err [" + op + "]", err, extra || ""); } catch (e) {}
+}
 $("#dbg-record").addEventListener("change", (e) => {
   dbgRecording = e.target.checked;
-  dbg("기록 " + (dbgRecording ? "시작" : "중지"));
+  dbgForce("기록 " + (dbgRecording ? "시작 (상세 디버그 ON)" : "중지"));
 });
-$("#dbg-copy").addEventListener("click", () => navigator.clipboard.writeText(dbgLines.join("\n")).catch(() => {}));
+$("#dbg-copy").addEventListener("click", () =>
+  navigator.clipboard.writeText(dbgLines.join("\n")).catch((err) => dbgErr("dbg-copy", err)));
 $("#dbg-clear").addEventListener("click", () => { dbgLines.length = 0; const el = $("#dbg-log"); if (el) el.textContent = ""; });
+
+// Catch-all: uncaught exceptions and unhandled promise rejections anywhere in the
+// UI are recorded (with stack) instead of vanishing into the WebView console only.
+window.addEventListener("error", (ev) => {
+  dbgErr("window.error", ev.error || ev.message, ev.filename ? ev.filename + ":" + ev.lineno + ":" + ev.colno : "");
+});
+window.addEventListener("unhandledrejection", (ev) => { dbgErr("unhandledrejection", ev.reason); });
+dbgForce("▶ UI 시작 (상세 디버그는 디버깅 탭의 '이벤트 기록'으로 켜기)");
 
 // ---- status
 function renderStatus(s) {
@@ -55,7 +90,7 @@ function renderStatus(s) {
   }
 }
 async function refreshStatus() {
-  try { renderStatus(await invoke("get_status")); } catch (e) {}
+  try { renderStatus(await invoke("get_status")); } catch (e) { dbgErr("get_status", e); }
 }
 
 // ---- history
@@ -102,19 +137,21 @@ function hydrate() {
     if (!e) return;
     const path = itemPath(e);
     if (!path) return;
-    if (el.tagName === "IMG") invoke("thumbnail", { path }).then((d) => { if (d) el.src = d; }).catch(() => {});
-    else invoke("text_preview", { path }).then((t) => { if (t) el.textContent = t; }).catch(() => {});
+    if (el.tagName === "IMG") invoke("thumbnail", { path }).then((d) => { if (d) el.src = d; }).catch((err) => dbgErr("thumbnail", err, "path=" + path));
+    else invoke("text_preview", { path }).then((t) => { if (t) el.textContent = t; }).catch((err) => dbgErr("text_preview", err, "path=" + path));
   });
 }
 async function loadHistory() {
   const q = $("#search").value;
   try {
     lastRows = await invoke("get_history", { query: q || null });
+    dbg("기록 로드 " + lastRows.length + "건 (검색=" + (q || "·") + ")");
     $("#hist-list").innerHTML = lastRows.length
       ? lastRows.map((e, i) => itemHtml(e, i)).join("")
       : `<div class="empty">기록이 없습니다.</div>`;
     hydrate();
   } catch (e) {
+    dbgErr("get_history", e, "query=" + (q || ""));
     $("#hist-list").innerHTML = `<div class="empty">${esc(String(e))}</div>`;
   }
 }
@@ -125,18 +162,18 @@ $("#refresh").addEventListener("click", () => loadHistory());
 $("#send-btn").addEventListener("click", async () => {
   const t = $("#send-text").value;
   if (!t) return;
-  try { await invoke("send_text", { text: t }); $("#send-text").value = ""; }
-  catch (e) { alert("보내기 실패: " + e); }
+  try { await invoke("send_text", { text: t }); $("#send-text").value = ""; dbg("텍스트 전송 " + t.length + "자"); }
+  catch (e) { dbgErr("send_text", e, "len=" + t.length); alert("보내기 실패: " + e); }
 });
 
 // ---- send file (native dialog → send_file command)
 $("#file-btn").addEventListener("click", async () => {
   try {
     const dlg = window.__TAURI__.dialog;
-    if (!dlg) { alert("파일 대화상자를 사용할 수 없습니다"); return; }
+    if (!dlg) { dbgForce("⚠️ [send_file] dialog 플러그인 없음"); alert("파일 대화상자를 사용할 수 없습니다"); return; }
     const path = await dlg.open({ multiple: false, directory: false });
-    if (path) await invoke("send_file", { path });
-  } catch (e) { alert("파일 보내기 실패: " + e); }
+    if (path) { await invoke("send_file", { path }); dbg("파일 전송 " + path); }
+  } catch (e) { dbgErr("send_file", e); alert("파일 보내기 실패: " + e); }
 });
 
 // ---- routing (per-device targets)
@@ -156,12 +193,13 @@ function renderDevices() {
 function applyTargets() {
   let ids = [];
   if (curMode() === "some") ids = [...$("#dev-list").querySelectorAll("input:checked")].map((c) => c.value);
-  invoke("set_targets", { ids }).catch(() => {});
+  dbg("타겟 설정 mode=" + curMode() + " ids=[" + ids.join(",") + "]");
+  invoke("set_targets", { ids }).catch((err) => dbgErr("set_targets", err, "ids=[" + ids.join(",") + "]"));
 }
 document.querySelectorAll('input[name=route]').forEach((r) =>
   r.addEventListener("change", () => { renderDevices(); applyTargets(); }));
 async function loadRoster() {
-  try { roster = await invoke("get_roster"); renderDevices(); } catch (e) {}
+  try { roster = await invoke("get_roster"); dbg("로스터 로드 " + roster.length + "대"); renderDevices(); } catch (e) { dbgErr("get_roster", e); }
 }
 listen("roster", (ev) => { roster = ev.payload || []; dbg("로스터 " + roster.length + "대"); renderDevices(); });
 loadRoster();
@@ -179,8 +217,10 @@ $("#pair-btn").addEventListener("click", async () => {
       e2ePass: $("#p-e2e").value,
     });
     msg.className = "msg ok"; msg.textContent = "페어링 완료!";
+    dbgForce("🔗 페어링 완료 server=" + $("#p-server").value.trim());
     renderStatus(s);
   } catch (e) {
+    dbgErr("pair", e, "server=" + $("#p-server").value.trim());
     msg.className = "msg err"; msg.textContent = "실패: " + e;
   }
 });
@@ -232,7 +272,7 @@ listen("clip", (ev) => {
   if (p.sensitive) showBlockedToast(p.sensitive, p.text || p.name);
   if ($("#history").classList.contains("active")) loadHistory();
 });
-listen("error", (ev) => { dbgForce("⚠️ " + ev.payload); console.warn("copysync:", ev.payload); });
+listen("error", (ev) => { dbgForce("⚠️ [backend] " + ev.payload); try { console.warn("copysync:", ev.payload); } catch (e) {} });
 // Clipboard-watcher diagnostics (e.g. RDP/virtual file copies that aren't CF_HDROP).
 listen("cliplog", (ev) => dbg("📋 " + ev.payload));
 // Reconnect attempts (exponential backoff) — show the countdown + log it.
@@ -243,12 +283,14 @@ listen("reconnect", (ev) => {
 
 // ---- autostart
 async function loadAutostart() {
-  try { $("#autostart").checked = await invoke("get_autostart"); } catch (e) {}
+  try { $("#autostart").checked = await invoke("get_autostart"); } catch (e) { dbgErr("get_autostart", e); }
 }
 $("#autostart").addEventListener("change", async (e) => {
   try {
     await invoke("set_autostart", { enabled: e.target.checked });
+    dbg("자동 시작 " + (e.target.checked ? "켜짐" : "꺼짐"));
   } catch (err) {
+    dbgErr("set_autostart", err, "enabled=" + e.target.checked);
     alert("자동 시작 설정 실패: " + err);
     e.target.checked = !e.target.checked;
   }
@@ -257,12 +299,14 @@ loadAutostart();
 
 // ---- privacy filter (toggle: don't sync sensitive clips)
 async function loadPrivacyFilter() {
-  try { $("#privacy-filter").checked = await invoke("get_privacy_filter"); } catch (e) {}
+  try { $("#privacy-filter").checked = await invoke("get_privacy_filter"); } catch (e) { dbgErr("get_privacy_filter", e); }
 }
 $("#privacy-filter").addEventListener("change", async (e) => {
   try {
     await invoke("set_privacy_filter", { enabled: e.target.checked });
+    dbg("개인정보 필터 " + (e.target.checked ? "켜짐" : "꺼짐"));
   } catch (err) {
+    dbgErr("set_privacy_filter", err, "enabled=" + e.target.checked);
     alert("필터 설정 실패: " + err);
     e.target.checked = !e.target.checked;
   }
@@ -292,7 +336,7 @@ async function loadShortcut() {
     const box = $("#shortcut");
     box.dataset.accel = a || "";
     box.value = prettyAccel(a) || "없음";
-  } catch (e) {}
+  } catch (e) { dbgErr("get_shortcut", e); }
 }
 $("#shortcut-record").addEventListener("click", () => {
   recordingShortcut = true;
@@ -300,7 +344,7 @@ $("#shortcut-record").addEventListener("click", () => {
   $("#shortcut").focus();
 });
 $("#shortcut-clear").addEventListener("click", async () => {
-  try { await invoke("set_shortcut", { accel: "" }); } catch (e) {}
+  try { await invoke("set_shortcut", { accel: "" }); dbg("단축키 해제"); } catch (e) { dbgErr("set_shortcut(clear)", e); }
   await loadShortcut();
 });
 $("#shortcut").addEventListener("keydown", async (e) => {
@@ -325,6 +369,7 @@ $("#shortcut").addEventListener("keydown", async (e) => {
     await loadShortcut();
     dbg("단축키 변경 " + accel);
   } catch (err) {
+    dbgErr("set_shortcut", err, "accel=" + accel);
     $("#shortcut").value = "사용 불가: " + err;
     setTimeout(loadShortcut, 1800);
   }
@@ -336,11 +381,11 @@ loadShortcut();
 
 // ---- mark received clips sensitive (exclude from OS clipboard history)
 async function loadMarkSensitive() {
-  try { $("#mark-sensitive").checked = await invoke("get_mark_sensitive"); } catch (e) {}
+  try { $("#mark-sensitive").checked = await invoke("get_mark_sensitive"); } catch (e) { dbgErr("get_mark_sensitive", e); }
 }
 $("#mark-sensitive").addEventListener("change", async (e) => {
-  try { await invoke("set_mark_sensitive", { enabled: e.target.checked }); }
-  catch (err) { alert("설정 실패: " + err); e.target.checked = !e.target.checked; }
+  try { await invoke("set_mark_sensitive", { enabled: e.target.checked }); dbg("민감 표시 " + (e.target.checked ? "켜짐" : "꺼짐")); }
+  catch (err) { dbgErr("set_mark_sensitive", err, "enabled=" + e.target.checked); alert("설정 실패: " + err); e.target.checked = !e.target.checked; }
 });
 loadMarkSensitive();
 
@@ -351,13 +396,13 @@ function paintAutoClear(secs) {
   });
 }
 async function loadAutoClear() {
-  try { paintAutoClear(await invoke("get_auto_clear")); } catch (e) {}
+  try { paintAutoClear(await invoke("get_auto_clear")); } catch (e) { dbgErr("get_auto_clear", e); }
 }
 document.querySelectorAll("#autoclear-row .ac").forEach((b) => {
   b.addEventListener("click", async () => {
     const secs = Number(b.dataset.secs);
-    try { await invoke("set_auto_clear", { secs }); paintAutoClear(secs); }
-    catch (err) { alert("자동 비우기 설정 실패: " + err); }
+    try { await invoke("set_auto_clear", { secs }); paintAutoClear(secs); dbg("자동 비우기 " + secs + "초"); }
+    catch (err) { dbgErr("set_auto_clear", err, "secs=" + secs); alert("자동 비우기 설정 실패: " + err); }
   });
 });
 loadAutoClear();
@@ -368,6 +413,7 @@ $("#discover-btn").addEventListener("click", async () => {
   box.innerHTML = `<p class="hint">검색 중…</p>`;
   try {
     const found = await invoke("discover_servers");
+    dbg("mDNS 검색 결과 " + found.length + "대");
     if (!found.length) { box.innerHTML = `<p class="hint">서버를 찾지 못했습니다 (같은 LAN인지 확인).</p>`; return; }
     const st = "display:block;width:100%;text-align:left;margin-top:6px;padding:9px 11px;border-radius:8px;background:var(--panel2);color:var(--fg);border:1px solid var(--line);cursor:pointer";
     box.innerHTML = found.map((s) =>
@@ -375,15 +421,17 @@ $("#discover-btn").addEventListener("click", async () => {
     ).join("");
     box.querySelectorAll(".found").forEach((b) =>
       b.addEventListener("click", () => { $("#p-server").value = b.dataset.url; }));
-  } catch (e) { box.innerHTML = `<p class="hint">검색 실패: ${esc(String(e))}</p>`; }
+  } catch (e) { dbgErr("discover_servers", e); box.innerHTML = `<p class="hint">검색 실패: ${esc(String(e))}</p>`; }
 });
 
 $("#pool").addEventListener("change", (e) => {
-  invoke("set_pool", { pool: e.target.value }).catch((err) => alert("풀 변경 실패: " + err));
+  dbg("풀 변경 → " + e.target.value);
+  invoke("set_pool", { pool: e.target.value }).catch((err) => { dbgErr("set_pool", err, "pool=" + e.target.value); alert("풀 변경 실패: " + err); });
 });
 
 $("#reconnect-btn").addEventListener("click", () => {
-  invoke("reconnect").catch(() => {});
+  dbgForce("🔄 수동 재연결 요청");
+  invoke("reconnect").catch((err) => dbgErr("reconnect", err));
   const c = $("#s-conn"); if (c) c.textContent = "재연결 중…";
 });
 
@@ -395,9 +443,9 @@ const THEME_KEY = "cs-theme";
 const themeDefaults = { mode: "dark", img: "", x: 50, y: 50, zoom: 1, bright: 1, blur: 0, cardOp: 1 };
 let theme = (() => {
   try { return Object.assign({}, themeDefaults, JSON.parse(localStorage.getItem(THEME_KEY) || "{}")); }
-  catch (e) { return Object.assign({}, themeDefaults); }
+  catch (e) { try { console.error("copysync.err [loadTheme]", e); } catch (_) {} return Object.assign({}, themeDefaults); }
 })();
-function saveTheme() { try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch (e) {} }
+function saveTheme() { try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch (e) { dbgErr("saveTheme", e); } }
 const darkMql = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 function applyTheme() {
   const root = document.documentElement;
@@ -405,6 +453,10 @@ function applyTheme() {
   root.dataset.theme = resolved === "light" ? "light" : "dark";
   root.style.setProperty("--bg-img", theme.img ? `url("${theme.img}")` : "none");
   root.style.setProperty("--scrim", theme.img ? "0.62" : "0"); // readability wash over a wallpaper
+  // Gate the costly backdrop-filter blur on having a wallpaper (CSS body.has-bg).
+  document.body.classList.toggle("has-bg", !!theme.img);
+  dbg("테마 적용 mode=" + theme.mode + " bg=" + (theme.img ? "있음" : "없음") +
+      " op=" + theme.cardOp + " blur=" + theme.blur + " zoom=" + theme.zoom + " bright=" + theme.bright);
   root.style.setProperty("--bg-x", theme.x + "%");
   root.style.setProperty("--bg-y", theme.y + "%");
   root.style.setProperty("--bg-zoom", theme.zoom);
@@ -438,31 +490,40 @@ $("#bg-file").addEventListener("change", (e) => {
   rd.onload = () => {
     const im = new Image();
     im.onload = () => {
-      const max = 1600, sc = Math.min(1, max / Math.max(im.width, im.height));
-      const c = document.createElement("canvas");
-      c.width = Math.round(im.width * sc); c.height = Math.round(im.height * sc);
-      c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
-      theme.img = c.toDataURL("image/jpeg", 0.82);
-      theme.x = 50; theme.y = 50; applyTheme(); syncThemeControls(); saveTheme();
+      try {
+        const max = 1600, sc = Math.min(1, max / Math.max(im.width, im.height));
+        const c = document.createElement("canvas");
+        c.width = Math.round(im.width * sc); c.height = Math.round(im.height * sc);
+        c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+        theme.img = c.toDataURL("image/jpeg", 0.82);
+        theme.x = 50; theme.y = 50; applyTheme(); syncThemeControls(); saveTheme();
+        dbg("배경 이미지 설정 " + c.width + "×" + c.height);
+      } catch (err) { dbgErr("bg-image:encode", err, "name=" + f.name); alert("배경 이미지 처리 실패: " + err); }
     };
+    im.onerror = (err) => dbgErr("bg-image:decode", err, "name=" + f.name);
     im.src = rd.result;
   };
+  rd.onerror = () => dbgErr("bg-image:read", rd.error, "name=" + f.name);
   rd.readAsDataURL(f);
 });
 $("#bg-clear").addEventListener("click", () => { theme.img = ""; applyTheme(); syncThemeControls(); saveTheme(); });
 (() => {
   const box = $("#bg-crop"); if (!box) return;
   let dragging = false;
+  // Pan updates the position live (applyTheme each frame) but localStorage is
+  // only written on mouseup — writing JSON every mousemove frame was needless churn.
   const pan = (e) => {
     if (!dragging || !theme.img) return;
     const r = box.getBoundingClientRect();
     theme.x = Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100));
     theme.y = Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100));
-    applyTheme(); saveTheme();
+    applyTheme();
   };
   box.addEventListener("mousedown", (e) => { if (theme.img) { dragging = true; pan(e); e.preventDefault(); } });
   window.addEventListener("mousemove", pan);
-  window.addEventListener("mouseup", () => { dragging = false; });
+  window.addEventListener("mouseup", () => {
+    if (dragging) { dragging = false; saveTheme(); dbg("배경 위치 저장 x=" + Math.round(theme.x) + " y=" + Math.round(theme.y)); }
+  });
 })();
 if (darkMql) darkMql.addEventListener("change", () => { if (theme.mode === "system") applyTheme(); });
 applyTheme(); syncThemeControls();

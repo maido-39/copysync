@@ -91,14 +91,17 @@
 @keyframes toast-out { to { opacity: 0; transform: translateY(8px); } }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; }
+html, body { margin: 0; height: 100%; min-width: 0; }
 body {
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.5 system-ui, "Segoe UI", "Noto Sans KR", sans-serif;
-  display: flex; flex-direction: column; height: 100vh;
+  /* dvh + min-height:0 + overflow:hidden keep the flex column from being
+     mangled while the WebView2 window is drag-resized. */
+  display: flex; flex-direction: column; height: 100dvh; min-height: 0; overflow: hidden;
 }
 header {
+  flex: 0 0 auto;
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
@@ -109,14 +112,14 @@ header {
 .pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent);    color: var(--warn); }     /* 재연결 중 */
 .pill.off  { background: color-mix(in srgb, var(--danger) 16%, transparent);  color: var(--danger); }   /* 연결 끊김 */
 
-nav#tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+nav#tabs { flex: 0 0 auto; display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
 nav#tabs button {
   flex: 1; background: transparent; color: var(--muted); border: 0; padding: 9px 0;
   border-radius: 8px; cursor: pointer; font-size: 14px;
 }
 nav#tabs button.active { background: var(--panel2); color: var(--fg); }
 
-main { flex: 1; overflow: auto; padding: 16px; }
+main { flex: 1 1 0; min-height: 0; overflow: auto; padding: 16px; }
 .tab { display: none; }
 .tab.active { display: block; }
 
@@ -193,7 +196,13 @@ label.dev { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor
    always sit on a dark-enough (dark mode) / light-enough (light mode) backdrop.
    --scrim is 0 (invisible) unless a bg image is set, so the no-image UI is untouched. */
 .app-bg::after { content: ""; position: absolute; inset: 0; background: rgba(var(--bg-rgb), var(--scrim)); }
-header, nav#tabs, .card, .item { -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+/* backdrop-filter blur is the main WebView2 per-frame resize-jank source, so it's
+   OPT-IN: only paid when a wallpaper is set (body.has-bg, toggled by applyTheme).
+   The common no-wallpaper UI never triggers the per-frame reflow. */
+body.has-bg header,
+body.has-bg nav#tabs,
+body.has-bg .card,
+body.has-bg .item { -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
 
 /* ---- theme controls ------------------------------------------------------ */
 .modebar { display: flex; gap: 6px; margin: 2px 0 10px; }

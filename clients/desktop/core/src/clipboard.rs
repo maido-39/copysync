@@ -10,18 +10,56 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// Bounded open-retry for arboard. `arboard::Clipboard::new()` can transiently fail
+/// when another app (or the RDP redirector) is mid-write and still holds the
+/// clipboard — the *set* path already uses `clipboard_win::new_attempts(10)`, but
+/// the read path had no retry and would silently skip a just-copied generation.
+/// Retries ~5×40ms (~200ms) before giving up; logs the final failure to the
+/// engine debug log so a contended/locked clipboard is observable, not lost.
+const OPEN_ATTEMPTS: u32 = 5;
+const OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+
+fn open_clipboard(what: &str) -> Result<arboard::Clipboard> {
+    let mut last_err = None;
+    for attempt in 1..=OPEN_ATTEMPTS {
+        match arboard::Clipboard::new() {
+            Ok(c) => {
+                if attempt > 1 {
+                    crate::engine::debug_log(
+                        "clipboard",
+                        &format!("open for {what}: succeeded on attempt {attempt}/{OPEN_ATTEMPTS}"),
+                    );
+                }
+                return Ok(c);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < OPEN_ATTEMPTS {
+                    std::thread::sleep(OPEN_BACKOFF);
+                }
+            }
+        }
+    }
+    let e = last_err.expect("at least one open attempt failed");
+    crate::engine::debug_log(
+        "clipboard",
+        &format!("open for {what}: FAILED after {OPEN_ATTEMPTS} attempts: {e}"),
+    );
+    Err(anyhow::anyhow!("open clipboard for {what}: {e}"))
+}
+
 pub fn get_text() -> Result<String> {
-    Ok(arboard::Clipboard::new()?.get_text()?)
+    Ok(open_clipboard("get_text")?.get_text()?)
 }
 
 pub fn set_text(s: &str) -> Result<()> {
-    arboard::Clipboard::new()?.set_text(s.to_string())?;
+    open_clipboard("set_text")?.set_text(s.to_string())?;
     Ok(())
 }
 
 /// Empty the OS clipboard (used by the auto-clear timer after receiving a clip).
 pub fn clear() -> Result<()> {
-    arboard::Clipboard::new()?.clear()?;
+    open_clipboard("clear")?.clear()?;
     Ok(())
 }
 
@@ -54,7 +92,7 @@ pub fn set_text_sensitive(s: &str) -> Result<()> {
 }
 
 pub fn get_image() -> Result<Image> {
-    let img = arboard::Clipboard::new()?.get_image()?;
+    let img = open_clipboard("get_image")?.get_image()?;
     Ok(Image {
         width: img.width,
         height: img.height,
@@ -66,7 +104,25 @@ pub fn get_image() -> Result<Image> {
 /// None on non-Windows, or when the clipboard holds no file list.
 #[cfg(windows)]
 pub fn get_files() -> Option<Vec<String>> {
-    let files: Vec<String> = clipboard_win::get_clipboard(clipboard_win::formats::FileList).ok()?;
+    // Bounded open-retry: clipboard_win::get_clipboard opens the clipboard, which
+    // can be transiently locked by another app / the RDP redirector.
+    let mut files: Option<Vec<String>> = None;
+    for attempt in 1..=OPEN_ATTEMPTS {
+        match clipboard_win::get_clipboard::<Vec<String>, _>(clipboard_win::formats::FileList) {
+            Ok(f) => { files = Some(f); break; }
+            Err(e) => {
+                if attempt < OPEN_ATTEMPTS {
+                    std::thread::sleep(OPEN_BACKOFF);
+                } else {
+                    crate::engine::debug_log(
+                        "clipboard",
+                        &format!("get_files: clipboard read FAILED after {OPEN_ATTEMPTS} attempts: {e}"),
+                    );
+                }
+            }
+        }
+    }
+    let files = files?;
     if files.is_empty() {
         None
     } else {
@@ -177,7 +233,7 @@ pub fn set_files(_paths: &[String]) -> Result<()> {
 }
 
 pub fn set_image(img: &Image) -> Result<()> {
-    arboard::Clipboard::new()?.set_image(arboard::ImageData {
+    open_clipboard("set_image")?.set_image(arboard::ImageData {
         width: img.width,
         height: img.height,
         bytes: std::borrow::Cow::Borrowed(&img.rgba),
@@ -187,12 +243,12 @@ pub fn set_image(img: &Image) -> Result<()> {
 
 /// Read the clipboard's rich-text (HTML) representation, if any.
 pub fn get_html() -> Result<String> {
-    Ok(arboard::Clipboard::new()?.get().html()?)
+    Ok(open_clipboard("get_html")?.get().html()?)
 }
 
 /// Set both an HTML representation and a plain-text fallback (`alt`).
 pub fn set_html(html: &str, alt: &str) -> Result<()> {
-    arboard::Clipboard::new()?
+    open_clipboard("set_html")?
         .set_html(html.to_string(), Some(alt.to_string()))?;
     Ok(())
 }

@@ -18,6 +18,11 @@ type Client struct {
 	closeOnce   sync.Once
 	done        chan struct{}
 	closeReason string
+	// evicted is true when Close was triggered by a server-side eviction or
+	// replacement (an intentional, expected close) rather than a normal/error
+	// teardown. The write pump uses this to pick a benign close code so clients
+	// don't treat the disconnect as a protocol error.
+	evicted bool
 }
 
 // NewClient creates a client with a buffered send channel.
@@ -35,10 +40,18 @@ func (c *Client) Done() <-chan struct{} { return c.done }
 // CloseReason returns why the client was evicted (empty if it left normally).
 func (c *Client) CloseReason() string { return c.closeReason }
 
+// Evicted reports whether this client was closed by an intentional server-side
+// eviction/replacement (vs. a normal or error teardown). It is only meaningful
+// after Done() has fired.
+func (c *Client) Evicted() bool { return c.evicted }
+
 // Close signals the transport to disconnect this client. Safe to call repeatedly.
+// It marks the close as an intentional server-side eviction/replacement, so the
+// write pump uses a benign WebSocket close code.
 func (c *Client) Close(reason string) {
 	c.closeOnce.Do(func() {
 		c.closeReason = reason
+		c.evicted = true
 		close(c.done)
 	})
 }

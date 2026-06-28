@@ -5,8 +5,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import com.copysync.android.capture.Captured
@@ -35,6 +39,7 @@ import com.copysync.android.net.WsClient
 import com.copysync.android.net.decodePayload
 import com.copysync.android.net.pinnedClient
 import com.copysync.android.net.sha256Hex
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +77,27 @@ class SyncService : Service() {
     private val PREVIEW_CAP_BYTES = 25L * 1024 * 1024 // images up to this are fetched to show a history thumbnail
     private var seq = 0L
 
+    // Doze hardening: a CPU partial wakelock + a high-perf Wi-Fi lock keep the
+    // persistent socket alive while the screen is off. Held for the service
+    // lifetime; both released in onDestroy.
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /** Coarse network type for the verbose log (wifi / cellular / ethernet / none). */
+    private fun networkType(): String {
+        return runCatching {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return "unknown"
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return "none"
+            when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+                else -> "other"
+            }
+        }.getOrDefault("unknown")
+    }
+
     /** Build the outbound `targets` field from the user's routing selection. */
     private fun currentTargets(): JsonElement {
         val sel = SyncState.targets.value
@@ -107,17 +133,77 @@ class SyncService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        DebugLog.v("svc") { "onCreate" }
         Notifications.ensureChannels(this)
+        acquireLocks()
+    }
+
+    /** Acquire a PARTIAL_WAKE_LOCK + a high-perf Wi-Fi lock for the service lifetime. */
+    private fun acquireLocks() {
+        runCatching {
+            val pm = getSystemService(PowerManager::class.java)
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "copysync:sync").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            DebugLog.v("wakelock") { "PARTIAL_WAKE_LOCK acquired (copysync:sync)" }
+        }.onFailure { DebugLog.e("wakelock", "wakelock acquire failed", it) }
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = wm.createWifiLock(mode, "copysync:wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            DebugLog.v("wakelock") { "WifiLock acquired (mode=$mode)" }
+        }.onFailure { DebugLog.e("wakelock", "WifiLock acquire failed", it) }
+    }
+
+    private fun releaseLocks() {
+        runCatching { if (wakeLock?.isHeld == true) { wakeLock?.release(); DebugLog.v("wakelock") { "PARTIAL_WAKE_LOCK released" } } }
+            .onFailure { DebugLog.e("wakelock", "wakelock release failed", it) }
+        runCatching { if (wifiLock?.isHeld == true) { wifiLock?.release(); DebugLog.v("wakelock") { "WifiLock released" } } }
+            .onFailure { DebugLog.e("wakelock", "WifiLock release failed", it) }
+        wakeLock = null
+        wifiLock = null
+    }
+
+    /**
+     * On the first paired run, prompt the user to exempt CopySync from battery
+     * optimization (the #1 lever against Doze killing the socket). Guarded by
+     * isIgnoringBatteryOptimizations + a one-shot pref so we never nag.
+     */
+    private fun maybePromptBatteryOptimization() {
+        if (settings.batteryOptAsked) return
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            settings.batteryOptAsked = true
+            DebugLog.v("svc") { "already exempt from battery optimization" }
+            return
+        }
+        settings.batteryOptAsked = true
+        runCatching {
+            val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = android.net.Uri.parse("package:$packageName")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            DebugLog.v("svc") { "prompted ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" }
+        }.onFailure { DebugLog.e("svc", "battery-optimization prompt failed", it) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        DebugLog.v("svc") { "onStartCommand action=${intent?.action ?: "none"} flags=$flags startId=$startId net=${networkType()}" }
         startForegroundCompat("starting…")
         if (intent?.action == ACTION_STOP || !settings.isPaired) {
+            DebugLog.v("svc") { "stopSelf (stop action or not paired)" }
             stopSelf()
             return START_NOT_STICKY
         }
         if (!SyncState.running.value) {
             SyncState.running.value = true
+            maybePromptBatteryOptimization()
             startCapture()
             startConnectLoop()
         }
@@ -160,6 +246,7 @@ class SyncService : Service() {
                 is Captured.Text -> {
                     ensureKey()
                     val sha = sha256Hex(c.text)
+                    DebugLog.v("capture") { "text captured: ${c.text.toByteArray().size} bytes, sha=${sha.take(12)}, html=${c.html != null}" }
                     if (settings.excludeSensitive) {
                         val sens = Privacy.classify(c.text)
                         if (sens != null) {
@@ -167,6 +254,7 @@ class SyncService : Service() {
                             SyncState.blockedToast.value =
                                 BlockedClip(sens.label, c.text.take(90), System.currentTimeMillis())
                             DebugLog.i("sensitive clip filtered (not synced): ${sens.label}")
+                            DebugLog.v("capture") { "SKIP send: sensitive (${sens.label})" }
                             return@launch
                         }
                     }
@@ -204,8 +292,12 @@ class SyncService : Service() {
                 }
                 is Captured.Binary -> {
                     ensureKey()
+                    DebugLog.v("capture") { "binary captured: ${c.name} kind=${if (c.mime.startsWith("image/")) "image" else "file"} mime=${c.mime} size=${c.size} sha=${c.sha.take(12)}" }
                     if (blob == null) {
-                        DebugLog.w("no blob channel; file not sent")
+                        // SAFE FIX: make the drop LOUD (retry-queue is DEFERRED). Without a
+                        // live blob channel (socket down/connecting) a copied file is silently
+                        // lost — this is the most common "my file didn't sync" cause.
+                        DebugLog.e("blob", "DROPPED binary clip '${c.name}' (${c.size} bytes): no blob channel (connected=${SyncState.connected.value}, net=${networkType()}) — not queued (retry DEFERRED)")
                     } else {
                         val kind = if (c.mime.startsWith("image/")) "image" else "file"
                         val dev = settings.deviceId.orEmpty()
@@ -251,7 +343,13 @@ class SyncService : Service() {
                                 runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             } else {
-                                if (runCatching { blob?.put(ct) }.isFailure) { DebugLog.w("e2e upload failed"); return@launch }
+                                DebugLog.v("blob") { "put attempt (e2e ciphertext, ${ct.size} bytes, $blobId)" }
+                                val r = runCatching { blob?.put(ct) }
+                                if (r.isFailure) {
+                                    DebugLog.e("blob", "DROPPED e2e binary clip '${c.name}' (${c.size} bytes): blob.put failed ($blobId) — not queued (retry DEFERRED)", r.exceptionOrNull())
+                                    return@launch
+                                }
+                                DebugLog.v("blob") { "put result OK (e2e $blobId)" }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             }
                             c.file.delete()
@@ -266,7 +364,13 @@ class SyncService : Service() {
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
                             } else {
-                                if (runCatching { blob?.putFile(c.file, c.mime, blobId) }.isFailure) { DebugLog.w("file upload failed: ${c.name}"); return@launch }
+                                DebugLog.v("blob") { "putFile attempt (${c.name}, ${c.size} bytes, $blobId)" }
+                                val r = runCatching { blob?.putFile(c.file, c.mime, blobId) }
+                                if (r.isFailure) {
+                                    DebugLog.e("blob", "DROPPED binary clip '${c.name}' (${c.size} bytes): blob.putFile failed ($blobId) — not queued (retry DEFERRED)", r.exceptionOrNull())
+                                    return@launch
+                                }
+                                DebugLog.v("blob") { "putFile result OK ($blobId)" }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 c.file.delete()
@@ -293,6 +397,7 @@ class SyncService : Service() {
     private fun startConnectLoop() {
         scope.launch {
             var backoff = 1000L
+            var attempt = 0
             while (isActive && SyncState.running.value) {
                 try {
                     val url = settings.serverUrl
@@ -302,6 +407,7 @@ class SyncService : Service() {
                     if (url == null || pin == null || token == null || devId == null) {
                         update("not paired"); break
                     }
+                    attempt++
                     val client = pinnedClient(pin)
                     val w = WsClient(client)
                     ws = w
@@ -311,15 +417,17 @@ class SyncService : Service() {
                         // the whole receive loop (it'd silently stop all inbound sync).
                         w.incoming.collect { env ->
                             runCatching { handle(env) }
-                                .onFailure { DebugLog.w("수신 프레임 처리 오류(${env.t}): $it") }
+                                .onFailure { DebugLog.e("ws", "수신 프레임 처리 오류(${env.t})", it) }
                         }
                     }
                     val wsUrl = url.replaceFirst("https://", "wss://")
                         .replaceFirst("http://", "ws://").trimEnd('/') + "/ws"
+                    DebugLog.v("ws") { "connect attempt #$attempt → $wsUrl (net=${networkType()}, backoff=${backoff}ms)" }
                     update("connecting…")
                     w.connect(wsUrl, object : WsClient.Listener {
                         override fun onOpen() {
                             SyncState.connected.value = true
+                            DebugLog.v("ws") { "onOpen → sending hello (dev=$devId, net=${networkType()})" }
                             w.sendHello(
                                 Hello(deviceId = devId, deviceName = settings.deviceName ?: "android", token = token),
                             )
@@ -337,20 +445,30 @@ class SyncService : Service() {
                     while (isActive && !w.connected.value && waited < 8000) {
                         delay(200); waited += 200
                     }
-                    if (w.connected.value) backoff = 1000L
+                    if (w.connected.value) { backoff = 1000L; DebugLog.v("ws") { "connected; backoff reset to 1000ms" } }
+                    else DebugLog.v("ws") { "connect attempt #$attempt did not open within ${waited}ms" }
                     while (isActive && SyncState.running.value && w.connected.value) {
                         delay(1000)
                     }
                     SyncState.connected.value = false
+                    DebugLog.v("ws") { "session ended (running=${SyncState.running.value}); tearing down socket" }
                     incomingJob.cancel()
                     w.close()
                     blob = null
                 } catch (e: Exception) {
-                    DebugLog.w("연결/실행 오류: $e")
+                    // SAFE FIX: a CancellationException means the scope is being torn
+                    // down (service stopping). Rethrow it so teardown is not mislabeled
+                    // as a connection error and the loop unwinds cleanly.
+                    if (e is CancellationException) {
+                        DebugLog.v("ws") { "connect loop cancelled (teardown)" }
+                        throw e
+                    }
+                    DebugLog.e("ws", "연결/실행 오류 (attempt #$attempt, net=${networkType()})", e)
                     update("error: ${e.message ?: e.javaClass.simpleName}")
                     SyncState.connected.value = false
                 }
                 if (!SyncState.running.value) break
+                DebugLog.v("ws") { "reconnect in ${backoff}ms (next attempt #${attempt + 1})" }
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(30_000L)
             }
@@ -436,6 +554,7 @@ class SyncService : Service() {
                                 val k = key
                                 html = if (k != null) runCatching { String(E2eCrypto.open(k, Base64.decode(html, Base64.NO_WRAP))) }.getOrNull() else null
                             }
+                            DebugLog.v("apply") { "applying inbound text to clipboard (${text.toByteArray().size} bytes, html=${html != null})" }
                             capture?.applyInbound(text, html, settings.sensitiveMark)
                             scheduleAutoClear(sha256Hex(text))
                         }
@@ -545,11 +664,13 @@ class SyncService : Service() {
     }
 
     override fun onDestroy() {
+        DebugLog.v("svc") { "onDestroy" }
         SyncState.running.value = false
         SyncState.connected.value = false
         capture?.stop()
         capture = null
         ws?.close()
+        releaseLocks()
         scope.cancel()
         super.onDestroy()
     }

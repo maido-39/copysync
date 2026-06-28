@@ -69,6 +69,7 @@ type Hub struct {
 	now        Clock
 	serverID   string
 	serverName string
+	debug      bool // verbose connection-lifecycle logging (COPYSYNC_DEBUG=1)
 
 	register   chan registerReq
 	unregister chan *Client
@@ -107,6 +108,20 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		onDemand:   make(map[model.BlobID]model.DeviceID),
 		monSubs:    make(map[int]chan MonitorEvent),
 	}
+}
+
+// SetDebug toggles verbose connection-lifecycle logging. It is meant to be
+// called once at startup (e.g. when COPYSYNC_DEBUG=1) before Run starts, so no
+// synchronization is needed. Debug lines are emitted via the hub's logger,
+// prefixed with "ws-debug" so they are easy to grep.
+func (h *Hub) SetDebug(on bool) { h.debug = on }
+
+// dbg emits a greppable verbose connection-lifecycle line when debug is enabled.
+func (h *Hub) dbg(event string, args ...any) {
+	if !h.debug {
+		return
+	}
+	h.log.Info("ws-debug "+event, args...)
 }
 
 // Run is the hub's event loop; it returns when ctx is cancelled.
@@ -168,27 +183,39 @@ func (h *Hub) RequestBlob(id model.BlobID) bool {
 func (h *Hub) handleBlobRequest(id model.BlobID) bool {
 	origin, ok := h.onDemand[id]
 	if !ok {
+		h.dbg("blob_request-unknown", "blob", id)
 		return false
 	}
 	c, online := h.clients[origin]
 	if !online {
+		h.dbg("blob_request-offline", "blob", id, "origin", origin)
 		return false
 	}
 	b, err := protocol.Encode(protocol.TypeBlobReq, protocol.BlobRequest{ID: string(id)})
 	if err != nil {
+		h.log.Warn("blob_request encode failed", "blob", id, "origin", origin, "err", err)
 		return false
 	}
-	return c.Enqueue(b)
+	if !c.Enqueue(b) {
+		// Origin's send buffer is full: the blob-pull request is silently dropped
+		// at the transport. Surface it (previously this returned false with no
+		// trace, making on-demand pull failures impossible to diagnose).
+		h.dbg("blob_request-drop", "blob", id, "origin", origin, "reason", "origin send buffer full")
+		return false
+	}
+	return true
 }
 
 func (h *Hub) handleRegister(r registerReq) {
 	c := r.client
 	id := c.Device.ID
 	if old, ok := h.clients[id]; ok {
+		h.dbg("replace", "device", id, "reason", "replaced by a newer connection", "side", "server")
 		old.Close("replaced by a newer connection")
 		delete(h.clients, id)
 	}
 	h.clients[id] = c
+	h.dbg("register", "device", id, "name", c.Device.Name, "pool", poolName(c.Device.Pool), "online_count", len(h.clients))
 	_ = h.store.UpdateLastSeen(id, h.now())
 
 	settings, _ := h.store.GetSettings()
@@ -230,7 +257,22 @@ func (h *Hub) handleUnregister(c *Client) {
 	if cur, ok := h.clients[id]; ok && cur == c {
 		delete(h.clients, id)
 		_ = h.store.UpdateLastSeen(id, h.now())
+		// Prune on-demand blob holdings owned by this device: once it is offline,
+		// nobody can pull those blobs from it, so the entries are dead weight.
+		// (Previously this map was never cleaned up and grew unbounded.)
+		pruned := 0
+		for blobID, holder := range h.onDemand {
+			if holder == id {
+				delete(h.onDemand, blobID)
+				pruned++
+			}
+		}
+		h.dbg("unregister", "device", id, "reason", c.CloseReason(), "evicted", c.Evicted(), "online_count", len(h.clients), "ondemand_pruned", pruned, "ondemand_size", len(h.onDemand))
 		h.broadcastPresence(c.Device, false, "")
+	} else {
+		// A stale unregister for a connection that was already replaced/evicted;
+		// the current registry entry (if any) belongs to a newer connection.
+		h.dbg("unregister-stale", "device", id, "reason", c.CloseReason(), "evicted", c.Evicted())
 	}
 }
 
@@ -260,6 +302,7 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 				continue
 			}
 			// Slow client: disconnect and queue; it reconnects and drains.
+			h.dbg("evict", "device", dev.ID, "reason", "send buffer full", "side", "server")
 			c.Close("send buffer full")
 			delete(h.clients, dev.ID)
 		}

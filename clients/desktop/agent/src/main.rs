@@ -37,6 +37,73 @@ use interprocess::local_socket::{
     prelude::*, GenericNamespaced, ListenerOptions, Stream as SyncStream,
 };
 
+// ----------------------------------------------------------------- debug log
+//
+// The agent is headless — no window, and (when launched at boot or auto-spawned
+// by the GUI) often no console either. So a file is the ONLY diagnostic. Detailed
+// logging is gated by the `COPYSYNC_DEBUG=1` environment variable and written to
+// `dirs::config_dir()/copysync/logs/agent.log`. We log IPC connect/disconnect,
+// engine start/stop, and every error path with context.
+
+use std::io::Write as _;
+use std::sync::OnceLock;
+
+/// Whether detailed debug logging is on, read once from `COPYSYNC_DEBUG`. Treated
+/// as enabled when the var is exactly "1" or "true" (case-insensitive).
+fn debug_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("COPYSYNC_DEBUG") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    })
+}
+
+/// The agent debug-log path: `dirs::config_dir()/copysync/logs/agent.log`, with a
+/// temp-dir fallback so we always have somewhere to write.
+fn agent_log_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("copysync").join("logs").join("agent.log")
+}
+
+/// A coarse wall-clock "HH:MM:SS" stamp (no date crate). Enough to order events
+/// within a session.
+fn debug_stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// Append one timestamped line to `agent.log` when `COPYSYNC_DEBUG` is set.
+/// No-op (and zero filesystem work) otherwise. Best-effort: a logging failure is
+/// swallowed because there's nowhere safer to report it.
+fn dlog(msg: &str) {
+    if !debug_enabled() {
+        return;
+    }
+    let path = agent_log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[{}] {}", debug_stamp(), msg);
+    }
+}
+
 // ----------------------------------------------------------------- conversions
 
 fn status_to_ipc(s: &CoreStatus) -> IpcStatus {
@@ -198,6 +265,12 @@ impl Engine {
     /// the old command sender (dropping it closes the channel → the old actor and
     /// clipboard thread exit) and aborts the previous actor task.
     fn start(self: &Arc<Self>, cfg: Config) {
+        dlog(&format!(
+            "engine start: server={:?} device={:?} e2e={}",
+            cfg.server_name,
+            cfg.device_name,
+            !cfg.e2e_pass.is_empty()
+        ));
         self.state
             .exclude_sensitive
             .store(cfg.exclude_sensitive, Ordering::Relaxed);
@@ -222,6 +295,7 @@ impl Engine {
         *self.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
         // Abort any previous actor task so we never run two engines at once.
         if let Some(prev) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            dlog("engine restart: aborting previous actor task");
             prev.abort();
         }
 
@@ -240,6 +314,7 @@ impl Engine {
             engine::run(cfg, state, emit, rx).await;
             // The actor returned (command channel closed / fatal). Surface it and
             // mark the status disconnected so later sends fail loudly, not silently.
+            dlog("engine stop: actor task returned (channel closed / fatal) — marking disconnected");
             let _ = events.send(Event::Error {
                 message: "동기화가 멈췄습니다 — 다시 페어링하거나 에이전트를 재시작하세요.".into(),
             });
@@ -310,9 +385,12 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
                 Ok(list) => {
                     Outbound::Reply(Response::History(list.iter().map(entry_to_histrow).collect()))
                 }
-                Err(e) => Outbound::Reply(Response::Error {
-                    message: format!("기록 조회 실패: {e}"),
-                }),
+                Err(e) => {
+                    dlog(&format!("GetHistory failed: {e:#}"));
+                    Outbound::Reply(Response::Error {
+                        message: format!("기록 조회 실패: {e}"),
+                    })
+                }
             }
         }
 
@@ -381,12 +459,18 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
                         })
                         .collect(),
                 )),
-                Ok(Err(e)) => Outbound::Reply(Response::Error {
-                    message: format!("검색 실패: {e}"),
-                }),
-                Err(e) => Outbound::Reply(Response::Error {
-                    message: format!("검색 작업 실패: {e}"),
-                }),
+                Ok(Err(e)) => {
+                    dlog(&format!("DiscoverServers failed: {e:#}"));
+                    Outbound::Reply(Response::Error {
+                        message: format!("검색 실패: {e}"),
+                    })
+                }
+                Err(e) => {
+                    dlog(&format!("DiscoverServers join error: {e:#}"));
+                    Outbound::Reply(Response::Error {
+                        message: format!("검색 작업 실패: {e}"),
+                    })
+                }
             }
         }
 
@@ -396,20 +480,28 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
             name,
             pin,
             e2e_pass,
-        } => match pairing::claim(&server, &pin, &otp, &name, &e2e_pass).await {
-            Ok(cfg) => {
-                if let Err(e) = cfg.save(&engine.state.cfg_path) {
-                    return Outbound::Reply(Response::Error {
-                        message: format!("설정 저장 실패: {e}"),
-                    });
+        } => {
+            dlog(&format!("Pair attempt: server={server:?} name={name:?}"));
+            match pairing::claim(&server, &pin, &otp, &name, &e2e_pass).await {
+                Ok(cfg) => {
+                    if let Err(e) = cfg.save(&engine.state.cfg_path) {
+                        dlog(&format!("Pair config save failed: {e:#}"));
+                        return Outbound::Reply(Response::Error {
+                            message: format!("설정 저장 실패: {e}"),
+                        });
+                    }
+                    dlog("Pair succeeded — starting engine");
+                    engine.start(cfg);
+                    Outbound::Reply(Response::Paired(engine.status_snapshot()))
                 }
-                engine.start(cfg);
-                Outbound::Reply(Response::Paired(engine.status_snapshot()))
+                Err(e) => {
+                    dlog(&format!("Pair failed: {e:#}"));
+                    Outbound::Reply(Response::Error {
+                        message: e.to_string(),
+                    })
+                }
             }
-            Err(e) => Outbound::Reply(Response::Error {
-                message: e.to_string(),
-            }),
-        },
+        }
 
         // The streaming is handled in the connection loop; this is just an ack.
         Request::Subscribe => Outbound::Reply(Response::Ok),
@@ -421,13 +513,19 @@ fn send_cmd(engine: &Arc<Engine>, cmd: Cmd) -> Outbound {
     match engine.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         Some(tx) => match tx.send(cmd) {
             Ok(()) => Outbound::Reply(Response::Ok),
-            Err(_) => Outbound::Reply(Response::Error {
-                message: "동기화가 중단됨 — 다시 페어링하세요.".into(),
-            }),
+            Err(_) => {
+                dlog("send_cmd failed: actor channel closed (sync stopped)");
+                Outbound::Reply(Response::Error {
+                    message: "동기화가 중단됨 — 다시 페어링하세요.".into(),
+                })
+            }
         },
-        None => Outbound::Reply(Response::Error {
-            message: "페어링이 필요합니다.".into(),
-        }),
+        None => {
+            dlog("send_cmd rejected: not paired (no command channel)");
+            Outbound::Reply(Response::Error {
+                message: "페어링이 필요합니다.".into(),
+            })
+        }
     }
 }
 
@@ -440,17 +538,26 @@ async fn serve(engine: Arc<Engine>) -> Result<()> {
         .create_tokio()
         .context("bind local socket (is another agent already running?)")?;
     eprintln!("copysync-agent: listening on {}", socket_label());
+    dlog(&format!("IPC listening on {}", socket_label()));
     loop {
         match listener.accept().await {
             Ok(conn) => {
+                dlog("IPC client connected");
                 let eng = engine.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(eng, conn).await {
-                        eprintln!("copysync-agent: connection ended: {e}");
+                    match handle_conn(eng, conn).await {
+                        Ok(()) => dlog("IPC client disconnected (clean EOF)"),
+                        Err(e) => {
+                            eprintln!("copysync-agent: connection ended: {e}");
+                            dlog(&format!("IPC connection ended with error: {e:#}"));
+                        }
                     }
                 });
             }
-            Err(e) => eprintln!("copysync-agent: accept error: {e}"),
+            Err(e) => {
+                eprintln!("copysync-agent: accept error: {e}");
+                dlog(&format!("IPC accept error: {e:#}"));
+            }
         }
     }
 }
@@ -528,9 +635,12 @@ async fn process_line(
             }
             Some(handle_request(engine, req).await)
         }
-        Err(e) => Some(Outbound::Reply(Response::Error {
-            message: format!("bad request: {e}"),
-        })),
+        Err(e) => {
+            dlog(&format!("bad request line: {e} (raw: {trimmed:?})"));
+            Some(Outbound::Reply(Response::Error {
+                message: format!("bad request: {e}"),
+            }))
+        }
     }
 }
 
@@ -588,7 +698,10 @@ fn build_engine() -> Result<Arc<Engine>> {
 
     // Auto-start sync if a saved pairing exists.
     if let Some(cfg) = loaded {
+        dlog("found saved pairing — auto-starting sync");
         engine.start(cfg);
+    } else {
+        dlog("no saved pairing — idle until Pair");
     }
     Ok(engine)
 }
@@ -599,8 +712,15 @@ fn run_serve() -> Result<()> {
         .build()
         .context("build tokio runtime")?;
     rt.block_on(async {
-        let engine = build_engine()?;
-        serve(engine).await
+        dlog("agent serve starting (COPYSYNC_DEBUG on)");
+        let engine = build_engine().inspect_err(|e| {
+            dlog(&format!("build_engine failed: {e:#}"));
+        })?;
+        let result = serve(engine).await;
+        if let Err(e) = &result {
+            dlog(&format!("serve exited with error: {e:#}"));
+        }
+        result
     })
 }
 

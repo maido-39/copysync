@@ -1,6 +1,7 @@
 package com.copysync.android.net
 
 import android.util.Base64
+import com.copysync.android.sync.DebugLog
 import okhttp3.OkHttpClient
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -23,9 +24,21 @@ fun pinnedClient(spkiPinB64: String, readTimeout: Duration = Duration.ZERO): OkH
     val tm = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
         override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-            val leaf = chain?.firstOrNull() ?: throw CertificateException("no server certificate")
+            val leaf = chain?.firstOrNull()
+                ?: throw CertificateException("no server certificate").also {
+                    DebugLog.e("pin", "TLS pin check: no server certificate in chain", it)
+                }
             val spki = MessageDigest.getInstance("SHA-256").digest(leaf.publicKey.encoded)
-            if (!spki.contentEquals(pin)) throw CertificateException("server SPKI pin mismatch (possible MITM)")
+            if (!spki.contentEquals(pin)) {
+                val ex = CertificateException("server SPKI pin mismatch (possible MITM)")
+                DebugLog.e(
+                    "pin",
+                    "TLS pin MISMATCH (possible MITM): presented=${Base64.encodeToString(spki, Base64.NO_WRAP)}",
+                    ex,
+                )
+                throw ex
+            }
+            DebugLog.v("pin") { "TLS pin OK (authType=$authType)" }
         }
         override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
     }

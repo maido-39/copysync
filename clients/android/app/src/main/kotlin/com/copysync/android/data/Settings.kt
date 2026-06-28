@@ -51,6 +51,16 @@ class Settings(context: Context) {
         get() = prefs.getInt(KEY_AUTOCLEAR, 0)
         set(v) = prefs.edit().putInt(KEY_AUTOCLEAR, v).apply()
 
+    /** "상세 디버깅": persist every event (ms+thread+tag) to the rotating log file. */
+    var verboseDebug: Boolean
+        get() = prefs.getBoolean(KEY_VERBOSE, false)
+        set(v) = prefs.edit().putBoolean(KEY_VERBOSE, v).apply()
+
+    /** One-shot guard: have we already prompted to ignore battery optimization? */
+    var batteryOptAsked: Boolean
+        get() = prefs.getBoolean(KEY_BATT_ASKED, false)
+        set(v) = prefs.edit().putBoolean(KEY_BATT_ASKED, v).apply()
+
     // ---- theme / appearance ----
     var themeMode: String
         get() = prefs.getString(KEY_THEME, "system") ?: "system"
@@ -94,6 +104,8 @@ class Settings(context: Context) {
         const val KEY_SENS = "sensitiveMark"
         const val KEY_EXCLUDE = "excludeSensitive"
         const val KEY_AUTOCLEAR = "autoClearSeconds"
+        const val KEY_VERBOSE = "verboseDebug"
+        const val KEY_BATT_ASKED = "batteryOptAsked"
         const val KEY_THEME = "themeMode"
         const val KEY_BG = "bgImagePath"
         const val KEY_BRIGHT = "bgBrightness"

@@ -47,6 +47,26 @@ pub struct Config {
     pub mark_received_sensitive: bool,
 }
 
+// NOTE: Detailed debug mode is gated by the `COPYSYNC_DEBUG=1` environment
+// variable (see [`crate::engine::debug_enabled`]), which writes the verbose
+// engine event log to `dirs::config_dir()/copysync/logs/engine.log`. The env
+// var is the primary switch; we intentionally do NOT add a `Config` struct
+// field for it here because the crate constructs `Config` via exhaustive struct
+// literals (e.g. `pairing.rs`), and an env-var gate keeps this change additive
+// and self-contained. `Config::debug_logging` lets a host opt in programmatically
+// (e.g. from a host-side persisted setting) without that coupling.
+
+impl Config {
+    /// Host hook for turning on detailed debug logging from outside the engine
+    /// (the `COPYSYNC_DEBUG` env var remains the primary switch and is additive).
+    /// Defaults to off; hosts that persist their own debug toggle can call
+    /// [`crate::engine::force_debug`] instead. Kept here so callers have a single
+    /// documented entry point.
+    pub fn debug_logging(&self) -> bool {
+        false
+    }
+}
+
 /// Default Quick Panel hotkey: Cmd+Shift+V on macOS, Ctrl+Shift+V elsewhere.
 pub const DEFAULT_QUICK_PANEL_SHORTCUT: &str = "CommandOrControl+Shift+KeyV";
 

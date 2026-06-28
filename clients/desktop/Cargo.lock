@@ -921,6 +921,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "clipboard-win",
+ "dirs 5.0.1",
  "futures-util",
  "hex",
  "image",

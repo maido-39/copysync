@@ -72,7 +72,16 @@ func run(cfg config.Config, log *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Detailed connection-lifecycle debug logging, opt-in via COPYSYNC_DEBUG=1.
+	// Read once at startup; lines are emitted by the hub and transport prefixed
+	// with "ws-debug" (greppable) and go to the same logger sink (stderr).
+	debug := os.Getenv("COPYSYNC_DEBUG") == "1"
+	if debug {
+		log.Info("COPYSYNC_DEBUG enabled: verbose connection-lifecycle logging (grep 'ws-debug')")
+	}
+
 	h := hub.New(st, log, time.Now, serverID, cfg.ServerName)
+	h.SetDebug(debug)
 	go h.Run(ctx)
 	go housekeeping(ctx, st, blobStore, log)
 
@@ -140,6 +149,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		ValidateToken:    validate,
 		MaybeRotateToken: maybeRotate,
 		MaxMessage:       func() int64 { s, _ := st.GetSettings(); return s.MaxMessageBytes },
+		Debug:            debug,
 	})
 
 	api := httpapi.New(httpapi.Config{

@@ -31,6 +31,7 @@ arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 regex = "1"
 mdns-sd = "0.11"
+dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
