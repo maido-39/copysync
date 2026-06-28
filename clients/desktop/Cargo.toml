@@ -19,3 +19,11 @@ base64 = "0.22"
 # Smaller, faster debug builds for the heavy native deps.
 [profile.dev]
 opt-level = 1
+
+# Vendored egui-wgpu 0.29.1 with a one-block patch: when no HARDWARE wgpu adapter
+# exists (GPU-less / RDP machines), retry requesting the SOFTWARE FALLBACK adapter
+# (WARP on Windows / llvmpipe) instead of failing — so the native GUI runs without
+# a GPU. eframe 0.29 otherwise hardcodes force_fallback_adapter:false. See
+# vendor/egui-wgpu/src/lib.rs (the only change from upstream 0.29.1).
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
