@@ -1002,7 +1002,7 @@ impl App {
             tray: None,
             hotkey_mgr,
             hotkey_current,
-            hotkey_input: prefs.hotkey,
+            hotkey_input: prefs.hotkey.clone(),
             autostart_on,
             bg: BgImage::from_prefs(&prefs),
             bootstrapped: false,
