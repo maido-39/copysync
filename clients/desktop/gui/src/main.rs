@@ -1994,34 +1994,46 @@ fn main() -> eframe::Result<()> {
         gui_log_line(&format!("에이전트에 연결할 수 없음: {e}"));
     }
 
-    let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 680.0])
-            .with_min_inner_size([420.0, 480.0])
-            .with_title("CopySync"),
-        // Prefer (not Require) hardware acceleration: if the GL driver can't give
-        // us an accelerated context (headless/RDP/old GPU), eframe falls back to
-        // a software/less-capable path instead of failing to open a window. This
-        // is a common silent `gui.exe` launch failure on Windows.
-        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
-        ..Default::default()
+    // Build + run with a chosen renderer. Each call makes its own event channel so
+    // it can be retried cleanly: eframe fails at GL/context init BEFORE invoking
+    // this creator, so a failed attempt leaves no event thread or App behind.
+    let build_and_run = |renderer: eframe::Renderer| -> eframe::Result<()> {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([520.0, 680.0])
+                .with_min_inner_size([420.0, 480.0])
+                .with_title("CopySync"),
+            // Prefer (not Require) HW accel so a weak driver degrades instead of failing.
+            hardware_acceleration: eframe::HardwareAcceleration::Preferred,
+            renderer,
+            ..Default::default()
+        };
+        eframe::run_native(
+            "CopySync",
+            options,
+            Box::new(move |cc| {
+                // Start the event thread now that we hold an egui Context to repaint.
+                let ctx = cc.egui_ctx.clone();
+                std::thread::spawn(move || event_loop(events_tx, ctx));
+                Ok(Box::new(App::new(cc, events_rx)))
+            }),
+        )
     };
 
-    let result = eframe::run_native(
-        "CopySync",
-        options,
-        Box::new(move |cc| {
-            // Start the event thread now that we hold an egui Context to repaint.
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || event_loop(events_tx, ctx));
-            Ok(Box::new(App::new(cc, events_rx)))
-        }),
-    );
+    // Try glow (OpenGL) first — light, best when a real GL driver exists. Fall back
+    // to wgpu (DX12/Vulkan, + WARP software on Windows) when glow can't get an
+    // OpenGL 2.0+ context — the exact failure seen on RDP / driverless VMs.
+    let mut result = build_and_run(eframe::Renderer::Glow);
+    if let Err(e) = &result {
+        gui_log_line(&format!("glow 렌더러 실패 ({e}); wgpu 백엔드로 폴백 재시도"));
+        result = build_and_run(eframe::Renderer::Wgpu);
+        if result.is_ok() {
+            gui_log_line("wgpu 백엔드로 GUI 시작 성공");
+        }
+    }
 
-    // eframe can return Err without ever panicking (e.g. GL/winit init failure).
-    // Log it and show the MessageBox so this path is just as visible as a panic.
+    // Still failed (or any other init error): make it visible (log + MessageBox).
     if let Err(e) = &result {
         let msg = format!("eframe::run_native 실패: {e}");
         gui_log_line(&msg);

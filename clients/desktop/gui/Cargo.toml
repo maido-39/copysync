@@ -11,10 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 copysync-ipc = { path = "../ipc" }
-# egui's default glow (OpenGL) backend — explicitly NO wgpu, smaller link surface
-# and works on the conda GL/X stack. `persistence` gives us eframe storage for the
-# saved theme preference.
-eframe = { version = "0.29", default-features = false, features = ["glow", "persistence", "default_fonts"] }
+# glow (OpenGL) is the primary backend; wgpu (DX12/Vulkan, + WARP software on
+# Windows) is a fallback for machines without an OpenGL 2.0+ context (RDP /
+# driverless VMs) — main() tries glow then falls back to wgpu. `persistence`
+# gives us eframe storage for the saved theme preference.
+eframe = { version = "0.29", default-features = false, features = ["glow", "wgpu", "persistence", "default_fonts"] }
 egui = "0.29"
 interprocess = "2"
 serde = { workspace = true }
