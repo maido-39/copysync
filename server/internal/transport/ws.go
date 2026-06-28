@@ -165,8 +165,12 @@ func serve(parent context.Context, d Deps, c *websocket.Conn, remote string) {
 }
 
 func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Client, device model.DeviceID, lastActivity *atomic.Int64) {
-	ping := time.NewTicker(pingInterval)
-	defer ping.Stop()
+	// NOTE: pinging is deliberately NOT done here. coder/websocket's Ping blocks
+	// until the peer's pong arrives (up to writeTimeout); doing it in this select
+	// would stall draining client.Send for that whole window and could let a burst
+	// fill the send buffer and trigger a spurious "send buffer full" eviction of an
+	// otherwise-healthy client. Liveness pinging lives in idleWatchdog instead, so
+	// this goroutine only ever blocks on actual data writes.
 	for {
 		select {
 		case <-ctx.Done():
@@ -191,22 +195,6 @@ func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Clien
 			}
 			if took := d.Now().Sub(start); took >= slowWriteThreshold {
 				d.dbg("slow-write", "device", device, "took_ms", took.Milliseconds(), "deadline_ms", writeTimeout.Milliseconds(), "bytes", len(b))
-			}
-		case <-ping.C:
-			pctx, cancel := context.WithTimeout(ctx, writeTimeout)
-			start := d.Now()
-			err := c.Ping(pctx)
-			cancel()
-			if err != nil {
-				d.dbg("disconnect", "device", device, "side", "local", "reason", "ping failed", "close_code", websocket.CloseStatus(err), "err", err, "pump", "write")
-				return
-			}
-			// A successful Ping blocks until the peer's pong arrives, so it proves
-			// the peer is alive even when it sends no data frames. Bump liveness so
-			// the watchdog never reaps a healthy-but-idle client.
-			lastActivity.Store(d.Now().UnixNano())
-			if took := d.Now().Sub(start); took >= slowWriteThreshold {
-				d.dbg("slow-ping", "device", device, "took_ms", took.Milliseconds(), "deadline_ms", writeTimeout.Milliseconds())
 			}
 		}
 	}
@@ -265,18 +253,42 @@ func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps
 	}
 }
 
-// idleWatchdog reaps a half-open peer: if neither an inbound frame nor a
-// successful ping-pong has updated lastActivity within idleTimeout, it closes the
-// connection (which unblocks readPump's c.Read). A live-but-idle peer that answers
-// the server's pings keeps lastActivity fresh and is never reaped.
+// idleWatchdog owns liveness: it pings the peer on its own goroutine and reaps a
+// half-open peer. Pinging lives here (not in writePump) so a Ping's pong-wait
+// never stalls the data-write path. coder/websocket's Ping may run concurrently
+// with the Reader/Writer — pongs are consumed by readPump — so issuing it from
+// this goroutine is safe. A successful ping bumps lastActivity (proving a
+// data-silent peer is alive); if neither an inbound frame nor a ping-pong has
+// updated lastActivity within idleTimeout, the connection is closed (which
+// unblocks readPump's c.Read).
 func idleWatchdog(ctx context.Context, d Deps, c *websocket.Conn, device model.DeviceID, remote string, lastActivity *atomic.Int64) {
-	ticker := time.NewTicker(watchdogInterval)
-	defer ticker.Stop()
+	ping := time.NewTicker(pingInterval)
+	defer ping.Stop()
+	watch := time.NewTicker(watchdogInterval)
+	defer watch.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ping.C:
+			pctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			start := d.Now()
+			err := c.Ping(pctx)
+			cancel()
+			if err != nil {
+				// Ping failed/timed out: the peer is gone. Closing unblocks readPump.
+				d.dbg("disconnect", "device", device, "remote", remote, "side", "local", "reason", "ping failed", "close_code", websocket.CloseStatus(err), "err", err, "pump", "watchdog")
+				_ = c.Close(websocket.StatusGoingAway, "ping failed")
+				return
+			}
+			// A successful Ping blocks until the peer's pong arrives, so it proves
+			// the peer is alive even when it sends no data frames. Bump liveness so
+			// the watchdog never reaps a healthy-but-idle client.
+			lastActivity.Store(d.Now().UnixNano())
+			if took := d.Now().Sub(start); took >= slowWriteThreshold {
+				d.dbg("slow-ping", "device", device, "took_ms", took.Milliseconds(), "deadline_ms", writeTimeout.Milliseconds())
+			}
+		case <-watch.C:
 			idle := d.Now().Sub(time.Unix(0, lastActivity.Load()))
 			if idle >= idleTimeout {
 				d.dbg("disconnect", "device", device, "remote", remote, "side", "server", "reason", "idle timeout (half-open peer)", "idle_s", int(idle.Seconds()), "pump", "watchdog")

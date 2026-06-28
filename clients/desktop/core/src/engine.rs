@@ -231,18 +231,35 @@ fn sha_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
 }
 
-fn remember(q: &mut VecDeque<String>, sha: String) {
-    if q.iter().any(|x| x == &sha) {
+/// A content-hash echo-dedup ring entry: the hash plus the instant it was
+/// recorded, so `seen` can suppress only a *recent* echo (the inbound
+/// set_*→watcher round-trip) and NOT a deliberate later re-copy of identical
+/// content (idx 10).
+type Dedup = VecDeque<(String, Instant)>;
+
+/// How long a remembered hash suppresses a matching clip. Long enough to swallow
+/// the inbound-apply → clipboard-watcher re-read round-trip (which happens within
+/// a poll tick or two, i.e. well under a second), short enough that a deliberate
+/// later re-copy of the same content re-syncs (idx 10).
+const ECHO_TTL: Duration = Duration::from_secs(3);
+
+fn remember(q: &mut Dedup, sha: String) {
+    let now = Instant::now();
+    // Refresh the timestamp if we already hold this hash, so a fresh echo window
+    // starts; otherwise append. Either way keep the ring bounded to 64.
+    if let Some(slot) = q.iter_mut().find(|(x, _)| x == &sha) {
+        slot.1 = now;
         return;
     }
     if q.len() >= 64 {
         q.pop_front();
     }
-    q.push_back(sha);
+    q.push_back((sha, now));
 }
 
-fn seen(q: &VecDeque<String>, sha: &str) -> bool {
-    q.iter().any(|x| x == sha)
+fn seen(q: &Dedup, sha: &str) -> bool {
+    q.iter()
+        .any(|(x, t)| x == sha && t.elapsed() < ECHO_TTL)
 }
 
 fn preview(s: &str) -> String {
@@ -319,6 +336,12 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
     let mut last_text = String::new();
     let mut last_img = String::new();
     let mut last_files = String::new();
+    // idx 13: track whether an image/file format was present on the PREVIOUS
+    // generation so the priority cliplog fires only on the rising edge (when a
+    // rich format first appears) rather than on every 800ms poll tick. On
+    // non-Windows seq_num() is None so every tick is a "generation"; without this
+    // edge-gate a persistent image would flood the event feed ~75×/min.
+    let mut had_rich_last = false;
     loop {
         // On Windows, only touch the clipboard when its sequence number changes —
         // re-opening it every tick contends with RDP's redirector and drops copies.
@@ -381,9 +404,15 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
             if img_changed {
                 let img = img_res.expect("img_changed implies Ok");
                 last_img = sha_hex(&img.rgba);
-                // A NEW image arrived: text/files that came with it are stale.
-                last_text.clear();
-                last_files.clear();
+                // idx 3 fix: a NEW image arrived; we prefer it over any coexisting
+                // text/file fallback this generation. But do NOT clear last_text/
+                // last_files to empty — that would make the SAME still-present
+                // companion text/file compare unequal next tick and get spuriously
+                // re-synced as its own clip. Instead snapshot whatever companion is
+                // currently present as "already seen", so an unchanged companion is
+                // deduped next tick while a genuinely-new later change still fires.
+                last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
+                last_files = files_opt.as_ref().map(|f| f.join("\u{1}")).unwrap_or_default();
                 let (w, hh, bytes) = (img.width, img.height, img.rgba.len());
                 dlog!("clipboard", "gen: chose IMAGE {w}x{hh} ({bytes}B rgba); preferred over text/files");
                 let _ = tx.send(Cmd::LocalImage(img));
@@ -392,8 +421,12 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
                 // Windows Explorer file copy (CF_HDROP).
                 let files = files_opt.clone().expect("files_changed implies Some");
                 last_files = files.join("\u{1}");
-                last_text.clear();
-                last_img.clear();
+                // idx 3 fix: same as the image branch — snapshot the coexisting
+                // text/image companions as already-seen instead of clearing to
+                // empty, so an unchanged companion isn't spuriously re-synced next
+                // tick while a genuinely-new later change still fires.
+                last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
+                last_img = img_res.as_ref().ok().map(|img| sha_hex(&img.rgba)).unwrap_or_default();
                 dlog!("clipboard", "gen: chose FILES ({} path(s)); preferred over text", files.len());
                 let _ = tx.send(Cmd::LocalFiles(files));
                 handled = true;
@@ -424,12 +457,17 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
 
             // Observability: if an image/file format *was* present this generation,
             // record it so any future re-introduction of text-shadowing is visible
-            // in the debug feed even when dedup meant we sent nothing.
-            if had_image || had_files {
+            // in the debug feed even when dedup meant we sent nothing. idx 13: only
+            // emit on the rising edge (a rich format newly appeared) — NOT every
+            // tick — so a persistent image doesn't flood the feed on non-Windows
+            // where every 800ms tick is a "generation".
+            let had_rich = had_image || had_files;
+            if had_rich && !had_rich_last {
                 emit.cliplog(format!(
                     "클립보드 우선순위: 이미지/파일 포맷 감지 (image={had_image}, files={had_files}) → 텍스트보다 우선 동기화"
                 ));
             }
+            had_rich_last = had_rich;
 
             if read_ok {
                 // Only now mark this generation as consumed.
@@ -532,15 +570,31 @@ pub async fn run(
     let http = pinning::http_client(pin);
     let pull = blob::pull_client(pin);
     let mut seq: u64 = 0;
-    let mut recent_text: VecDeque<String> = VecDeque::new();
-    let mut recent_img: VecDeque<String> = VecDeque::new();
-    let mut recent_files: VecDeque<String> = VecDeque::new();
+    let mut recent_text: Dedup = VecDeque::new();
+    let mut recent_img: Dedup = VecDeque::new();
+    let mut recent_files: Dedup = VecDeque::new();
     let mut on_demand: HashMap<String, Hold> = HashMap::new();
     // Insertion order for `on_demand`, so the bounded ring can evict the oldest
     // advertised-but-unfetched hold (see hold_on_demand) — the leak fix.
     let mut on_demand_order: VecDeque<String> = VecDeque::new();
     let reconnect = state.reconnect.clone();
     let mut attempt: u32 = 0;
+
+    // idx 0 fix: the OFF-LOOP blob result channel lives for the WHOLE run, NOT
+    // per-connection. A transfer that started on a prior connection (a slow
+    // upload/download, or the server's up-to-60s on-demand long-poll) finishes
+    // by sending its BlobResult here; if the channel were re-created per
+    // connection, that result would land in a dropped receiver and be silently
+    // lost — the clip would never be advertised (outbound) or applied (inbound).
+    // Keeping it persistent means the result is still delivered on the NEW
+    // socket. Declared like seq/recent_*/on_demand above.
+    let (blob_tx, mut blob_rx) = tokio::sync::mpsc::unbounded_channel::<BlobResult>();
+    // idx 0 fix: when an Upload result arrives but the current socket's T_CLIP
+    // send fails (e.g. the link dropped between the upload finishing and the
+    // advertise), we don't discard the clip — we stash the already-built
+    // ClipEvent (plus its history/emit bookkeeping) here and re-advertise it at
+    // the top of the next connection so the peers still learn about the blob.
+    let mut pending_uploads: Vec<BlobResult> = Vec::new();
 
     loop {
         dlog!("ws", "connect: dialing {} (attempt #{attempt})", cfg.server_url);
@@ -578,13 +632,60 @@ pub async fn run(
                 ping_at.tick().await;
                 let mut watchdog = tokio::time::interval(Duration::from_secs(15));
                 watchdog.tick().await;
-                // Internal channel for OFF-LOOP blob workers (idx 1). put_blob/get_blob
-                // now run in tokio::spawn tasks and report results here, so this arm is
-                // polled alongside ws::recv/ping/watchdog — the WS read half keeps
-                // flushing pongs while a (possibly 60s long-poll) transfer is in flight,
-                // instead of stalling the whole select! and getting reaped as dead.
-                // Re-created per connection so results from a dead socket are dropped.
-                let (blob_tx, mut blob_rx) = tokio::sync::mpsc::unbounded_channel::<BlobResult>();
+                // The OFF-LOOP blob result channel (blob_tx/blob_rx) is owned by
+                // the WHOLE run (declared before the reconnect loop) — see the
+                // idx 0 fix there. We poll blob_rx in this select! alongside
+                // ws::recv/ping/watchdog so the WS read half keeps flushing pongs
+                // while a (possibly 60s long-poll) transfer is in flight, AND so a
+                // transfer that started on a previous connection still delivers
+                // its result here instead of being silently dropped.
+                //
+                // idx 0 fix: re-advertise any uploads whose T_CLIP send failed on
+                // a prior (now-dead) connection. The blob bytes are already on the
+                // server; we just need to tell the peers about them on this fresh
+                // socket. Done before entering the select! so it can't be starved.
+                if !pending_uploads.is_empty() {
+                    let stash = std::mem::take(&mut pending_uploads);
+                    let mut requeue_failed = false;
+                    for res in stash {
+                        if requeue_failed {
+                            // Socket already proven down this pass — keep the rest.
+                            pending_uploads.push(res);
+                            continue;
+                        }
+                        match res {
+                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error } => {
+                                dlog!("send", "re-advertising pending upload seq={} blob_id={} on new connection", ev.seq, ev.blob_id);
+                                if ws::send(&mut sock, protocol::T_CLIP, &ev).await.is_err() {
+                                    dlog!("send", "re-advertise seq={}: ws::send FAILED — control channel down again", ev.seq);
+                                    requeue_failed = true;
+                                    pending_uploads.push(BlobResult::Upload {
+                                        outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error,
+                                    });
+                                } else {
+                                    add_history(&hist, &ev.ts, hist_kind, "me", "out", &hist_preview, &hist_mime, hist_size, &ev.blob_id, &hist_name);
+                                    emit.clip(emit_json);
+                                }
+                            }
+                            // Only Upload results are ever stashed (downloads/serves
+                            // are not re-advertised); ignore anything else defensively.
+                            _ => {}
+                        }
+                    }
+                    if requeue_failed {
+                        // Don't even enter the select! on a socket we already know
+                        // is dead; fall through to the reconnect/backoff path.
+                        emit.error("재연결 직후 제어 채널이 다시 끊겨 보류 중인 클립을 다음 연결에서 다시 시도합니다".to_string());
+                        set_connected(&*emit, &status, false);
+                        attempt = attempt.saturating_add(1);
+                        let delay = backoff_delay(attempt);
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = reconnect.notified() => {}
+                        }
+                        continue;
+                    }
+                }
                 let why: String = 'inner: loop {
                     tokio::select! {
                         _ = ping_at.tick() => {
@@ -695,8 +796,17 @@ pub async fn run(
                                     Ok(()) => {
                                         dlog!("send", "upload done seq={} blob_id={} → control channel", ev.seq, ev.blob_id);
                                         if ws::send(&mut sock, protocol::T_CLIP, &ev).await.is_err() {
-                                            dlog!("send", "upload done seq={}: ws::send FAILED — control channel down", ev.seq);
-                                            break 'inner "클립 전송 실패 — 제어 채널 끊김".to_string();
+                                            // idx 0 fix: the upload completed (bytes are on the
+                                            // server) but the control channel just died before we
+                                            // could advertise. Do NOT drop the clip — stash it so
+                                            // the next connection re-advertises it (history/emit
+                                            // are recorded only after a successful advertise).
+                                            dlog!("send", "upload done seq={}: ws::send FAILED — stashing for re-advertise on reconnect", ev.seq);
+                                            pending_uploads.push(BlobResult::Upload {
+                                                outcome: Ok(()),
+                                                ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error,
+                                            });
+                                            break 'inner "클립 전송 실패 — 제어 채널 끊김(보류 후 재연결 시 재전송)".to_string();
                                         }
                                         add_history(&hist, &ev.ts, hist_kind, "me", "out", &hist_preview, &hist_mime, hist_size, &ev.blob_id, &hist_name);
                                         emit.clip(emit_json);
@@ -1194,7 +1304,7 @@ async fn handle_frame(
     state: &EngineState,
     hist: &Arc<Mutex<History>>,
     roster: &Arc<Mutex<Vec<RosterDevice>>>,
-    recent_text: &mut VecDeque<String>,
+    recent_text: &mut Dedup,
     on_demand: &mut HashMap<String, Hold>,
     blob_tx: &UnboundedSender<BlobResult>,
 ) {
@@ -1282,19 +1392,30 @@ fn apply_blob(
     state: &EngineState,
     hist: &Arc<Mutex<History>>,
     downloads: &Path,
-    recent_img: &mut VecDeque<String>,
-    recent_files: &mut VecDeque<String>,
+    recent_img: &mut Dedup,
+    recent_files: &mut Dedup,
 ) {
     {
         let plain = match (&ev.enc, key) {
-            (Some(_), Some((k, _))) => match e2e::open(k, &data) {
-                Ok(p) => p,
-                Err(_) => {
-                    dlog!("recv", "blob decrypt FAILED (wrong passphrase / ciphertext) blob_id={}", ev.blob_id);
-                    emit.notify("CopySync", "받은 파일을 복호화할 수 없습니다 (암호문?)");
+            (Some(meta), Some((k, kid))) => {
+                // idx 12 fix: surface a precise "different passphrase" diagnostic
+                // when the sender's key_id is known and doesn't match ours, instead
+                // of the generic GCM-tag-failure "can't decrypt" message (parity
+                // with Android's SyncService).
+                if !meta.key_id.is_empty() && &meta.key_id != kid {
+                    dlog!("recv", "no matching E2E key for blob: sender kid={} local kid={} blob_id={}", meta.key_id, kid, ev.blob_id);
+                    emit.notify("CopySync", &format!("다른 암호로 암호화된 파일을 받았습니다 (keyId={})", meta.key_id));
                     return;
                 }
-            },
+                match e2e::open(k, &data) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        dlog!("recv", "blob decrypt FAILED (wrong passphrase / ciphertext) blob_id={}", ev.blob_id);
+                        emit.notify("CopySync", "받은 파일을 복호화할 수 없습니다 (암호문?)");
+                        return;
+                    }
+                }
+            }
             (Some(_), None) => {
                 dlog!("recv", "blob is encrypted but no E2E key set — cannot apply");
                 emit.notify("CopySync", "암호화된 파일을 받았지만 암호문이 설정되지 않았습니다");
@@ -1355,10 +1476,20 @@ async fn handle_incoming_text(
     emit: &dyn Emitter,
     state: &EngineState,
     hist: &Arc<Mutex<History>>,
-    recent_text: &mut VecDeque<String>,
+    recent_text: &mut Dedup,
 ) {
     let text = match (&ev.enc, key) {
-        (Some(_), Some((k, _))) => {
+        (Some(meta), Some((k, kid))) => {
+            // idx 12 fix: if the sender's key_id is known and differs from ours,
+            // this clip was encrypted with a DIFFERENT passphrase/group key.
+            // GCM would just fail the tag and we'd show a generic "can't decrypt"
+            // — instead give the precise, actionable diagnostic Android gives
+            // (SyncService.kt) so a mismatched-passphrase misconfig is obvious.
+            if !meta.key_id.is_empty() && &meta.key_id != kid {
+                dlog!("recv", "no matching E2E key: sender kid={} local kid={}", meta.key_id, kid);
+                emit.notify("CopySync", &format!("다른 암호로 암호화된 클립을 받았습니다 (keyId={})", meta.key_id));
+                return;
+            }
             use base64::{engine::general_purpose::STANDARD, Engine};
             let raw = match STANDARD.decode(&ev.inline_text) {
                 Ok(r) => r,

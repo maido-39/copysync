@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/syaro/copysync/internal/blob"
+	"github.com/syaro/copysync/internal/hub"
 	"github.com/syaro/copysync/internal/model"
 )
 
@@ -109,13 +110,21 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "unavailable", "blob channel disabled")
 		return
 	}
-	if _, ok := s.authBlob(r); !ok {
+	dev, ok := s.authBlob(r)
+	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "invalid device token")
 		return
 	}
 	id := r.PathValue("id")
 	if !blob.ValidID(id) {
 		writeJSONError(w, http.StatusBadRequest, "bad_id", "id must be sha256:<hex>")
+		return
+	}
+	// Only the recorded on-demand origin holder may supply a blob's bytes, so a
+	// paired device cannot inject content for a blob id it never advertised.
+	if s.hub != nil && !s.hub.AuthorizedForBlob(model.BlobID(id), dev.ID, hub.BlobSupply) {
+		// 404 rather than 403 so the response does not confirm the id exists.
+		writeJSONError(w, http.StatusNotFound, "not_found", "blob not found")
 		return
 	}
 	settings, _ := s.store.GetSettings()
@@ -147,13 +156,23 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "unavailable", "blob channel disabled")
 		return
 	}
-	if _, ok := s.authBlob(r); !ok {
+	dev, ok := s.authBlob(r)
+	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "invalid device token")
 		return
 	}
 	id := r.PathValue("id")
 	if !blob.ValidID(id) {
 		writeJSONError(w, http.StatusBadRequest, "bad_id", "id must be sha256:<hex>")
+		return
+	}
+	// Authorize against the clip that referenced this blob: a device may only
+	// fetch a blob it was a recipient of (origin ∪ targets / origin's pool). This
+	// also prevents an unauthorized requester from coercing pullOnDemand into
+	// waking the origin to upload bytes it only shared within another pool.
+	if s.hub != nil && !s.hub.AuthorizedForBlob(model.BlobID(id), dev.ID, hub.BlobFetch) {
+		// 404 rather than 403 so the response does not confirm the id exists.
+		writeJSONError(w, http.StatusNotFound, "not_found", "blob not found")
 		return
 	}
 	rc, _, err := s.blobStore.Open(id)

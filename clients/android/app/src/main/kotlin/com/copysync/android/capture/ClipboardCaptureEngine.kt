@@ -220,7 +220,16 @@ class ClipboardCaptureEngine(
 
     private fun imageClip(bytes: ByteArray, name: String): ClipData? = runCatching {
         val dir = File(context.cacheDir, "clip-out").apply { mkdirs() }
-        val f = File(dir, name).apply { writeBytes(bytes) }
+        // Sanitize a remote-controlled name to a bare basename to prevent path
+        // traversal (e.g. "../../databases/history.db"). Strip any directory
+        // component using both separators and reject empty/"."/".." results.
+        val safe = name.substringAfterLast('/').substringAfterLast('\\')
+            .ifBlank { "file" }
+            .let { if (it == "." || it == "..") "file" else it }
+        val f = File(dir, safe)
+        // Defense-in-depth: never write outside the intended directory.
+        if (!f.canonicalPath.startsWith(dir.canonicalPath + File.separator)) return@runCatching null
+        f.writeBytes(bytes)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
         ClipData.newUri(context.contentResolver, "CopySync", uri)
     }.getOrNull()

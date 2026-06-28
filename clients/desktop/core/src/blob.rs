@@ -40,7 +40,19 @@ pub async fn get_blob(
     if !resp.status().is_success() {
         anyhow::bail!("blob GET {}", resp.status().as_u16());
     }
-    Ok(resp.bytes().await?.to_vec())
+    let bytes = resp.bytes().await?.to_vec();
+    // idx 4 fix: the blob id IS the content address (sha256:<hex>) of the bytes,
+    // so recompute it on receipt and reject a mismatch. This restores the
+    // content-addressed integrity guarantee for the non-E2E (plaintext) path —
+    // where, unlike E2E, nothing else authenticates the relayed bytes — and is
+    // harmless for E2E (the id covers the ciphertext, which GCM also checks).
+    // Every caller fetches by ev.blob_id, which is always content-addressed, so
+    // this check is always valid.
+    let got = blob_id(&bytes);
+    if got != id {
+        anyhow::bail!("blob hash mismatch: requested {id}, got {got}");
+    }
+    Ok(bytes)
 }
 
 /// A reqwest client with a long timeout for on-demand pulls.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -102,6 +103,14 @@ func run(cfg config.Config, log *slog.Logger) error {
 		return dev, true
 	}
 
+	// pendingReissue records, per device, the grace (previous) token hash a device
+	// presented when maybeRotate decided to re-mint a token from the grace state
+	// (a prior rotation whose token_rotate frame was lost). commitRotation reads it
+	// to choose ReissuePendingToken over RotateToken. Guarded because maybeRotate
+	// runs on a per-connection goroutine.
+	var reissueMu sync.Mutex
+	pendingReissue := make(map[model.DeviceID]string)
+
 	// maybeRotate runs after a successful auth (Stage-3 token rotation): it retires
 	// the old token once the new one is in use, and decides whether to re-issue a
 	// token older than the configured age. Returns a new plaintext token to
@@ -121,9 +130,25 @@ func run(cfg config.Config, log *slog.Logger) error {
 			_ = st.RetireOldToken(id)
 			return ""
 		}
-		// Re-issue only from the current token, when enabled, not already rotating, and old enough.
 		s, _ := st.GetSettings()
-		if s.TokenRotateDays <= 0 || rec.PrevHash != "" || !curMatch {
+		if s.TokenRotateDays <= 0 {
+			return ""
+		}
+		// Self-heal a wedged rotation: the device is authenticating on the GRACE
+		// (previous) token while a rotation is pending — i.e. it never received the
+		// earlier token_rotate frame. The plaintext of that pending token is gone,
+		// so mint a FRESH one and re-deliver. commitRotation will swap the pending
+		// hash via ReissuePendingToken, keeping the grace token valid so the device
+		// is never locked out, until it finally ACKs by presenting the new token.
+		prevMatch := rec.PrevHash != "" && auth.ConstantTimeEqual(rec.PrevHash, presented)
+		if !curMatch && prevMatch {
+			reissueMu.Lock()
+			pendingReissue[id] = rec.PrevHash
+			reissueMu.Unlock()
+			return auth.GenerateToken()
+		}
+		// Re-issue only from the current token, when not already rotating, and old enough.
+		if rec.PrevHash != "" || !curMatch {
 			return ""
 		}
 		if time.Since(rec.IssuedAt) < time.Duration(s.TokenRotateDays)*24*time.Hour {
@@ -135,7 +160,20 @@ func run(cfg config.Config, log *slog.Logger) error {
 	// commitRotation durably records a rotation (called by the transport only after
 	// the token_rotate frame carrying newToken was successfully queued).
 	commitRotation := func(id model.DeviceID, newToken string) {
-		if err := st.RotateToken(id, auth.HashToken(secret, newToken), time.Now()); err != nil {
+		newHash := auth.HashToken(secret, newToken)
+		reissueMu.Lock()
+		prevHash, reissue := pendingReissue[id]
+		delete(pendingReissue, id)
+		reissueMu.Unlock()
+		if reissue {
+			// Grace re-issue path: replace the orphaned pending token rather than
+			// no-op'ing on the already-set PrevHash (which RotateToken would do).
+			if _, err := st.ReissuePendingToken(id, prevHash, newHash, time.Now()); err != nil {
+				log.Warn("commit token re-issue failed", "device", id, "err", err)
+			}
+			return
+		}
+		if err := st.RotateToken(id, newHash, time.Now()); err != nil {
 			log.Warn("commit token rotation failed", "device", id, "err", err)
 		}
 	}

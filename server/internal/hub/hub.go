@@ -62,6 +62,21 @@ type blobReqMsg struct {
 	reply chan bool
 }
 
+type blobAuthReq struct {
+	id    model.BlobID
+	dev   model.DeviceID
+	mode  BlobAuthMode
+	reply chan bool
+}
+
+// blobACL records who may fetch a blob: the origin holder (the only device
+// allowed to PUT it on demand) and the set of devices the referencing clip was
+// routed to (origin ∪ targets).
+type blobACL struct {
+	origin  model.DeviceID
+	allowed map[model.DeviceID]bool
+}
+
 // Hub owns the registry of connected clients and routes clips.
 type Hub struct {
 	store      Store
@@ -76,11 +91,16 @@ type Hub struct {
 	route      chan routeReq
 	roster     chan rosterReq
 	blobReq    chan blobReqMsg
+	blobAuth   chan blobAuthReq
 	setPool    chan setPoolReq
 	evict      chan model.DeviceID
 
 	clients  map[model.DeviceID]*Client      // owned by Run only
 	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
+	// blobACL authorizes the blob channel: blobId -> the device set permitted to
+	// fetch it (origin ∪ the referencing clip's targets), so a paired device can
+	// only pull blobs it was actually a recipient of. Owned by Run.
+	blobACL map[model.BlobID]blobACL
 
 	monMu     sync.Mutex                // guards the live-monitor subscribers + ring
 	monSubs   map[int]chan MonitorEvent // admin live-monitor subscribers
@@ -104,10 +124,12 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		route:      make(chan routeReq),
 		roster:     make(chan rosterReq),
 		blobReq:    make(chan blobReqMsg),
+		blobAuth:   make(chan blobAuthReq),
 		setPool:    make(chan setPoolReq),
 		evict:      make(chan model.DeviceID),
 		clients:    make(map[model.DeviceID]*Client),
 		onDemand:   make(map[model.BlobID]model.DeviceID),
+		blobACL:    make(map[model.BlobID]blobACL),
 		monSubs:    make(map[int]chan MonitorEvent),
 	}
 }
@@ -142,6 +164,8 @@ func (h *Hub) Run(ctx context.Context) {
 			r.reply <- h.snapshot()
 		case r := <-h.blobReq:
 			r.reply <- h.handleBlobRequest(r.id)
+		case r := <-h.blobAuth:
+			r.reply <- h.handleBlobAuth(r.id, r.dev, r.mode)
 		case r := <-h.setPool:
 			h.handleSetPool(r.id, r.pool)
 			close(r.reply)
@@ -189,6 +213,62 @@ func (h *Hub) RequestBlob(id model.BlobID) bool {
 	reply := make(chan bool, 1)
 	h.blobReq <- blobReqMsg{id: id, reply: reply}
 	return <-reply
+}
+
+// BlobAuthMode selects which authorization a blob-channel request needs.
+type BlobAuthMode int
+
+const (
+	// BlobFetch authorizes a GET: dev must be a recorded recipient of the clip
+	// that referenced the blob (origin ∪ targets), or — when no ACL is on record —
+	// share the origin's pool.
+	BlobFetch BlobAuthMode = iota
+	// BlobSupply authorizes an on-demand PUT: dev must be the recorded origin
+	// holder of the blob.
+	BlobSupply
+)
+
+// AuthorizedForBlob reports whether dev is permitted to perform the given
+// blob-channel operation on id. It is dispatched onto the Run goroutine so it
+// reads the onDemand/blobACL maps without locking.
+func (h *Hub) AuthorizedForBlob(id model.BlobID, dev model.DeviceID, mode BlobAuthMode) bool {
+	reply := make(chan bool, 1)
+	h.blobAuth <- blobAuthReq{id: id, dev: dev, reply: reply, mode: mode}
+	return <-reply
+}
+
+func (h *Hub) handleBlobAuth(id model.BlobID, dev model.DeviceID, mode BlobAuthMode) bool {
+	if mode == BlobSupply {
+		// Only the device that advertised the on-demand blob may upload its bytes.
+		origin, ok := h.onDemand[id]
+		return ok && origin == dev
+	}
+	// Fetch path: dev must be in the referencing clip's recipient set.
+	if acl, ok := h.blobACL[id]; ok {
+		return acl.allowed[dev]
+	}
+	// No ACL recorded for this blob (e.g. it predates this process or was never
+	// routed through here). Fall back to pool scoping against the on-demand
+	// origin if we know one; otherwise deny.
+	origin, ok := h.onDemand[id]
+	if !ok {
+		return false
+	}
+	return h.poolOf(origin) == h.poolOf(dev)
+}
+
+// pruneOnDemand drops every on-demand blob holding (and its ACL) owned by id and
+// returns how many on-demand entries were removed.
+func (h *Hub) pruneOnDemand(id model.DeviceID) int {
+	pruned := 0
+	for blobID, holder := range h.onDemand {
+		if holder == id {
+			delete(h.onDemand, blobID)
+			delete(h.blobACL, blobID)
+			pruned++
+		}
+	}
+	return pruned
 }
 
 func (h *Hub) handleBlobRequest(id model.BlobID) bool {
@@ -282,13 +362,7 @@ func (h *Hub) handleUnregister(c *Client) {
 		// Prune on-demand blob holdings owned by this device: once it is offline,
 		// nobody can pull those blobs from it, so the entries are dead weight.
 		// (Previously this map was never cleaned up and grew unbounded.)
-		pruned := 0
-		for blobID, holder := range h.onDemand {
-			if holder == id {
-				delete(h.onDemand, blobID)
-				pruned++
-			}
-		}
+		pruned := h.pruneOnDemand(id)
 		h.dbg("unregister", "device", id, "reason", c.CloseReason(), "evicted", c.Evicted(), "online_count", len(h.clients), "ondemand_pruned", pruned, "ondemand_size", len(h.onDemand))
 		h.broadcastPresence(c.Device, false, "")
 	} else {
@@ -308,13 +382,7 @@ func (h *Hub) handleEvict(id model.DeviceID) {
 	delete(h.clients, id)
 	// Drop any on-demand blob holdings owned by this device; nobody can pull them
 	// from a connection that is being torn down.
-	pruned := 0
-	for blobID, holder := range h.onDemand {
-		if holder == id {
-			delete(h.onDemand, blobID)
-			pruned++
-		}
-	}
+	pruned := h.pruneOnDemand(id)
 	h.dbg("evict-by-id", "device", id, "ondemand_pruned", pruned, "online_count", len(h.clients))
 	// The store record is already gone, so announce offline using the client's
 	// own device snapshot.
@@ -328,13 +396,28 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	// with no encryption metadata violates that invariant — reject it before it
 	// reaches the monitor feed or any peer. (The broadcast endpoint is the one
 	// legitimate plaintext source, and it is already blocked when E2E is on.)
-	if settings.E2EEnabled && ev.Enc == nil && (ev.InlineText != "" || ev.Html != "") {
+	if settings.E2EEnabled && ev.Enc == nil && (ev.InlineText != "" || ev.Html != "" || ev.BlobID != "") {
+		// A blob-bearing clip with no encryption metadata means its referenced
+		// payload is plaintext; under enforced E2E it must not be relayed/queued
+		// or recorded as an on-demand holder (which would let peers pull the
+		// plaintext bytes). Reject before any of that happens.
 		h.log.Warn("rejected plaintext clip while E2E enforced", "device", ev.OriginDevice)
 		return RouteResult{Status: protocol.AckRejected}
 	}
 	h.publishMonitor(ev, settings.E2EEnabled)
 	_ = h.store.RecordActivity(h.now(), ev.Size)
 	targets := h.resolveTargets(ev)
+	// Authorize the blob channel against this clip: record the recipient set
+	// (origin ∪ targets) so a later GET /blob/<id> is only served to a device the
+	// clip was actually routed to (mirroring resolveTargets' pool/target scoping).
+	if ev.BlobID != "" {
+		allowed := make(map[model.DeviceID]bool, len(targets)+1)
+		allowed[ev.OriginDevice] = true
+		for _, d := range targets {
+			allowed[d.ID] = true
+		}
+		h.blobACL[ev.BlobID] = blobACL{origin: ev.OriginDevice, allowed: allowed}
+	}
 	// Remember who holds an on-demand blob so a later GET can pull it from them.
 	if ev.OnDemand && ev.BlobID != "" {
 		h.onDemand[ev.BlobID] = ev.OriginDevice
@@ -355,10 +438,13 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 				relayedAny = true
 				continue
 			}
-			// Slow client: disconnect and queue; it reconnects and drains.
+			// Slow client: disconnect and queue; it reconnects and drains. Reclaim
+			// its on-demand blob holdings here too — handleUnregister will see the
+			// registry entry already gone (stale branch) and skip pruning otherwise.
 			h.dbg("evict", "device", dev.ID, "reason", "send buffer full", "side", "server")
 			c.Close("send buffer full")
 			delete(h.clients, dev.ID)
+			h.pruneOnDemand(dev.ID)
 		}
 		h.enqueue(dev.ID, ev, settings.QueueDepthPerDevice)
 		queuedFor = append(queuedFor, dev.ID)

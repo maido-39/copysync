@@ -63,6 +63,48 @@ func (s *Store) RotateToken(id model.DeviceID, newHash string, now time.Time) er
 	})
 }
 
+// ReissuePendingToken replaces a pending-but-unconfirmed rotation with a fresh
+// token while the device is still authenticating on the PREVIOUS token. It is
+// used to self-heal a rotation whose token_rotate frame was lost before the
+// client persisted it: the plaintext of the previously-issued new token is gone,
+// so a brand-new one is minted. The grace token (PrevHash) is kept so the device
+// stays authenticated; the orphaned previous TokenHash is removed from the index
+// to avoid a dangling entry. No-op (and reports false) unless a rotation is
+// pending (PrevHash set) and the device currently presents that PrevHash.
+func (s *Store) ReissuePendingToken(id model.DeviceID, prevHash, newHash string, now time.Time) (bool, error) {
+	done := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var rec model.TokenRecord
+		found, err := getJSON(tx.Bucket(bucketTokens), []byte(id), &rec)
+		if err != nil || !found {
+			return err
+		}
+		// Only re-issue from the grace state: a rotation must be pending and the
+		// device must still hold the previous (grace) token.
+		if rec.PrevHash == "" || rec.PrevHash != prevHash || rec.TokenHash == newHash {
+			return nil
+		}
+		idx := tx.Bucket(bucketTokenIndex)
+		// Drop the orphaned, never-delivered new-token hash from the index.
+		if rec.TokenHash != "" && rec.TokenHash != rec.PrevHash {
+			if err := idx.Delete([]byte(rec.TokenHash)); err != nil {
+				return err
+			}
+		}
+		rec.TokenHash = newHash
+		rec.IssuedAt = now
+		if err := putJSON(tx.Bucket(bucketTokens), []byte(id), rec); err != nil {
+			return err
+		}
+		if err := idx.Put([]byte(newHash), []byte(id)); err != nil {
+			return err
+		}
+		done = true
+		return nil
+	})
+	return done, err
+}
+
 // RetireOldToken invalidates the previous token once the device has proven it
 // holds the new one. No-op when no rotation is pending.
 func (s *Store) RetireOldToken(id model.DeviceID) error {

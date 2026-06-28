@@ -343,15 +343,20 @@ fn build_tray() -> Result<TrayIcon> {
 /// emits a synthetic `Reconnect` note, sleeps 1s, and reconnects forever.
 fn event_loop(tx: Sender<Event>, ctx: egui::Context) {
     loop {
-        match subscribe_stream(&tx, &ctx) {
-            Ok(()) => { /* clean EOF — fall through to reconnect */ }
-            Err(e) => {
-                let _ = tx.send(Event::Reconnect {
-                    info: format!("이벤트 연결 끊김: {e}"),
-                });
-                ctx.request_repaint();
-            }
+        // Each iteration ends by sending a synthetic `Reconnect` heartbeat. If that
+        // send fails, the App (and its `Receiver`) has been dropped — e.g. the
+        // window closed, or a renderer attempt that already spawned us was torn down
+        // and main() retried with another backend. A failed send is the one reliable
+        // signal that this thread is now orphaned, so we `return` instead of looping
+        // forever (which would keep calling `ensure_agent()` and respawn the agent).
+        let info = match subscribe_stream(&tx, &ctx) {
+            Ok(()) => "이벤트 연결 재시도".to_string(), // clean EOF — reconnect
+            Err(e) => format!("이벤트 연결 끊김: {e}"),
+        };
+        if tx.send(Event::Reconnect { info }).is_err() {
+            return; // UI gone — stop this (possibly orphaned) thread.
         }
+        ctx.request_repaint();
         std::thread::sleep(Duration::from_secs(1));
         // If the agent died, try to bring it back before reconnecting.
         let _ = ensure_agent();
@@ -2596,10 +2601,16 @@ fn main() -> eframe::Result<()> {
         gui_log_line(&format!("에이전트에 연결할 수 없음: {e}"));
     }
 
-    // Build + run with a chosen renderer. Each call makes its own event channel so
-    // it can be retried cleanly: eframe fails at GL/context init BEFORE invoking
-    // this creator, so a failed attempt leaves no event thread or App behind.
-    let build_and_run = |renderer: eframe::Renderer| -> eframe::Result<()> {
+    // Build + run with a chosen renderer. Each call makes its own event channel.
+    // `creator_ran` records whether eframe got far enough to invoke our creator
+    // closure (which spawns the long-lived event thread). The common glow failure
+    // (no GL 2.0+ context) errors BEFORE the creator runs, leaving no thread/App
+    // behind — only then is a wgpu retry safe. If glow created the window+context,
+    // ran the creator (spawning event thread #1) and then failed afterward, a retry
+    // would orphan that thread; so the caller skips the retry in that case.
+    let build_and_run = |renderer: eframe::Renderer,
+                         creator_ran: std::sync::Arc<std::sync::atomic::AtomicBool>|
+     -> eframe::Result<()> {
         let (events_tx, events_rx) = std::sync::mpsc::channel::<Event>();
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -2616,6 +2627,10 @@ fn main() -> eframe::Result<()> {
             "CopySync",
             options,
             Box::new(move |cc| {
+                // The creator ran: a window + context exist and the event thread is
+                // about to be spawned. Record this so a post-creator failure does not
+                // trigger a renderer retry that would orphan this thread.
+                creator_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 // Start the event thread now that we hold an egui Context to repaint.
                 let ctx = cc.egui_ctx.clone();
                 std::thread::spawn(move || event_loop(events_tx, ctx));
@@ -2627,12 +2642,24 @@ fn main() -> eframe::Result<()> {
     // Try glow (OpenGL) first — light, best when a real GL driver exists. Fall back
     // to wgpu (DX12/Vulkan, + WARP software on Windows) when glow can't get an
     // OpenGL 2.0+ context — the exact failure seen on RDP / driverless VMs.
-    let mut result = build_and_run(eframe::Renderer::Glow);
+    let glow_creator_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut result = build_and_run(eframe::Renderer::Glow, glow_creator_ran.clone());
     if let Err(e) = &result {
-        gui_log_line(&format!("glow 렌더러 실패 ({e}); wgpu 백엔드로 폴백 재시도"));
-        result = build_and_run(eframe::Renderer::Wgpu);
-        if result.is_ok() {
-            gui_log_line("wgpu 백엔드로 GUI 시작 성공");
+        // Only fall back when glow failed at init (before its creator spawned the
+        // event thread). A post-creator failure already left a live event thread; a
+        // wgpu retry would spawn a second one, so don't retry in that case.
+        if glow_creator_ran.load(std::sync::atomic::Ordering::SeqCst) {
+            gui_log_line(&format!(
+                "glow 렌더러가 초기화 후 실패 ({e}); 이벤트 스레드 중복 생성을 피하기 위해 wgpu 폴백 생략"
+            ));
+        } else {
+            gui_log_line(&format!("glow 렌더러 실패 ({e}); wgpu 백엔드로 폴백 재시도"));
+            let wgpu_creator_ran =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            result = build_and_run(eframe::Renderer::Wgpu, wgpu_creator_ran);
+            if result.is_ok() {
+                gui_log_line("wgpu 백엔드로 GUI 시작 성공");
+            }
         }
     }
 
