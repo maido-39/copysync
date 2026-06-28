@@ -1987,6 +1987,14 @@ fn main() -> eframe::Result<()> {
     install_crash_handler();
     gui_log_line("GUI 프로세스 시작");
 
+    // If a bundled Mesa software-GL (opengl32.dll + libgallium_wgl.dll) sits next
+    // to the exe — the "softgl" build for GPU-less machines (RDP / no driver) —
+    // force the pure-CPU llvmpipe driver so glow gets an OpenGL 3.3 context with
+    // NO GPU/DX adapter at all. Harmless when no bundled Mesa is present (the
+    // system opengl32 ignores GALLIUM_DRIVER). Set before any GL/thread init.
+    #[cfg(windows)]
+    std::env::set_var("GALLIUM_DRIVER", "llvmpipe");
+
     // Best-effort: make sure the agent is up before the window opens. The UI
     // still launches (showing "연결 끊김") if this fails. Route the error to
     // gui.log — `eprintln!` is invisible under the windows subsystem.
