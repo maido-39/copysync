@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 use eframe::egui;
-use egui::{Color32, Margin, Rounding, Stroke};
+use egui::{Color32, LayerId, Margin, Rounding, Stroke};
 use egui::epaint::Shadow;
 
 use copysync_ipc::{
@@ -401,6 +401,12 @@ const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
+/// Inverse of [`hex`]: pack a `Color32`'s RGB into a `0xRRGGBB` `u32`, dropping
+/// alpha. Used to persist the accent/fg color-picker overrides in `Prefs`.
+fn rgb24(c: Color32) -> u32 {
+    ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32
+}
+
 /// Tint a token toward transparency by a linear alpha fraction (0..=1). Used for
 /// the spec's "@22%/@18%/@45%" fill/stroke tints — `from_rgba_unmultiplied`
 /// keeps the source hue and just lowers coverage so it composites over whatever
@@ -645,6 +651,13 @@ struct Prefs {
     /// Card/panel fill opacity (1.0 = opaque). Lowered so the wallpaper shows
     /// through the cards; only meaningful when a wallpaper is set.
     card_opacity: f32,
+    /// Optional accent (테마색) override as `0xRRGGBB`. `None` = use the built-in
+    /// palette accent. When set it replaces `Palette::accent` and every hue
+    /// derived from it (hover/selection tints) in both dark and light themes.
+    accent_rgb: Option<u32>,
+    /// Optional foreground (글자색) override as `0xRRGGBB`. `None` = built-in
+    /// palette `fg`. When set it replaces `Palette::fg` (the primary text ink).
+    fg_rgb: Option<u32>,
 }
 
 impl Default for Prefs {
@@ -658,6 +671,8 @@ impl Default for Prefs {
             bg_brightness: 1.0,
             bg_blur: 0.0,
             card_opacity: 1.0,
+            accent_rgb: None,
+            fg_rgb: None,
         }
     }
 }
@@ -700,6 +715,15 @@ fn load_prefs() -> Prefs {
         if let Some(o) = v.get("card_opacity").and_then(|o| o.as_f64()) {
             prefs.card_opacity = o as f32;
         }
+        // Color overrides — optional; absent in old files → None (built-in
+        // palette). Stored as a plain JSON number (0xRRGGBB); we mask to 24 bits
+        // so a stray alpha byte can't leak in.
+        if let Some(c) = v.get("accent_rgb").and_then(|c| c.as_u64()) {
+            prefs.accent_rgb = Some((c as u32) & 0x00FF_FFFF);
+        }
+        if let Some(c) = v.get("fg_rgb").and_then(|c| c.as_u64()) {
+            prefs.fg_rgb = Some((c as u32) & 0x00FF_FFFF);
+        }
     }
     prefs
 }
@@ -718,6 +742,10 @@ fn save_prefs(prefs: &Prefs) {
         "bg_brightness": prefs.bg_brightness,
         "bg_blur": prefs.bg_blur,
         "card_opacity": prefs.card_opacity,
+        // `Option<u32>` → number or `null`; `load_prefs` reads it back via
+        // `as_u64()`, so a `null` (or missing key) cleanly maps back to `None`.
+        "accent_rgb": prefs.accent_rgb,
+        "fg_rgb": prefs.fg_rgb,
     });
     let _ = std::fs::write(&p, serde_json::to_vec_pretty(&body).unwrap_or_default());
 }
@@ -734,6 +762,12 @@ fn save_prefs(prefs: &Prefs) {
 /// Cap the decoded wallpaper's longest edge so a huge photo doesn't blow up GPU
 /// memory or the one-off blur cost (the web client caps at 1600 too).
 const BG_MAX_EDGE: u32 = 1600;
+
+/// Alpha of the readability scrim painted over the wallpaper and under all content
+/// (the egui twin of the web client's `--scrim`). At ~0.55 the theme background
+/// reads clearly behind translucent cards so `fg`/`muted` text stays legible over
+/// a busy image even at low card opacity, while the wallpaper is still visible.
+const SCRIM_ALPHA: f32 = 0.55;
 
 /// All wallpaper state: the persisted controls plus the lazily-built texture and
 /// the inputs it was built from (so we can detect when a rebuild is needed).
@@ -912,6 +946,12 @@ struct App {
 
     // theme
     theme_mode: ThemeMode,
+    // Optional accent (테마색) / foreground (글자색) overrides as `0xRRGGBB`.
+    // `None` = use the built-in palette color. Applied in `palette()` so every
+    // card/button/input that reads `pal.accent`/`pal.fg` picks them up, in both
+    // dark and light. Edited via the color pickers in 설정→화면.
+    accent_override: Option<u32>,
+    fg_override: Option<u32>,
 
     // ---- M4 desktop shell ----
     // The tray is created lazily on the first `update()` (Windows needs the
@@ -999,6 +1039,8 @@ impl App {
             discover_rx: None,
             discovering: false,
             theme_mode,
+            accent_override: prefs.accent_rgb,
+            fg_override: prefs.fg_rgb,
             tray: None,
             hotkey_mgr,
             hotkey_current,
@@ -1025,6 +1067,8 @@ impl App {
             bg_brightness: self.bg.brightness,
             bg_blur: self.bg.blur,
             card_opacity: self.bg.card_opacity,
+            accent_rgb: self.accent_override,
+            fg_rgb: self.fg_override,
         }
     }
 
@@ -1113,45 +1157,63 @@ impl App {
         }
     }
 
-    /// The resolved "Warm Trust" palette for the current theme mode. Cheap
-    /// (a const table pick + a `dark_mode` read), so it's fetched per-frame from
-    /// the UI builders that need a token.
+    /// Whether a wallpaper texture is actually loaded this frame. Gates every
+    /// wallpaper-only effect (translucent surfaces, the scrim) so that with no
+    /// image the UI is byte-for-byte the original opaque look.
+    fn has_wallpaper(&self) -> bool {
+        !self.bg.path.is_empty() && self.bg.texture.is_some()
+    }
+
+    /// The resolved "Warm Trust" palette for the current theme mode, plus the two
+    /// runtime customizations the user can apply in 설정→화면:
+    ///
+    ///   * **Color overrides** — `accent_override`/`fg_override` replace
+    ///     `Palette::accent`/`fg`. Because every hover/selection tint is derived at
+    ///     its call site via `tint(pal.accent, ..)`, overriding `accent` here also
+    ///     recolors all of those. Works in dark *and* light (applied post-resolve).
+    ///   * **Card opacity** — when a wallpaper is loaded we lower the alpha of the
+    ///     surface tokens the cards/inputs/top-bar/secondary-buttons fill with
+    ///     (`panel`, `panel2`) so the image shows through the cards themselves. This
+    ///     is the single source of truth: `apply_theme` builds its `Visuals` from
+    ///     this same (already-translucent) palette, so opacity is applied exactly
+    ///     once across both the hand-painted frames and egui's widget fills.
+    ///
+    /// `bg` is intentionally NOT alpha-reduced — it's the opaque scrim color (see
+    /// `paint_backdrop`). Cheap enough to call per-frame from every UI builder.
     fn palette(&self, ctx: &egui::Context) -> Palette {
-        Palette::resolve(self.theme_mode, ctx)
+        let mut pal = Palette::resolve(self.theme_mode, ctx);
+
+        // Color overrides (independent of any wallpaper).
+        if let Some(rgb) = self.accent_override {
+            pal.accent = hex(rgb);
+        }
+        if let Some(rgb) = self.fg_override {
+            pal.fg = hex(rgb);
+        }
+
+        // Card opacity — only when a wallpaper is up *and* the user asked for
+        // less than full opacity; otherwise the surfaces stay fully opaque.
+        if self.has_wallpaper() && self.bg.card_opacity < 0.999 {
+            let a = (self.bg.card_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let translucent = |c: Color32| {
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+            };
+            pal.panel = translucent(pal.panel);
+            pal.panel2 = translucent(pal.panel2);
+        }
+        pal
     }
 
     /// Install the custom `Visuals` for the active theme (DESIGN.md §3), replacing
     /// the raw `dark()/light()` defaults. Called on theme change and every frame
     /// from `update()` (the build is cheap and keeps "system" tracking the OS).
-    /// When a wallpaper is active we lower the card/panel/window fill alpha by
-    /// `card_opacity` so the image shows through; with no wallpaper (or opacity 1)
-    /// the surfaces stay fully opaque, preserving the original look.
+    /// The palette it builds from already carries the color overrides and (when a
+    /// wallpaper is set) the `card_opacity`-reduced `panel`/`panel2` alpha, so the
+    /// egui widget fills line up with the hand-painted card frames automatically —
+    /// no separate translucency pass here.
     fn apply_theme(&self, ctx: &egui::Context) {
         let pal = self.palette(ctx);
-        let mut v = pal.visuals();
-        let has_bg = !self.bg.path.is_empty() && self.bg.texture.is_some();
-        if has_bg && self.bg.card_opacity < 0.999 {
-            let a = (self.bg.card_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let translucent = |c: Color32| {
-                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-            };
-            // Panel/window/input surfaces become translucent over the wallpaper.
-            // The central panel fill stays fully transparent (see `paint_wallpaper`)
-            // so the image is visible; cards/top-bar/inputs ride at `card_opacity`.
-            v.window_fill = translucent(v.window_fill);
-            v.extreme_bg_color = translucent(v.extreme_bg_color);
-            v.faint_bg_color = translucent(v.faint_bg_color);
-            for ws in [
-                &mut v.widgets.noninteractive,
-                &mut v.widgets.inactive,
-                &mut v.widgets.hovered,
-                &mut v.widgets.open,
-            ] {
-                ws.bg_fill = translucent(ws.bg_fill);
-                ws.weak_bg_fill = translucent(ws.weak_bg_fill);
-            }
-        }
-        ctx.set_visuals(v);
+        ctx.set_visuals(pal.visuals());
     }
 
     /// Rebuild the cached wallpaper texture if (and only if) its decode inputs
@@ -1185,10 +1247,21 @@ impl App {
         }
     }
 
-    /// Paint the cached wallpaper as the background of the central-panel `rect`,
-    /// honoring `zoom`, centered, beneath all content. No-op when no texture is
-    /// loaded. Drawn first inside the central panel so every card sits on top.
-    fn paint_wallpaper(&self, ui: &egui::Ui, rect: egui::Rect) {
+    /// Paint the cached wallpaper across `rect`, honoring `zoom`, centered, then a
+    /// semi-opaque scrim of the theme background color ON TOP of it. No-op when no
+    /// texture is loaded.
+    ///
+    /// The scrim is the egui equivalent of the web client's `--scrim`: a solid
+    /// `pal.bg` layer at [`SCRIM_ALPHA`] sitting between the wallpaper and all
+    /// content. Because every translucent surface (the now-`card_opacity`-reduced
+    /// cards/top-bar/inputs and the transparent central panel) composites over this
+    /// scrim, `fg`/`muted` text stays readable at ANY card opacity over any image —
+    /// the previously "washed-out" un-scrimmed regions are exactly what it fixes.
+    ///
+    /// Called against the *background* layer painter over the full screen rect so it
+    /// covers the top bar, central area, and cards uniformly. Paint order is
+    /// wallpaper → scrim → (egui draws panels/cards/content on top).
+    fn paint_backdrop(&self, painter: &egui::Painter, rect: egui::Rect, pal: &Palette) {
         let Some(tex) = self.bg.texture.as_ref() else {
             return;
         };
@@ -1196,9 +1269,9 @@ impl App {
         if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
             return;
         }
-        // "cover" the panel: scale so the image fills `rect` on both axes, then
-        // apply the user zoom on top. UVs are derived from the centered overlap so
-        // we crop (not letterbox) — matching the web client's background-size/cover.
+        // "cover" the rect: scale so the image fills it on both axes, then apply the
+        // user zoom on top. UVs are derived from the centered overlap so we crop
+        // (not letterbox) — matching the web client's background-size/cover.
         let base = (rect.width() / tex_size.x).max(rect.height() / tex_size.y);
         let scale = base * self.bg.zoom.max(0.05);
         let drawn = tex_size * scale; // image size in screen px at this scale
@@ -1210,12 +1283,18 @@ impl App {
             egui::pos2(0.5 - u / 2.0, 0.5 - v / 2.0),
             egui::pos2(0.5 + u / 2.0, 0.5 + v / 2.0),
         );
-        ui.painter().image(
-            tex.id(),
-            rect,
-            uv,
-            Color32::WHITE,
+        painter.image(tex.id(), rect, uv, Color32::WHITE);
+
+        // Readability scrim: solid theme background over the whole image. `pal.bg`
+        // is the OPAQUE table color (never alpha-reduced by `palette()`), so we
+        // tint it here to `SCRIM_ALPHA`.
+        let scrim = Color32::from_rgba_unmultiplied(
+            pal.bg.r(),
+            pal.bg.g(),
+            pal.bg.b(),
+            (SCRIM_ALPHA * 255.0).round() as u8,
         );
+        painter.rect_filled(rect, Rounding::ZERO, scrim);
     }
 
     fn logline(&mut self, force: bool, msg: impl Into<String>) {
@@ -1401,6 +1480,18 @@ impl eframe::App for App {
         // is set it also lowers card/panel fill alpha by `card_opacity`.
         self.apply_theme(ctx);
 
+        // Wallpaper + scrim backdrop: painted ONCE into the background layer over
+        // the whole window, beneath every panel. The top bar and central panel draw
+        // into higher content layers, so their (now translucent) fills composite
+        // over this — giving the cards, top bar, and central area one uniform
+        // wallpaper+scrim backdrop. No-op (and zero cost) when no wallpaper is set.
+        if self.has_wallpaper() {
+            let pal = self.palette(ctx);
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(LayerId::background());
+            self.paint_backdrop(&painter, screen, &pal);
+        }
+
         // Create the tray lazily on the first frame: on Windows the tray needs a
         // running message loop, which only exists once eframe's event loop is up
         // (i.e. inside `update`), not at construction time. Best-effort.
@@ -1452,20 +1543,15 @@ impl eframe::App for App {
         self.top_bar(ctx);
 
         // When a wallpaper is loaded, give the central panel a TRANSPARENT fill so
-        // the image (painted first, below) shows through behind the cards; without
-        // one we keep egui's opaque panel fill (the original look).
-        let has_bg = self.bg.texture.is_some();
-        let central = if has_bg {
+        // the backdrop (wallpaper + scrim, painted into the background layer above)
+        // shows through behind the cards; without one we keep egui's opaque panel
+        // fill (the original look).
+        let central = if self.has_wallpaper() {
             egui::CentralPanel::default().frame(egui::Frame::none())
         } else {
             egui::CentralPanel::default()
         };
         central.show(ctx, |ui| {
-            // Paint the wallpaper beneath all content, covering the panel rect.
-            if has_bg {
-                let rect = ui.max_rect();
-                self.paint_wallpaper(ui, rect);
-            }
             match self.tab {
                 Tab::Connect => self.tab_connect(ui),
                 Tab::History => self.tab_history(ui),
@@ -2113,7 +2199,9 @@ impl App {
                     row(ui, "확대", &mut self.bg.zoom, 1.0..=3.0, &mut touched, &mut released);
                     row(ui, "밝기", &mut self.bg.brightness, 0.3..=2.0, &mut touched, &mut released);
                     row(ui, "흐림", &mut self.bg.blur, 0.0..=20.0, &mut touched, &mut released);
-                    row(ui, "박스 투명도", &mut self.bg.card_opacity, 0.2..=1.0, &mut touched, &mut released);
+                    // Min 0.05 (not ~0.2): the readability scrim keeps text legible
+                    // even at near-transparent cards, so allow the full range.
+                    row(ui, "박스 투명도", &mut self.bg.card_opacity, 0.05..=1.0, &mut touched, &mut released);
                     // Persist when a drag finishes (or on a discrete keyboard step).
                     if released {
                         save_prefs(&self.prefs_snapshot());
@@ -2123,6 +2211,61 @@ impl App {
                     if touched {
                         ctx.request_repaint();
                     }
+                }
+
+                // ---- color overrides (테마색 / 글자색)
+                // Two egui color pickers that override the palette `accent` and `fg`
+                // in BOTH themes. The swatch seeds from the current effective color
+                // (override if set, else the built-in for this theme). Picking a
+                // color stores the override, re-applies the theme, and persists; the
+                // 기본값 button clears both back to the built-in palette.
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("색상").size(13.0).color(pal.fg),
+                );
+                ui.add_space(4.0);
+                // Built-in colors for THIS theme (no overrides) — the fall-back the
+                // swatches show when the user hasn't picked a custom color yet.
+                let base = Palette::resolve(self.theme_mode, ctx);
+                let mut accent_col = match self.accent_override {
+                    Some(rgb) => hex(rgb),
+                    None => base.accent,
+                };
+                let mut fg_col = match self.fg_override {
+                    Some(rgb) => hex(rgb),
+                    None => base.fg,
+                };
+                let mut color_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("테마색").size(12.5).color(pal.muted));
+                    if ui.color_edit_button_srgba(&mut accent_col).changed() {
+                        // Drop any alpha — the palette accent is always opaque.
+                        self.accent_override = Some(rgb24(accent_col));
+                        color_changed = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("글자색").size(12.5).color(pal.muted));
+                    if ui.color_edit_button_srgba(&mut fg_col).changed() {
+                        self.fg_override = Some(rgb24(fg_col));
+                        color_changed = true;
+                    }
+                    ui.add_space(8.0);
+                    if (self.accent_override.is_some() || self.fg_override.is_some())
+                        && Self::secondary_button(ui, &pal, "기본값").clicked()
+                    {
+                        self.accent_override = None;
+                        self.fg_override = None;
+                        color_changed = true;
+                    }
+                });
+                if color_changed {
+                    // Re-assert visuals so egui's widget fills pick up the new
+                    // accent/fg immediately (the hand-painted frames already read the
+                    // live palette next frame), then persist.
+                    self.apply_theme(ctx);
+                    save_prefs(&self.prefs_snapshot());
                 }
             });
 

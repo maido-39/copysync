@@ -226,7 +226,7 @@ fun ThemeSettingsCard() {
                 ThemeSlider("확대", zoom, 1f, 3f) { ThemeState.zoom.value = it; settings.bgZoom = it }
                 ThemeSlider("밝기", bright, 0.3f, 1.3f) { ThemeState.brightness.value = it; settings.bgBrightness = it }
                 ThemeSlider("흐림(블러)", blurR, 0f, 24f) { ThemeState.blur.value = it; settings.bgBlur = it }
-                ThemeSlider("박스 투명도", cardOp, 0.3f, 1f) { ThemeState.cardOpacity.value = it; settings.cardOpacity = it }
+                ThemeSlider("박스 투명도", cardOp, 0.05f, 1f) { ThemeState.cardOpacity.value = it; settings.cardOpacity = it }
                 Text("미리보기를 드래그해 위치를 조정하세요.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }

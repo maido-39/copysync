@@ -640,7 +640,7 @@
       card.appendChild(slider("확대", "zoom", 1, 3, 0.02, "×"));
       card.appendChild(slider("밝기", "bright", 0.3, 1.3, 0.02, ""));
       card.appendChild(slider("흐림(블러)", "blur", 0, 24, 0.5, "px"));
-      card.appendChild(slider("박스 투명도", "cardOp", 0.3, 1, 0.02, ""));
+      card.appendChild(slider("박스 투명도", "cardOp", 0.05, 1, 0.02, ""));
     }
     m.appendChild(card);
     paintMode();
