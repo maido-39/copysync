@@ -77,6 +77,7 @@ type Hub struct {
 	roster     chan rosterReq
 	blobReq    chan blobReqMsg
 	setPool    chan setPoolReq
+	evict      chan model.DeviceID
 
 	clients  map[model.DeviceID]*Client      // owned by Run only
 	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
@@ -104,6 +105,7 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		roster:     make(chan rosterReq),
 		blobReq:    make(chan blobReqMsg),
 		setPool:    make(chan setPoolReq),
+		evict:      make(chan model.DeviceID),
 		clients:    make(map[model.DeviceID]*Client),
 		onDemand:   make(map[model.BlobID]model.DeviceID),
 		monSubs:    make(map[int]chan MonitorEvent),
@@ -143,6 +145,8 @@ func (h *Hub) Run(ctx context.Context) {
 		case r := <-h.setPool:
 			h.handleSetPool(r.id, r.pool)
 			close(r.reply)
+		case id := <-h.evict:
+			h.handleEvict(id)
 		}
 	}
 }
@@ -157,6 +161,13 @@ func (h *Hub) Register(c *Client) {
 
 // Unregister removes a client and announces that it went offline.
 func (h *Hub) Unregister(c *Client) { h.unregister <- c }
+
+// Evict tears down any live connection for id and corrects presence. It is meant
+// to be called after the device has been deleted or revoked from the store, so
+// an already-open session is cut off immediately rather than continuing to relay
+// clips and serve on-demand blobs until it happens to disconnect. No-op if the
+// device has no live connection.
+func (h *Hub) Evict(id model.DeviceID) { h.evict <- id }
 
 // Route relays a clip to its targets and returns the disposition for an ack.
 func (h *Hub) Route(ev model.ClipEvent) RouteResult {
@@ -237,13 +248,24 @@ func (h *Hub) handleRegister(r registerReq) {
 
 	// Drain the offline queue (oldest first) before any live clip can arrive.
 	if items, err := h.store.DrainQueue(id); err == nil {
-		for _, it := range items {
+		settings, _ := h.store.GetSettings()
+		for i, it := range items {
 			b, err := protocol.Encode(protocol.TypeClip, it.Event)
 			if err != nil {
 				continue
 			}
 			if !c.Enqueue(b) {
-				break // buffer full; client will reconnect and we re-drain
+				// Send buffer is full: DrainQueue already deleted the whole queue
+				// bucket, so the undelivered tail exists only in this slice. Re-persist
+				// it (preserving the original QueueItem so EnqueuedAt/TTL accounting
+				// stays correct) before bailing; the next reconnect — or a slot freeing
+				// up — re-drains it. Without this the tail is silently lost forever.
+				for _, rem := range items[i:] {
+					if _, err := h.store.Enqueue(id, rem, settings.QueueDepthPerDevice); err != nil {
+						h.log.Warn("re-enqueue undelivered tail failed", "device", id, "err", err)
+					}
+				}
+				break
 			}
 		}
 	}
@@ -276,9 +298,41 @@ func (h *Hub) handleUnregister(c *Client) {
 	}
 }
 
+func (h *Hub) handleEvict(id model.DeviceID) {
+	c, ok := h.clients[id]
+	if !ok {
+		h.dbg("evict-by-id-absent", "device", id)
+		return
+	}
+	c.Close("device deleted")
+	delete(h.clients, id)
+	// Drop any on-demand blob holdings owned by this device; nobody can pull them
+	// from a connection that is being torn down.
+	pruned := 0
+	for blobID, holder := range h.onDemand {
+		if holder == id {
+			delete(h.onDemand, blobID)
+			pruned++
+		}
+	}
+	h.dbg("evict-by-id", "device", id, "ondemand_pruned", pruned, "online_count", len(h.clients))
+	// The store record is already gone, so announce offline using the client's
+	// own device snapshot.
+	h.broadcastPresence(c.Device, false, "")
+}
+
 func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	settings, _ := h.store.GetSettings()
-	h.publishMonitor(ev)
+	// Enforce E2E on ingest: when E2E is enabled the server must never see, store,
+	// echo, or relay plaintext. A clip carrying inline plaintext (text or HTML)
+	// with no encryption metadata violates that invariant — reject it before it
+	// reaches the monitor feed or any peer. (The broadcast endpoint is the one
+	// legitimate plaintext source, and it is already blocked when E2E is on.)
+	if settings.E2EEnabled && ev.Enc == nil && (ev.InlineText != "" || ev.Html != "") {
+		h.log.Warn("rejected plaintext clip while E2E enforced", "device", ev.OriginDevice)
+		return RouteResult{Status: protocol.AckRejected}
+	}
+	h.publishMonitor(ev, settings.E2EEnabled)
 	_ = h.store.RecordActivity(h.now(), ev.Size)
 	targets := h.resolveTargets(ev)
 	// Remember who holds an on-demand blob so a later GET can pull it from them.
@@ -318,6 +372,12 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 }
 
 func (h *Hub) resolveTargets(ev model.ClipEvent) []model.Device {
+	if ev.Targets.Broadcast {
+		// Admin server broadcast: reach every device across ALL pools (unlike All,
+		// which is pool-scoped via the origin's pool).
+		devs, _ := h.store.ListDevices()
+		return devs
+	}
 	if ev.Targets.All {
 		// "all" routes to every device in the origin's share pool.
 		devs, _ := h.store.ListDevices()
@@ -454,8 +514,12 @@ func (h *Hub) UnsubscribeMonitor(id int) {
 	}
 }
 
-func (h *Hub) publishMonitor(ev model.ClipEvent) {
-	me := MonitorEvent{TS: ev.TS, Origin: h.deviceName(ev.OriginDevice), Pool: h.poolOf(ev.OriginDevice), Size: ev.Size, E2E: ev.Enc != nil}
+func (h *Hub) publishMonitor(ev model.ClipEvent, e2eEnforced bool) {
+	// Treat the clip as opaque for preview purposes if it is encrypted OR E2E is
+	// enforced server-wide: under enforced E2E no plaintext preview must ever enter
+	// the monitor ring / SSE feed, even for a (non-conforming) clip with Enc==nil.
+	e2e := ev.Enc != nil || e2eEnforced
+	me := MonitorEvent{TS: ev.TS, Origin: h.deviceName(ev.OriginDevice), Pool: h.poolOf(ev.OriginDevice), Size: ev.Size, E2E: e2e}
 	if len(ev.Mime) > 0 {
 		me.Mime = ev.Mime[0]
 	}

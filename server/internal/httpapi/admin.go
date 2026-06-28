@@ -117,6 +117,10 @@ func (s *Server) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "could not delete device")
 		return
 	}
+	// Cut off any already-open WebSocket for this device so it stops relaying clips
+	// and serving on-demand blobs immediately, rather than lingering until it next
+	// disconnects on its own.
+	s.hub.Evict(id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -174,7 +178,9 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 		InlineText:   req.Text,
 		Size:         int64(len(req.Text)),
 		Sha256:       hex.EncodeToString(sum[:]),
-		Targets:      model.Targets{All: true},
+		// Broadcast reaches every device across all pools (All would be scoped to
+		// the synthetic "server" origin's pool, i.e. only "default").
+		Targets: model.Targets{Broadcast: true},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": res.Status, "queuedFor": res.QueuedFor})
 }

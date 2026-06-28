@@ -7,6 +7,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -20,12 +21,19 @@ const (
 	writeTimeout = 10 * time.Second
 	helloTimeout = 10 * time.Second
 	pingInterval = 30 * time.Second
-	// idleTimeout bounds how long a read may block with no inbound frame. It is
-	// deliberately larger than pingInterval so a healthy idle peer (which still
-	// answers pings, but those are handled by the library and do not surface as
-	// reads) is never reaped; a dead peer is detected within idleTimeout instead
-	// of the ~40s zombie window the old unbounded read allowed.
+	// idleTimeout bounds how long the connection may go with NO sign of life from
+	// the peer before it is reaped as half-open. Liveness is tracked by a shared
+	// lastActivity timestamp that is bumped on (i) every inbound frame and (ii)
+	// every successful server->client Ping (coder/websocket's Ping blocks until
+	// the peer's pong arrives, so a successful Ping proves the peer is alive even
+	// when it is sending no data frames). A separate watchdog ticker tears the
+	// connection down only when now-lastActivity exceeds idleTimeout. This must
+	// NOT be enforced as a per-read deadline: coder/websocket consumes ping/pong
+	// control frames inside its read loop without surfacing them as reads, so a
+	// healthy-but-idle peer that only answers pings would otherwise be reaped.
 	idleTimeout = 75 * time.Second
+	// watchdogInterval is how often the liveness watchdog checks lastActivity.
+	watchdogInterval = 15 * time.Second
 	// slowWriteThreshold is the fraction of writeTimeout past which a write is
 	// logged (in debug mode) as "slow" — an early warning of a stalling peer.
 	slowWriteThreshold = writeTimeout / 2
@@ -38,9 +46,18 @@ type Deps struct {
 	Now func() time.Time
 	// ValidateToken returns the device for a (deviceID, token) pair, or false.
 	ValidateToken func(model.DeviceID, string) (model.Device, bool)
-	// MaybeRotateToken optionally re-issues the device's bearer token after a
-	// successful auth, returning a new plaintext token to deliver (or "" for none).
+	// MaybeRotateToken runs after a successful auth (Stage-3 token rotation). It
+	// retires a now-confirmed previous token and decides whether to re-issue the
+	// bearer token, returning a NEW plaintext token to deliver (or "" for none).
+	// It MUST NOT durably commit the rotation: the caller only commits once the
+	// new token has actually been queued for delivery (via CommitTokenRotation),
+	// so a dropped token_rotate frame cannot wedge the device on a never-retired
+	// token that the client never learns.
 	MaybeRotateToken func(model.DeviceID, string) string
+	// CommitTokenRotation durably records a rotation issued by MaybeRotateToken,
+	// keyed by the new plaintext token. Called only after the token_rotate frame
+	// was successfully enqueued.
+	CommitTokenRotation func(model.DeviceID, string)
 	// MaxMessage returns the current WS read limit in bytes.
 	MaxMessage func() int64
 	// Debug enables verbose connection-lifecycle logging (COPYSYNC_DEBUG=1),
@@ -113,25 +130,41 @@ func serve(parent context.Context, d Deps, c *websocket.Conn, remote string) {
 	ctx, cancelAll := context.WithCancel(parent)
 	defer cancelAll()
 
-	go writePump(ctx, d, c, client, dev.ID)
+	// Shared liveness clock (UnixNano). Bumped by readPump on every inbound frame
+	// and by writePump on every successful ping; watched by the idle watchdog.
+	var lastActivity atomic.Int64
+	lastActivity.Store(d.Now().UnixNano())
+
+	go writePump(ctx, d, c, client, dev.ID, &lastActivity)
+	go idleWatchdog(ctx, d, c, dev.ID, remote, &lastActivity)
 	d.Hub.Register(client)
 	defer d.Hub.Unregister(client)
 
 	// 2b) Token rotation: if the server re-issued this device's token, deliver it
 	// so the client persists it (the old token is retired once the new is used).
+	// The rotation is committed to the store ONLY after the frame is actually
+	// queued; if the send buffer is full and the frame would be dropped, we skip
+	// the commit so the device keeps its current token and rotation is retried on
+	// the next reconnect — rather than wedging on a new token it never learned.
 	if d.MaybeRotateToken != nil {
 		if newTok := d.MaybeRotateToken(hello.DeviceID, hello.Token); newTok != "" {
 			if b, err := protocol.Encode(protocol.TypeTokenRotate, protocol.TokenRotate{Token: newTok}); err == nil {
-				client.Enqueue(b)
+				if client.Enqueue(b) {
+					if d.CommitTokenRotation != nil {
+						d.CommitTokenRotation(hello.DeviceID, newTok)
+					}
+				} else {
+					d.Log.Warn("token_rotate frame dropped (send buffer full); rotation deferred to next reconnect", "device", hello.DeviceID)
+				}
 			}
 		}
 	}
 
 	// 3) Read pump: blocks until the connection ends.
-	readPump(ctx, c, client, d, hello.DeviceID, remote)
+	readPump(ctx, c, client, d, hello.DeviceID, remote, &lastActivity)
 }
 
-func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Client, device model.DeviceID) {
+func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Client, device model.DeviceID, lastActivity *atomic.Int64) {
 	ping := time.NewTicker(pingInterval)
 	defer ping.Stop()
 	for {
@@ -168,6 +201,10 @@ func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Clien
 				d.dbg("disconnect", "device", device, "side", "local", "reason", "ping failed", "close_code", websocket.CloseStatus(err), "err", err, "pump", "write")
 				return
 			}
+			// A successful Ping blocks until the peer's pong arrives, so it proves
+			// the peer is alive even when it sends no data frames. Bump liveness so
+			// the watchdog never reaps a healthy-but-idle client.
+			lastActivity.Store(d.Now().UnixNano())
 			if took := d.Now().Sub(start); took >= slowWriteThreshold {
 				d.dbg("slow-ping", "device", device, "took_ms", took.Milliseconds(), "deadline_ms", writeTimeout.Milliseconds())
 			}
@@ -175,30 +212,27 @@ func writePump(ctx context.Context, d Deps, c *websocket.Conn, client *hub.Clien
 	}
 }
 
-func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps, originID model.DeviceID, remote string) {
+func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps, originID model.DeviceID, remote string, lastActivity *atomic.Int64) {
 	for {
-		// Bound each read by an idle deadline so a half-open (dead) peer is reaped
-		// within idleTimeout instead of lingering until the next failed write.
-		// The deadline is reset for every received frame because it is recreated
-		// each loop iteration.
-		rctx, cancel := context.WithTimeout(ctx, idleTimeout)
-		_, data, err := c.Read(rctx)
-		cancel()
+		// Read on the parent context (no per-read idle deadline): coder/websocket
+		// consumes ping/pong control frames inside its read loop without surfacing
+		// them as reads, so bounding the read by idleTimeout would reap a healthy
+		// peer that only answers pings. Half-open detection is instead handled by
+		// idleWatchdog, which closes the conn when neither a frame nor a ping-pong
+		// has been seen within idleTimeout.
+		_, data, err := c.Read(ctx)
 		if err != nil {
-			switch {
-			case ctx.Err() != nil:
-				// Parent context ended (server shutdown or eviction unwinding).
+			if ctx.Err() != nil {
+				// Parent context ended (server shutdown, eviction, or watchdog reap).
 				d.dbg("disconnect", "device", originID, "remote", remote, "side", "server", "reason", "context cancelled", "pump", "read")
-			case rctx.Err() != nil:
-				// Our idle deadline fired but the parent is still live: the peer
-				// went silent (half-open). Reap it.
-				d.dbg("disconnect", "device", originID, "remote", remote, "side", "server", "reason", "idle read timeout (half-open peer)", "idle_s", int(idleTimeout.Seconds()), "pump", "read")
-			default:
+			} else {
 				// Normal close or read error initiated by the peer.
 				d.dbg("disconnect", "device", originID, "remote", remote, "side", "remote", "reason", "read ended", "close_code", websocket.CloseStatus(err), "err", err, "pump", "read")
 			}
 			return
 		}
+		// Any inbound frame is a sign of life.
+		lastActivity.Store(d.Now().UnixNano())
 		env, err := protocol.DecodeEnvelope(data)
 		if err != nil {
 			continue
@@ -227,6 +261,28 @@ func readPump(ctx context.Context, c *websocket.Conn, client *hub.Client, d Deps
 			}
 		default:
 			// Ignore unknown frame types for forward compatibility.
+		}
+	}
+}
+
+// idleWatchdog reaps a half-open peer: if neither an inbound frame nor a
+// successful ping-pong has updated lastActivity within idleTimeout, it closes the
+// connection (which unblocks readPump's c.Read). A live-but-idle peer that answers
+// the server's pings keeps lastActivity fresh and is never reaped.
+func idleWatchdog(ctx context.Context, d Deps, c *websocket.Conn, device model.DeviceID, remote string, lastActivity *atomic.Int64) {
+	ticker := time.NewTicker(watchdogInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			idle := d.Now().Sub(time.Unix(0, lastActivity.Load()))
+			if idle >= idleTimeout {
+				d.dbg("disconnect", "device", device, "remote", remote, "side", "server", "reason", "idle timeout (half-open peer)", "idle_s", int(idle.Seconds()), "pump", "watchdog")
+				_ = c.Close(websocket.StatusGoingAway, "idle timeout")
+				return
+			}
 		}
 	}
 }

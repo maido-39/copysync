@@ -144,6 +144,42 @@ pub enum Hold {
     Plain(PathBuf),  // plaintext: re-read on demand
 }
 
+/// Result of an OFF-LOOP blob network op, sent back to the connection's `select!`
+/// loop over an internal channel. Moving `put_blob`/`get_blob` off the loop (into
+/// `tokio::spawn`ed workers) is what keeps `ws::recv` polled while a transfer is in
+/// flight, so the WS pong/ping/watchdog arms stay live and the server doesn't reap
+/// a genuinely-alive connection mid-transfer (see the on-demand long-poll case).
+enum BlobResult {
+    /// An outbound upload finished. On success the loop emits the already-built
+    /// `T_CLIP` frame; on failure it surfaces the error and emits nothing.
+    Upload {
+        outcome: Result<(), (&'static str, String)>, // Ok(()) | Err((class, msg))
+        ev: ClipEvent,
+        // history bookkeeping (recorded on the loop after a successful send)
+        hist_kind: &'static str,
+        hist_preview: String,
+        hist_mime: String,
+        hist_size: i64,
+        hist_name: String,
+        // the {"direction":"out",...} json to emit on success
+        emit_json: serde_json::Value,
+        // user-facing error sink: true => emit.error, false => emit.notify
+        err_via_error: bool,
+    },
+    /// An on-demand `blob_request` upload finished. On success the loop drops the
+    /// hold from `on_demand` so the map can't grow without bound.
+    Serve {
+        id: String,
+        ok: bool,
+    },
+    /// An inbound blob download finished. On success the loop decrypts + applies
+    /// the bytes to the clipboard / history (the tail of `handle_incoming`).
+    Download {
+        outcome: Result<Vec<u8>, (&'static str, String)>,
+        ev: ClipEvent,
+    },
+}
+
 #[derive(Clone, Serialize, Default)]
 pub struct Status {
     pub paired: bool,
@@ -306,66 +342,84 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
             // handled on its own generation per the existing logic.)
             let img_res = clipboard::get_image();
             let files_opt = clipboard::get_files();
+            let text_res = clipboard::get_text();
             let had_image = img_res.is_ok();
             let had_files = files_opt.is_some();
             let mut handled = false;
 
-            if let Ok(img) = img_res {
-                read_ok = true;
-                let h = sha_hex(&img.rgba);
-                if h != last_img {
-                    last_img = h;
-                    last_text.clear();
-                    last_files.clear();
-                    let (w, hh, bytes) = (img.width, img.height, img.rgba.len());
-                    dlog!("clipboard", "gen: chose IMAGE {w}x{hh} ({bytes}B rgba); skipped text/files");
-                    let _ = tx.send(Cmd::LocalImage(img));
-                } else {
-                    dlog!("clipboard", "gen: IMAGE unchanged (dedup) — skip");
+            // Per-format dedup is now DECOUPLED from a whole-generation short-circuit.
+            // We evaluate image, files, and text INDEPENDENTLY against their own
+            // last-hash so a coexisting format whose hash didn't change (e.g. a
+            // screenshot/clipboard-history tool keeping a persistent image present)
+            // can never shadow a genuinely-new text/file copy in the same generation.
+            // When MULTIPLE formats are simultaneously NEW, we prefer image > files >
+            // text (preserving the original "richer format wins" fix) by only sending
+            // one rich format and clearing the others' last-hash so they re-sync next.
+            let img_changed = match &img_res {
+                Ok(img) => {
+                    read_ok = true;
+                    sha_hex(&img.rgba) != last_img
                 }
+                Err(_) => false,
+            };
+            let files_changed = match &files_opt {
+                Some(files) => {
+                    read_ok = true;
+                    files.join("\u{1}") != last_files
+                }
+                None => false,
+            };
+            let text_changed = match &text_res {
+                Ok(t) if !t.is_empty() => {
+                    read_ok = true;
+                    *t != last_text
+                }
+                Ok(_) => { read_ok = true; false } // empty text, nothing to send
+                Err(e) => { dlog!("clipboard", "gen: text read failed: {e}"); false }
+            };
+
+            if img_changed {
+                let img = img_res.expect("img_changed implies Ok");
+                last_img = sha_hex(&img.rgba);
+                // A NEW image arrived: text/files that came with it are stale.
+                last_text.clear();
+                last_files.clear();
+                let (w, hh, bytes) = (img.width, img.height, img.rgba.len());
+                dlog!("clipboard", "gen: chose IMAGE {w}x{hh} ({bytes}B rgba); preferred over text/files");
+                let _ = tx.send(Cmd::LocalImage(img));
                 handled = true;
-            } else if let Some(files) = files_opt {
+            } else if files_changed {
                 // Windows Explorer file copy (CF_HDROP).
-                read_ok = true;
-                let key = files.join("\u{1}");
-                if key != last_files {
-                    last_files = key;
-                    last_text.clear();
-                    last_img.clear();
-                    dlog!("clipboard", "gen: chose FILES ({} path(s)); skipped text", files.len());
-                    let _ = tx.send(Cmd::LocalFiles(files));
-                } else {
-                    dlog!("clipboard", "gen: FILES unchanged (dedup) — skip");
-                }
+                let files = files_opt.clone().expect("files_changed implies Some");
+                last_files = files.join("\u{1}");
+                last_text.clear();
+                last_img.clear();
+                dlog!("clipboard", "gen: chose FILES ({} path(s)); preferred over text", files.len());
+                let _ = tx.send(Cmd::LocalFiles(files));
                 handled = true;
-            } else {
-                // No image / file list present — fall back to text.
-                let text = clipboard::get_text();
-                match &text {
-                    Ok(t) if !t.is_empty() => {
-                        read_ok = true;
-                        if *t != last_text {
-                            last_text = t.clone();
-                            last_img.clear();
-                            last_files.clear();
-                            let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
-                            dlog!(
-                                "clipboard",
-                                "gen: chose TEXT ({} chars, html={}); no image/file present",
-                                t.chars().count(),
-                                html.is_some()
-                            );
-                            let _ = tx.send(Cmd::LocalText { text: t.clone(), html });
-                        } else {
-                            dlog!("clipboard", "gen: TEXT unchanged (dedup) — skip");
-                        }
-                        handled = true;
-                    }
-                    Ok(_) => { read_ok = true; /* empty text, nothing to send */ }
-                    Err(e) => {
-                        dlog!("clipboard", "gen: text read failed: {e}");
-                    }
-                }
+            } else if text_changed {
+                // Neither a NEW image nor a NEW file list this generation — but the
+                // text genuinely changed (even if a stale image/file is still present),
+                // so sync it instead of letting an unchanged rich format shadow it.
+                let t = text_res.as_ref().expect("text_changed implies Ok").clone();
+                last_text = t.clone();
+                // Don't clear last_img/last_files here: an unchanged coexisting
+                // image/file is still valid and must NOT be force-resynced next tick.
+                let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
+                dlog!(
+                    "clipboard",
+                    "gen: chose TEXT ({} chars, html={}); no NEW image/file this generation",
+                    t.chars().count(),
+                    html.is_some()
+                );
+                let _ = tx.send(Cmd::LocalText { text: t, html });
+                handled = true;
+            } else if had_image {
+                dlog!("clipboard", "gen: IMAGE unchanged (dedup) — skip");
+            } else if had_files {
+                dlog!("clipboard", "gen: FILES unchanged (dedup) — skip");
+            } else if matches!(&text_res, Ok(t) if !t.is_empty()) {
+                dlog!("clipboard", "gen: TEXT unchanged (dedup) — skip");
             }
 
             // Observability: if an image/file format *was* present this generation,
@@ -482,6 +536,9 @@ pub async fn run(
     let mut recent_img: VecDeque<String> = VecDeque::new();
     let mut recent_files: VecDeque<String> = VecDeque::new();
     let mut on_demand: HashMap<String, Hold> = HashMap::new();
+    // Insertion order for `on_demand`, so the bounded ring can evict the oldest
+    // advertised-but-unfetched hold (see hold_on_demand) — the leak fix.
+    let mut on_demand_order: VecDeque<String> = VecDeque::new();
     let reconnect = state.reconnect.clone();
     let mut attempt: u32 = 0;
 
@@ -491,6 +548,12 @@ pub async fn run(
             Ok((mut sock, hello)) => {
                 attempt = 0;
                 let threshold = hello.on_demand_threshold;
+                // The server's per-frame WS read limit (idx 17). A text/HTML clip
+                // whose JSON frame exceeds this is rejected by the server's read
+                // pump and tears the control connection down, silently losing the
+                // clip; send_text_clip refuses oversized text instead of sending a
+                // frame guaranteed to be dropped. 0 = unknown/unset => no cap.
+                let max_msg = hello.max_msg;
                 dlog!(
                     "ws",
                     "connect: OK · pool={} pools={:?} on_demand_threshold={} roster={} device(s)",
@@ -515,6 +578,13 @@ pub async fn run(
                 ping_at.tick().await;
                 let mut watchdog = tokio::time::interval(Duration::from_secs(15));
                 watchdog.tick().await;
+                // Internal channel for OFF-LOOP blob workers (idx 1). put_blob/get_blob
+                // now run in tokio::spawn tasks and report results here, so this arm is
+                // polled alongside ws::recv/ping/watchdog — the WS read half keeps
+                // flushing pongs while a (possibly 60s long-poll) transfer is in flight,
+                // instead of stalling the whole select! and getting reaped as dead.
+                // Re-created per connection so results from a dead socket are dropped.
+                let (blob_tx, mut blob_rx) = tokio::sync::mpsc::unbounded_channel::<BlobResult>();
                 let why: String = 'inner: loop {
                     tokio::select! {
                         _ = ping_at.tick() => {
@@ -555,11 +625,11 @@ pub async fn run(
                                         continue;
                                     }
                                 }
-                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&state.targets), &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
+                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&state.targets), max_msg, &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::SendText(t)) => {
                                 remember(&mut recent_text, sha_hex(t.as_bytes()));
-                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&state.targets), &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
+                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&state.targets), max_msg, &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::LocalImage(img)) => {
                                 let sha = sha_hex(&img.rgba);
@@ -568,10 +638,12 @@ pub async fn run(
                                     continue;
                                 }
                                 remember(&mut recent_img, sha);
-                                if !send_image_clip(&mut sock, &mut seq, &img, &key, current_targets(&state.targets), &*emit, &hist, &http, &cfg, &state.data_dir).await { break 'inner "이미지 전송 실패 — 제어 채널 끊김".to_string(); }
+                                // Upload runs OFF the loop; the T_CLIP frame is emitted
+                                // from the blob_rx arm when the upload completes.
+                                spawn_image_clip(&mut seq, &img, &key, current_targets(&state.targets), &*emit, &http, &cfg, &state.data_dir, &blob_tx);
                             }
                             Some(Cmd::SendFile(p)) => {
-                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&state.targets), threshold, &mut on_demand, &*emit, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
+                                if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&state.targets), threshold, &mut on_demand, &mut on_demand_order, &*emit, &hist, &http, &cfg, &blob_tx).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::LocalFiles(files)) => {
                                 for p in files {
@@ -580,7 +652,7 @@ pub async fn run(
                                         dlog!("send", "LocalFiles entry SKIPPED (echo) path={p}");
                                         continue;
                                     }
-                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&state.targets), threshold, &mut on_demand, &*emit, &hist, &http, &cfg).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
+                                    if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&state.targets), threshold, &mut on_demand, &mut on_demand_order, &*emit, &hist, &http, &cfg, &blob_tx).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
                                 }
                             }
                             Some(Cmd::SetPool(name)) => {
@@ -608,11 +680,48 @@ pub async fn run(
                                     }
                                 } else {
                                     dlog!("ws", "recv: frame t={t}");
-                                    handle_frame(t, d, &key, &pull, &http, &cfg, &*emit, &state, &hist, &downloads, &roster, &mut recent_text, &mut recent_img, &mut recent_files, &on_demand).await;
+                                    handle_frame(t, d, &key, &pull, &http, &cfg, &*emit, &state, &hist, &roster, &mut recent_text, &mut on_demand, &blob_tx).await;
                                 }
                             }
                             Ok(None) => break 'inner "서버가 연결을 종료함".to_string(),
                             Err(e) => break 'inner format!("수신 오류: {e}"),
+                        },
+                        // Results from OFF-LOOP blob workers (idx 1). Polling this arm
+                        // alongside ws::recv is exactly what keeps the read half live
+                        // (pongs flow) while a transfer is in flight.
+                        Some(res) = blob_rx.recv() => match res {
+                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error } => {
+                                match outcome {
+                                    Ok(()) => {
+                                        dlog!("send", "upload done seq={} blob_id={} → control channel", ev.seq, ev.blob_id);
+                                        if ws::send(&mut sock, protocol::T_CLIP, &ev).await.is_err() {
+                                            dlog!("send", "upload done seq={}: ws::send FAILED — control channel down", ev.seq);
+                                            break 'inner "클립 전송 실패 — 제어 채널 끊김".to_string();
+                                        }
+                                        add_history(&hist, &ev.ts, hist_kind, "me", "out", &hist_preview, &hist_mime, hist_size, &ev.blob_id, &hist_name);
+                                        emit.clip(emit_json);
+                                    }
+                                    Err((_class, msg)) => {
+                                        // Blob-channel failure (not the control channel) — surface and drop.
+                                        if err_via_error { emit.error(msg); } else { emit.notify("CopySync", &msg); }
+                                    }
+                                }
+                            }
+                            BlobResult::Serve { id, ok } => {
+                                if ok {
+                                    // The server pulls each advertised on-demand blob exactly once.
+                                    // Drop the served hold so the map (full file-sized ciphertext for
+                                    // E2E) can't grow without bound (the leak fix). Only on success,
+                                    // so a failed upload can still be retried on a later request.
+                                    if on_demand.remove(&id).is_some() {
+                                        on_demand_order.retain(|k| k != &id);
+                                    }
+                                }
+                            }
+                            BlobResult::Download { outcome, ev } => match outcome {
+                                Ok(data) => apply_blob(ev, data, &key, &*emit, &state, &hist, &downloads, &mut recent_img, &mut recent_files),
+                                Err((_class, msg)) => emit.notify("CopySync", &msg),
+                            },
                         }
                     }
                 };
@@ -706,6 +815,7 @@ async fn send_text_clip(
     html: Option<&str>,
     key: &Option<(Vec<u8>, String)>,
     targets: Targets,
+    max_msg: i64,
     emit: &dyn Emitter,
     hist: &Arc<Mutex<History>>,
 ) -> bool {
@@ -724,10 +834,37 @@ async fn send_text_clip(
             return true;
         }
     };
+    // idx 17: refuse a frame larger than the server's advertised read limit. With
+    // E2E on, base64 of the ciphertext expands ~33%, so an oversized clip is easy
+    // to hit; sending it anyway would exceed the server read limit and tear the
+    // control connection down, silently losing this clip. Refuse + surface an error
+    // (and do NOT record it in history as a successful send) instead. The frame is
+    // encoded once here purely to measure; ws::send re-encodes identically.
+    let encoded = match crate::encode(protocol::T_CLIP, &ev) {
+        Ok(b) => b,
+        Err(e) => {
+            dlog!("send", "text seq={}: frame encode FAILED — not sent: {e}", *seq);
+            emit.error(format!("텍스트 클립 인코딩 실패 — 전송 안 함: {e}"));
+            return true;
+        }
+    };
+    if max_msg > 0 && encoded.len() as i64 > max_msg {
+        dlog!(
+            "send",
+            "text seq={}: frame {}B exceeds server limit {}B — refusing (would drop connection)",
+            *seq, encoded.len(), max_msg
+        );
+        emit.error(format!(
+            "텍스트가 서버 전송 한도({}KB)를 초과하여 동기화하지 않았습니다 ({}KB)",
+            (max_msg / 1024).max(1),
+            (encoded.len() as i64 / 1024).max(1)
+        ));
+        return true; // not a control-channel failure; just skip this clip
+    }
     dlog!(
         "send",
-        "text seq={} size={}B hash={} html={} → control channel",
-        *seq, text.len(), &sha_hex(text.as_bytes())[..16], html.is_some()
+        "text seq={} size={}B frame={}B hash={} html={} → control channel",
+        *seq, text.len(), encoded.len(), &sha_hex(text.as_bytes())[..16], html.is_some()
     );
     if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
         dlog!("send", "text seq={}: ws::send FAILED — control channel down", *seq);
@@ -750,25 +887,29 @@ fn cache_outbound_image(data_dir: &Path, png: &[u8]) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// Prepare an image clip and spawn its blob upload OFF the connection loop. The
+/// full `ClipEvent` is built here (its `blob_id`/`sha256` are pure functions of the
+/// payload, so no network is needed to know them); the actual `put_blob` runs in a
+/// detached task and reports back via `blob_tx`, where the loop emits the `T_CLIP`
+/// frame. Returns immediately so the loop keeps polling `ws::recv` (pongs flow).
 #[allow(clippy::too_many_arguments)]
-async fn send_image_clip(
-    sock: &mut ws::Ws,
+fn spawn_image_clip(
     seq: &mut u64,
     img: &Image,
     key: &Option<(Vec<u8>, String)>,
     targets: Targets,
     emit: &dyn Emitter,
-    hist: &Arc<Mutex<History>>,
     http: &reqwest::Client,
     cfg: &Config,
     data_dir: &Path,
-) -> bool {
+    blob_tx: &UnboundedSender<BlobResult>,
+) {
     let png = match clipboard::encode_png(img) {
         Ok(p) => p,
         Err(e) => {
             dlog!("send", "image PNG encode FAILED — not sent: {e}");
             emit.error(format!("이미지 PNG 인코딩 실패 — 전송 안 함: {e}"));
-            return true;
+            return;
         }
     };
     let payload = match key {
@@ -777,29 +918,14 @@ async fn send_image_clip(
             Err(e) => {
                 dlog!("send", "image E2E seal FAILED — not sent: {e}");
                 emit.error(format!("이미지 E2E 암호화 실패 — 전송 안 함: {e}"));
-                return true;
+                return;
             }
         },
         None => png.clone(),
     };
-    dlog!(
-        "blob",
-        "image upload attempt: {}B payload (e2e={})",
-        payload.len(),
-        key.is_some()
-    );
-    let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
-        Ok(b) => {
-            dlog!("blob", "image upload OK: blob_id={b}");
-            b
-        }
-        Err(e) => {
-            let class = classify_blob_err(&e);
-            dlog!("blob", "image upload FAILED ({class}): {e}");
-            emit.error(format!("이미지 blob 업로드 실패({class}) — 전송 안 함: {e}"));
-            return true; // blob channel issue, not the control channel
-        }
-    };
+    // blob_id and sha256 are pure functions of the bytes we're about to upload, so
+    // we can build the whole ClipEvent now and upload asynchronously.
+    let bid = blob::blob_id(&payload);
     *seq += 1;
     let ev = ClipEvent {
         id: protocol::new_id(),
@@ -818,17 +944,42 @@ async fn send_image_clip(
         }),
         ..Default::default()
     };
-    dlog!("send", "image seq={} size={}B blob_id={} → control channel", *seq, png.len(), ev.blob_id);
-    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
-        dlog!("send", "image seq={}: ws::send FAILED — control channel down", *seq);
-        return false;
-    }
-    let prev = cache_outbound_image(data_dir, &png).unwrap_or_else(|| "(클립보드 이미지)".into());
-    add_history(hist, &ev.ts, "image", "me", "out", &prev, "image/png", png.len() as i64, &ev.blob_id, "clipboard.png");
-    emit.clip(serde_json::json!({"direction":"out","kind":"image","name":"clipboard.png","size":png.len()}));
-    true
+    let preview = cache_outbound_image(data_dir, &png).unwrap_or_else(|| "(클립보드 이미지)".into());
+    let emit_json = serde_json::json!({"direction":"out","kind":"image","name":"clipboard.png","size":png.len()});
+    dlog!("blob", "image upload spawn: {}B payload (e2e={}) seq={}", payload.len(), key.is_some(), *seq);
+    let (client, base, token) = (http.clone(), cfg.server_url.clone(), cfg.token.clone());
+    let tx = blob_tx.clone();
+    let png_len = png.len() as i64;
+    tokio::spawn(async move {
+        let outcome = match blob::put_blob(&client, &base, &token, payload).await {
+            Ok(b) => { dlog!("blob", "image upload OK: blob_id={b}"); Ok(()) }
+            Err(e) => {
+                let class = classify_blob_err(&e);
+                dlog!("blob", "image upload FAILED ({class}): {e}");
+                Err((class, format!("이미지 blob 업로드 실패({class}) — 전송 안 함: {e}")))
+            }
+        };
+        let _ = tx.send(BlobResult::Upload {
+            outcome,
+            ev,
+            hist_kind: "image",
+            hist_preview: preview,
+            hist_mime: "image/png".to_string(),
+            hist_size: png_len,
+            hist_name: "clipboard.png".to_string(),
+            emit_json,
+            err_via_error: true,
+        });
+    });
 }
 
+/// Prepare a file clip. The on-demand path advertises immediately on the loop
+/// (a small control frame, no blob I/O) and holds the bytes for a later
+/// `blob_request`. The eager path computes the blob id locally, builds the full
+/// `ClipEvent`, and spawns the `put_blob` OFF the loop (reporting back via
+/// `blob_tx`, where the loop emits the `T_CLIP`). Returns `false` only on a real
+/// control-channel send failure (the on-demand advertisement), so the caller can
+/// trigger a reconnect; the eager path never blocks the loop on the network.
 #[allow(clippy::too_many_arguments)]
 async fn send_file_clip(
     sock: &mut ws::Ws,
@@ -838,10 +989,12 @@ async fn send_file_clip(
     targets: Targets,
     threshold: i64,
     on_demand: &mut HashMap<String, Hold>,
+    on_demand_order: &mut VecDeque<String>,
     emit: &dyn Emitter,
     hist: &Arc<Mutex<History>>,
     http: &reqwest::Client,
     cfg: &Config,
+    blob_tx: &UnboundedSender<BlobResult>,
 ) -> bool {
     let p = Path::new(path);
     let meta = match std::fs::metadata(p) {
@@ -864,8 +1017,9 @@ async fn send_file_clip(
     );
 
     *seq += 1;
-    let ev = if on_demand_mode {
-        // On-demand: advertise now, upload when the server asks.
+    if on_demand_mode {
+        // On-demand: advertise now, upload when the server asks. No blob I/O here,
+        // so this small advertisement frame is fine to send on the loop.
         let (bid, sha) = match key {
             Some((k, _)) => {
                 let data = match std::fs::read(p) {
@@ -875,26 +1029,35 @@ async fn send_file_clip(
                 let ct = match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog!("send", "on-demand file E2E seal FAILED: {e}"); emit.error(format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } };
                 let sha = sha_hex(&ct);
                 let bid = format!("sha256:{sha}");
-                on_demand.insert(bid.clone(), Hold::Sealed(ct));
+                hold_on_demand(on_demand, on_demand_order, bid.clone(), Hold::Sealed(ct));
                 (bid, sha)
             }
             None => {
                 let sha = match file_sha_hex(p) { Ok(s) => s, Err(e) => { dlog!("send", "on-demand file hash FAILED path={path}: {e}"); emit.notify("CopySync", &format!("읽기 실패: {e}")); return true; } };
                 let bid = format!("sha256:{sha}");
-                on_demand.insert(bid.clone(), Hold::Plain(p.to_path_buf()));
+                hold_on_demand(on_demand, on_demand_order, bid.clone(), Hold::Plain(p.to_path_buf()));
                 (bid, sha)
             }
         };
         dlog!("send", "file advertised on-demand: blob held for server request");
-        ClipEvent {
+        let ev = ClipEvent {
             id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
             mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
             sha256: sha, on_demand: true, targets,
             enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
             ..Default::default()
+        };
+        dlog!("send", "file seq={} name={} blob_id={} → control channel", *seq, name, ev.blob_id);
+        if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
+            dlog!("send", "file seq={}: ws::send FAILED — control channel down", *seq);
+            return false;
         }
+        add_history(hist, &ev.ts, kind, "me", "out", &name, &mime, size, &ev.blob_id, &name);
+        emit.clip(serde_json::json!({"direction":"out","kind":kind,"name":name,"size":size,"onDemand":ev.on_demand}));
+        true
     } else {
-        // Eager: upload the (encrypted) bytes immediately.
+        // Eager: read + (encrypt), build the event with a locally-computed blob id,
+        // then upload OFF the loop and emit the T_CLIP frame when it completes.
         let data = match std::fs::read(p) {
             Ok(d) => d,
             Err(e) => { dlog!("send", "eager file read FAILED path={path}: {e}"); emit.notify("CopySync", &format!("읽기 실패: {e}")); return true; }
@@ -903,32 +1066,63 @@ async fn send_file_clip(
             Some((k, _)) => match e2e::seal(k, &data) { Ok(c) => c, Err(e) => { dlog!("send", "eager file E2E seal FAILED: {e}"); emit.error(format!("파일 E2E 암호화 실패 — 전송 안 함: {e}")); return true; } },
             None => data,
         };
-        dlog!("blob", "file upload attempt: {}B payload (e2e={})", payload.len(), key.is_some());
-        let bid = match blob::put_blob(http, &cfg.server_url, &cfg.token, payload.clone()).await {
-            Ok(b) => { dlog!("blob", "file upload OK: blob_id={b}"); b }
-            Err(e) => {
-                let class = classify_blob_err(&e);
-                dlog!("blob", "file upload FAILED ({class}): {e}");
-                emit.notify("CopySync", &format!("업로드 실패({class}): {e}"));
-                return true;
-            }
-        };
-        ClipEvent {
+        let bid = blob::blob_id(&payload);
+        let ev = ClipEvent {
             id: protocol::new_id(), seq: *seq, ts: protocol::now_ts(),
             mime: vec![mime.clone()], name: name.clone(), blob_id: bid, size,
             sha256: sha_hex(&payload), targets,
             enc: key.as_ref().map(|(_, kid)| EncMeta { alg: e2e::ALG.into(), key_id: kid.clone(), nonce: String::new() }),
             ..Default::default()
-        }
-    };
-    dlog!("send", "file seq={} name={} blob_id={} → control channel", *seq, name, ev.blob_id);
-    if ws::send(sock, protocol::T_CLIP, &ev).await.is_err() {
-        dlog!("send", "file seq={}: ws::send FAILED — control channel down", *seq);
-        return false;
+        };
+        let emit_json = serde_json::json!({"direction":"out","kind":kind,"name":name,"size":size,"onDemand":false});
+        dlog!("blob", "file upload spawn: {}B payload (e2e={}) seq={}", payload.len(), key.is_some(), *seq);
+        let (client, base, token) = (http.clone(), cfg.server_url.clone(), cfg.token.clone());
+        let tx = blob_tx.clone();
+        let (hist_name, hist_mime) = (name.clone(), mime.clone());
+        tokio::spawn(async move {
+            let outcome = match blob::put_blob(&client, &base, &token, payload).await {
+                Ok(b) => { dlog!("blob", "file upload OK: blob_id={b}"); Ok(()) }
+                Err(e) => {
+                    let class = classify_blob_err(&e);
+                    dlog!("blob", "file upload FAILED ({class}): {e}");
+                    Err((class, format!("업로드 실패({class}): {e}")))
+                }
+            };
+            let _ = tx.send(BlobResult::Upload {
+                outcome,
+                ev,
+                hist_kind: kind,
+                hist_preview: hist_name.clone(),
+                hist_mime,
+                hist_size: size,
+                hist_name,
+                emit_json,
+                err_via_error: false, // file upload errors went to emit.notify
+            });
+        });
+        true
     }
-    add_history(hist, &ev.ts, kind, "me", "out", &name, &mime, size, &ev.blob_id, &name);
-    emit.clip(serde_json::json!({"direction":"out","kind":kind,"name":name,"size":size,"onDemand":ev.on_demand}));
-    true
+}
+
+/// Insert an on-demand hold, keeping the map bounded to a small insertion-ordered
+/// ring so a blob that is advertised but never fetched can't accumulate without
+/// bound (the leak fix). Re-advertising the same content is a no-op resize since
+/// it reuses the same key. Holds are also dropped right after they're served.
+fn hold_on_demand(
+    map: &mut HashMap<String, Hold>,
+    order: &mut VecDeque<String>,
+    key: String,
+    hold: Hold,
+) {
+    const MAX_HOLDS: usize = 16;
+    if map.insert(key.clone(), hold).is_none() {
+        order.push_back(key);
+        while order.len() > MAX_HOLDS {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
 }
 
 /// Classify a blob-upload/-download failure as transient (worth retrying — a
@@ -984,6 +1178,10 @@ fn file_sha_hex(p: &Path) -> std::io::Result<String> {
 
 // ----------------------------------------------------------------- inbound
 
+/// Handle one inbound control frame. Blob-bearing clips spawn their `get_blob`
+/// download OFF the loop (so `ws::recv` keeps being polled and pongs flow during
+/// the server's up-to-60s on-demand long-poll); a `blob_request` likewise spawns
+/// its `put_blob` upload off the loop. Text clips (no network) are applied inline.
 #[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     t: String,
@@ -995,19 +1193,36 @@ async fn handle_frame(
     emit: &dyn Emitter,
     state: &EngineState,
     hist: &Arc<Mutex<History>>,
-    downloads: &Path,
     roster: &Arc<Mutex<Vec<RosterDevice>>>,
     recent_text: &mut VecDeque<String>,
-    recent_img: &mut VecDeque<String>,
-    recent_files: &mut VecDeque<String>,
-    on_demand: &HashMap<String, Hold>,
+    on_demand: &mut HashMap<String, Hold>,
+    blob_tx: &UnboundedSender<BlobResult>,
 ) {
     match t.as_str() {
         protocol::T_CLIP => {
             match serde_json::from_value::<ClipEvent>(d) {
                 Ok(ev) => {
                     dlog!("recv", "clip: kind={} blob={} on_demand={} origin={} size={}", ev.kind(), ev.is_blob(), ev.on_demand, ev.origin_device, ev.size);
-                    handle_incoming(ev, key, pull, cfg, emit, state, hist, downloads, recent_text, recent_img, recent_files).await;
+                    if ev.is_blob() {
+                        // Download off the loop; the loop applies the bytes when the
+                        // BlobResult::Download arrives (see apply_blob).
+                        dlog!("recv", "blob pull spawn: blob_id={} ({}B advertised)", ev.blob_id, ev.size);
+                        let (client, base, token) = (pull.clone(), cfg.server_url.clone(), cfg.token.clone());
+                        let tx = blob_tx.clone();
+                        tokio::spawn(async move {
+                            let outcome = match blob::get_blob(&client, &base, &token, &ev.blob_id).await {
+                                Ok(d) => { dlog!("recv", "blob pull OK: {}B", d.len()); Ok(d) }
+                                Err(e) => {
+                                    let class = classify_blob_err(&e);
+                                    dlog!("recv", "blob pull FAILED ({class}) blob_id={}: {e}", ev.blob_id);
+                                    Err((class, format!("파일 받기 실패({class}): {e}")))
+                                }
+                            };
+                            let _ = tx.send(BlobResult::Download { outcome, ev });
+                        });
+                    } else {
+                        handle_incoming_text(ev, key, cfg, emit, state, hist, recent_text).await;
+                    }
                 }
                 Err(e) => { dlog!("recv", "clip decode FAILED: {e}"); emit.error(format!("받은 클립 디코딩 실패: {e}")); }
             }
@@ -1016,6 +1231,9 @@ async fn handle_frame(
             if let Ok(br) = serde_json::from_value::<BlobRequest>(d) {
                 if let Some(hold) = on_demand.get(&br.id) {
                     dlog!("blob", "blob_request: serving held blob id={}", br.id);
+                    // Clone/read the bytes on the loop (cheap for Sealed; a local
+                    // disk read for Plain), then upload OFF the loop. The hold is
+                    // dropped from on_demand by the loop on a successful Serve.
                     let bytes = match hold {
                         Hold::Sealed(b) => b.clone(),
                         Hold::Plain(p) => match std::fs::read(p) {
@@ -1023,10 +1241,16 @@ async fn handle_frame(
                             Err(e) => { dlog!("blob", "blob_request read FAILED id={}: {e}", br.id); emit.error(format!("요청받은 파일 읽기 실패: {e}")); return; }
                         },
                     };
-                    match blob::put_blob(http, &cfg.server_url, &cfg.token, bytes).await {
-                        Ok(b) => { dlog!("blob", "blob_request upload OK id={} blob_id={b}", br.id); }
-                        Err(e) => { let class = classify_blob_err(&e); dlog!("blob", "blob_request upload FAILED ({class}) id={}: {e}", br.id); }
-                    }
+                    let (client, base, token) = (http.clone(), cfg.server_url.clone(), cfg.token.clone());
+                    let tx = blob_tx.clone();
+                    let id = br.id.clone();
+                    tokio::spawn(async move {
+                        let ok = match blob::put_blob(&client, &base, &token, bytes).await {
+                            Ok(b) => { dlog!("blob", "blob_request upload OK id={id} blob_id={b}"); true }
+                            Err(e) => { let class = classify_blob_err(&e); dlog!("blob", "blob_request upload FAILED ({class}) id={id}: {e}"); false }
+                        };
+                        let _ = tx.send(BlobResult::Serve { id, ok });
+                    });
                 } else {
                     dlog!("blob", "blob_request: no held blob for id={} (already gone?)", br.id);
                 }
@@ -1046,31 +1270,22 @@ async fn handle_frame(
     }
 }
 
+/// Apply an already-downloaded blob clip's bytes (decrypt, persist, push to the
+/// clipboard, record history). Runs on the connection loop after the off-loop
+/// `get_blob` completes — the tail of the old `handle_incoming` blob branch.
 #[allow(clippy::too_many_arguments)]
-async fn handle_incoming(
+fn apply_blob(
     ev: ClipEvent,
+    data: Vec<u8>,
     key: &Option<(Vec<u8>, String)>,
-    pull: &reqwest::Client,
-    cfg: &Config,
     emit: &dyn Emitter,
     state: &EngineState,
     hist: &Arc<Mutex<History>>,
     downloads: &Path,
-    recent_text: &mut VecDeque<String>,
     recent_img: &mut VecDeque<String>,
     recent_files: &mut VecDeque<String>,
 ) {
-    if ev.is_blob() {
-        dlog!("recv", "blob pull attempt: blob_id={} ({}B advertised)", ev.blob_id, ev.size);
-        let data = match blob::get_blob(pull, &cfg.server_url, &cfg.token, &ev.blob_id).await {
-            Ok(d) => { dlog!("recv", "blob pull OK: {}B", d.len()); d }
-            Err(e) => {
-                let class = classify_blob_err(&e);
-                dlog!("recv", "blob pull FAILED ({class}) blob_id={}: {e}", ev.blob_id);
-                emit.notify("CopySync", &format!("파일 받기 실패({class}): {e}"));
-                return;
-            }
-        };
+    {
         let plain = match (&ev.enc, key) {
             (Some(_), Some((k, _))) => match e2e::open(k, &data) {
                 Ok(p) => p,
@@ -1127,10 +1342,21 @@ async fn handle_incoming(
         add_history(hist, &ev.ts, ev.kind(), &ev.origin_device, "in", &path.to_string_lossy(),
             ev.mime.first().map(|s| s.as_str()).unwrap_or(""), plain.len() as i64, &ev.blob_id, &name);
         emit.clip(serde_json::json!({"direction":"in","kind":ev.kind(),"name":name,"size":plain.len(),"path":path.to_string_lossy()}));
-        return;
     }
+}
 
-    // Text.
+/// Apply an inbound text/HTML clip (no network involved) — the tail of the old
+/// `handle_incoming` text branch. Runs inline on the connection loop.
+#[allow(clippy::too_many_arguments)]
+async fn handle_incoming_text(
+    ev: ClipEvent,
+    key: &Option<(Vec<u8>, String)>,
+    cfg: &Config,
+    emit: &dyn Emitter,
+    state: &EngineState,
+    hist: &Arc<Mutex<History>>,
+    recent_text: &mut VecDeque<String>,
+) {
     let text = match (&ev.enc, key) {
         (Some(_), Some((k, _))) => {
             use base64::{engine::general_purpose::STANDARD, Engine};

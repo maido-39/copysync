@@ -104,8 +104,19 @@ pub fn get_image() -> Result<Image> {
 /// None on non-Windows, or when the clipboard holds no file list.
 #[cfg(windows)]
 pub fn get_files() -> Option<Vec<String>> {
-    // Bounded open-retry: clipboard_win::get_clipboard opens the clipboard, which
-    // can be transiently locked by another app / the RDP redirector.
+    // Fast path: if there is no CF_HDROP file list on the clipboard at all (the
+    // overwhelmingly common case — every plain-text or image copy), bail out
+    // immediately. `IsClipboardFormatAvailable` does not open the clipboard, so
+    // it returns instantly and never contends. Without this guard the retry loop
+    // below could not tell "no file list present" (a permanent miss) from
+    // "clipboard transiently locked", and would burn all OPEN_ATTEMPTS × backoff
+    // (~160ms) on every text/image copy before returning None.
+    if !clipboard_win::raw::is_format_avail(clipboard_win::formats::CF_HDROP) {
+        return None;
+    }
+    // A file list IS present — only now do the bounded open-retry, since
+    // clipboard_win::get_clipboard opens the clipboard, which can be transiently
+    // locked by another app / the RDP redirector.
     let mut files: Option<Vec<String>> = None;
     for attempt in 1..=OPEN_ATTEMPTS {
         match clipboard_win::get_clipboard::<Vec<String>, _>(clipboard_win::formats::FileList) {

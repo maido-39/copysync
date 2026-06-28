@@ -41,12 +41,15 @@ class WsClient(private val client: OkHttpClient) {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                // SAFE FIX: do NOT echo webSocket.close(1000, null) here. Echoing a
-                // normal-closure code masked an unexpected liveness death as a clean
-                // "code 1000". Just mark disconnected and report the server's actual
-                // code + reason verbatim so the real cause is visible in the log.
-                connected.value = false
+                // Complete the WS close handshake immediately so onClosed fires
+                // deterministically instead of waiting on the connect loop's ~1s poll.
+                // OkHttp does NOT auto-send the responding close frame; the app must.
+                // The responding code must be 1000 (validateCloseCode rejects reserved
+                // codes like 1001), but we still report the server's ACTUAL code +
+                // reason verbatim in the log/listener so the real cause stays visible.
                 DebugLog.v("ws") { "disconnect (onClosing) — server code=$code reason='${reason}' (server-initiated)" }
+                webSocket.close(1000, null)
+                connected.value = false
                 listener.onClosed(if (reason.isNotEmpty()) "$reason (code $code)" else "code $code")
             }
 

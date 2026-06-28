@@ -103,8 +103,12 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 
 	// maybeRotate runs after a successful auth (Stage-3 token rotation): it retires
-	// the old token once the new one is in use, and re-issues tokens older than the
-	// configured age. Returns a new plaintext token to deliver, or "".
+	// the old token once the new one is in use, and decides whether to re-issue a
+	// token older than the configured age. Returns a new plaintext token to
+	// deliver, or "". It deliberately does NOT persist the rotation — the new token
+	// is committed only once it has actually been queued for delivery (see
+	// commitRotation), so a dropped token_rotate frame can never wedge the device
+	// on a never-retired token it never received.
 	maybeRotate := func(id model.DeviceID, token string) string {
 		rec, found, err := st.GetToken(id)
 		if err != nil || !found {
@@ -125,11 +129,15 @@ func run(cfg config.Config, log *slog.Logger) error {
 		if time.Since(rec.IssuedAt) < time.Duration(s.TokenRotateDays)*24*time.Hour {
 			return ""
 		}
-		newToken := auth.GenerateToken()
-		if st.RotateToken(id, auth.HashToken(secret, newToken), time.Now()) != nil {
-			return ""
+		return auth.GenerateToken()
+	}
+
+	// commitRotation durably records a rotation (called by the transport only after
+	// the token_rotate frame carrying newToken was successfully queued).
+	commitRotation := func(id model.DeviceID, newToken string) {
+		if err := st.RotateToken(id, auth.HashToken(secret, newToken), time.Now()); err != nil {
+			log.Warn("commit token rotation failed", "device", id, "err", err)
 		}
-		return newToken
 	}
 
 	// The blob channel authenticates by bearer token alone; resolve it to a
@@ -143,13 +151,14 @@ func run(cfg config.Config, log *slog.Logger) error {
 	}
 
 	wsHandler := transport.Handler(transport.Deps{
-		Hub:              h,
-		Log:              log,
-		Now:              time.Now,
-		ValidateToken:    validate,
-		MaybeRotateToken: maybeRotate,
-		MaxMessage:       func() int64 { s, _ := st.GetSettings(); return s.MaxMessageBytes },
-		Debug:            debug,
+		Hub:                 h,
+		Log:                 log,
+		Now:                 time.Now,
+		ValidateToken:       validate,
+		MaybeRotateToken:    maybeRotate,
+		CommitTokenRotation: commitRotation,
+		MaxMessage:          func() int64 { s, _ := st.GetSettings(); return s.MaxMessageBytes },
+		Debug:               debug,
 	})
 
 	api := httpapi.New(httpapi.Config{

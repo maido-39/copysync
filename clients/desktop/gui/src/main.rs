@@ -933,6 +933,10 @@ struct App {
     pair_pin: String,
     pair_e2e: String,
     pair_status: String,
+    // pairing worker channel (Pair runs off-thread like DiscoverServers, since
+    // the agent's Pair handler does a real network round-trip that can hang on a
+    // slow/unreachable server — running it on the UI thread freezes the GUI).
+    pair_rx: Option<Receiver<Result<Status, String>>>,
 
     // settings mirror (seeded from status / toggled locally)
     privacy_filter: bool,
@@ -1032,6 +1036,7 @@ impl App {
             pair_pin: String::new(),
             pair_e2e: String::new(),
             pair_status: String::new(),
+            pair_rx: None,
             privacy_filter: true,
             mark_sensitive: false,
             auto_clear_secs: 0,
@@ -1087,8 +1092,18 @@ impl App {
     /// `process::exit(0)` guarantees every thread is torn down.
     fn really_quit(&mut self) {
         self.logline(true, "종료 요청 — 에이전트 정지 후 GUI 종료");
-        // Best-effort: ignore any IPC error (agent already gone, etc.).
-        let _ = request(&Request::Shutdown);
+        // Best-effort, time-bounded: ask the agent to stop on a detached thread
+        // and exit after a short deadline regardless of the reply. `request()`
+        // blocks on connect+read with no timeout, so a wedged/unresponsive agent
+        // must never be able to stall the hard exit on the UI thread.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = request(&Request::Shutdown);
+            let _ = tx.send(());
+        });
+        // The agent acks Ok quickly (its own exit is deferred ~150ms), so this
+        // window is ample for the happy path while bounding the wedged case.
+        let _ = rx.recv_timeout(Duration::from_millis(300));
         std::process::exit(0);
     }
 
@@ -1523,12 +1538,23 @@ impl eframe::App for App {
         // tray ("열기" / left-click) or the quick-panel hotkey. A plain X must NOT
         // end the process; only the tray "종료" does.
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Only hide-to-tray if there's a live way back: a tray icon
+            // ("열기"/left-click) OR a registered global hotkey. Otherwise the X
+            // must really quit — hiding with no affordance would leave an
+            // invisible process that can only be killed from a task manager.
+            // Re-checked every frame (not cached) because the tray can come up
+            // late on Windows.
+            if self.tray.is_some() || self.hotkey_current.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.really_quit();
+            }
         }
 
         self.pump_events();
         self.poll_discovery(ctx);
+        self.poll_pair(ctx);
 
         // Keep `update()` ticking while idle so the tray/hotkey channels above
         // are polled even with no input events (otherwise egui sleeps).
@@ -2317,7 +2343,14 @@ impl App {
         });
     }
 
+    /// Kick off pairing on a worker thread (like `start_discovery`). The agent's
+    /// Pair handler does a real network round-trip that can hang for many seconds
+    /// on a slow/unreachable server, so it MUST NOT run on the UI thread. The
+    /// result is delivered over `pair_rx`, drained in `poll_pair` from `update()`.
     fn do_pair(&mut self) {
+        if self.pair_rx.is_some() {
+            return; // a pairing attempt is already in flight
+        }
         let req = Request::Pair {
             server: self.pair_server.trim().to_string(),
             otp: self.pair_otp.trim().to_string(),
@@ -2325,21 +2358,45 @@ impl App {
             pin: self.pair_pin.trim().to_string(),
             e2e_pass: self.pair_e2e.clone(),
         };
-        match request(&req) {
-            Ok(Response::Paired(s)) => {
+        self.pair_status = "페어링 중…".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pair_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = match request(&req) {
+                Ok(Response::Paired(s)) => Ok(s),
+                Ok(Response::Error { message }) => Err(message),
+                Ok(_) => Err("예상치 못한 응답".to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Drain the pairing worker result (mirrors `poll_discovery`).
+    fn poll_pair(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pair_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(s)) => {
+                self.pair_rx = None;
                 self.pair_status = "페어링 성공".into();
                 self.logline(true, "페어링 성공");
                 self.adopt_status(s);
                 self.reload_roster();
+                ctx.request_repaint();
             }
-            Ok(Response::Error { message }) => {
-                self.pair_status = format!("페어링 실패: {message}");
-                self.logline(true, format!("페어링 실패: {message}"));
-            }
-            Ok(_) => self.pair_status = "예상치 못한 응답".into(),
-            Err(e) => {
+            Ok(Err(e)) => {
+                self.pair_rx = None;
                 self.pair_status = format!("페어링 실패: {e}");
                 self.logline(true, format!("페어링 실패: {e}"));
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pair_rx = None;
             }
         }
     }

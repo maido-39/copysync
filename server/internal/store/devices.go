@@ -90,6 +90,12 @@ func (s *Store) DeleteDevice(id model.DeviceID) error {
 		var tr model.TokenRecord
 		if ok, _ := getJSON(tx.Bucket(bucketTokens), []byte(id), &tr); ok {
 			_ = tx.Bucket(bucketTokenIndex).Delete([]byte(tr.TokenHash))
+			// During a pending rotation the index also holds a PrevHash->id entry
+			// (added by RotateToken, normally removed by RetireOldToken). Delete it
+			// too, otherwise it dangles forever once the token record is gone.
+			if tr.PrevHash != "" {
+				_ = tx.Bucket(bucketTokenIndex).Delete([]byte(tr.PrevHash))
+			}
 		}
 		_ = tx.Bucket(bucketTokens).Delete([]byte(id))
 		if qb := tx.Bucket(bucketQueues).Bucket([]byte(id)); qb != nil {

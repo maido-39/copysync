@@ -405,7 +405,14 @@ class SyncService : Service() {
                     val token = secrets.token
                     val devId = settings.deviceId
                     if (url == null || pin == null || token == null || devId == null) {
-                        update("not paired"); break
+                        // Credentials vanished while running: stop the service so
+                        // onDestroy → releaseLocks() runs. A plain `break` would leave
+                        // the foreground service alive holding the CPU wakelock +
+                        // high-perf Wi-Fi lock forever with zero networking work.
+                        update("not paired")
+                        SyncState.running.value = false
+                        stopSelf()
+                        break
                     }
                     attempt++
                     val client = pinnedClient(pin)
@@ -420,41 +427,49 @@ class SyncService : Service() {
                                 .onFailure { DebugLog.e("ws", "수신 프레임 처리 오류(${env.t})", it) }
                         }
                     }
-                    val wsUrl = url.replaceFirst("https://", "wss://")
-                        .replaceFirst("http://", "ws://").trimEnd('/') + "/ws"
-                    DebugLog.v("ws") { "connect attempt #$attempt → $wsUrl (net=${networkType()}, backoff=${backoff}ms)" }
-                    update("connecting…")
-                    w.connect(wsUrl, object : WsClient.Listener {
-                        override fun onOpen() {
-                            SyncState.connected.value = true
-                            DebugLog.v("ws") { "onOpen → sending hello (dev=$devId, net=${networkType()})" }
-                            w.sendHello(
-                                Hello(deviceId = devId, deviceName = settings.deviceName ?: "android", token = token),
-                            )
-                            update("connected")
-                        }
+                    // try/finally so the collector coroutine + socket are torn down on
+                    // EVERY exit path. Without it, an exception after the launch (e.g.
+                    // w.connect or the URL rewrite throwing) would jump to the outer
+                    // catch and loop again, orphaning the incomingJob collector (a hot
+                    // SharedFlow that never completes) → coroutine/WsClient leak.
+                    try {
+                        val wsUrl = url.replaceFirst("https://", "wss://")
+                            .replaceFirst("http://", "ws://").trimEnd('/') + "/ws"
+                        DebugLog.v("ws") { "connect attempt #$attempt → $wsUrl (net=${networkType()}, backoff=${backoff}ms)" }
+                        update("connecting…")
+                        w.connect(wsUrl, object : WsClient.Listener {
+                            override fun onOpen() {
+                                SyncState.connected.value = true
+                                DebugLog.v("ws") { "onOpen → sending hello (dev=$devId, net=${networkType()})" }
+                                w.sendHello(
+                                    Hello(deviceId = devId, deviceName = settings.deviceName ?: "android", token = token),
+                                )
+                                update("connected")
+                            }
 
-                        override fun onClosed(reason: String) {
-                            SyncState.connected.value = false
-                            DebugLog.w("연결 끊김: $reason · 자동 재연결 시도")
-                            update("disconnected: $reason")
-                        }
-                    })
+                            override fun onClosed(reason: String) {
+                                SyncState.connected.value = false
+                                DebugLog.w("연결 끊김: $reason · 자동 재연결 시도")
+                                update("disconnected: $reason")
+                            }
+                        })
 
-                    var waited = 0
-                    while (isActive && !w.connected.value && waited < 8000) {
-                        delay(200); waited += 200
+                        var waited = 0
+                        while (isActive && !w.connected.value && waited < 8000) {
+                            delay(200); waited += 200
+                        }
+                        if (w.connected.value) { backoff = 1000L; DebugLog.v("ws") { "connected; backoff reset to 1000ms" } }
+                        else DebugLog.v("ws") { "connect attempt #$attempt did not open within ${waited}ms" }
+                        while (isActive && SyncState.running.value && w.connected.value) {
+                            delay(1000)
+                        }
+                    } finally {
+                        SyncState.connected.value = false
+                        DebugLog.v("ws") { "session ended (running=${SyncState.running.value}); tearing down socket" }
+                        incomingJob.cancel()
+                        w.close()
+                        blob = null
                     }
-                    if (w.connected.value) { backoff = 1000L; DebugLog.v("ws") { "connected; backoff reset to 1000ms" } }
-                    else DebugLog.v("ws") { "connect attempt #$attempt did not open within ${waited}ms" }
-                    while (isActive && SyncState.running.value && w.connected.value) {
-                        delay(1000)
-                    }
-                    SyncState.connected.value = false
-                    DebugLog.v("ws") { "session ended (running=${SyncState.running.value}); tearing down socket" }
-                    incomingJob.cancel()
-                    w.close()
-                    blob = null
                 } catch (e: Exception) {
                     // SAFE FIX: a CancellationException means the scope is being torn
                     // down (service stopping). Rethrow it so teardown is not mislabeled

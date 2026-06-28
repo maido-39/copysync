@@ -64,9 +64,15 @@ type EncMeta struct {
 
 // Targets selects the recipients of a clip: either all paired devices, or an
 // explicit list. Its JSON form is the string "all" or an array of device ids.
+//
+// Broadcast is an in-process-only flag (never serialized) used by the admin
+// server broadcast: unlike All — which scopes delivery to the origin's share
+// pool — Broadcast reaches every device across all pools. It is not part of the
+// wire form because no client ever needs to send or receive it.
 type Targets struct {
-	All     bool
-	Devices []DeviceID
+	All       bool
+	Broadcast bool
+	Devices   []DeviceID
 }
 
 // MarshalJSON encodes Targets as "all" or a device-id array (never null, so the
