@@ -33,6 +33,7 @@ import com.copysync.android.net.E2eCrypto
 import com.copysync.android.net.EncMeta
 import com.copysync.android.net.Envelope
 import com.copysync.android.net.Hello
+import com.copysync.android.net.HelloErr
 import com.copysync.android.net.HelloOk
 import com.copysync.android.net.MsgType
 import com.copysync.android.net.WsClient
@@ -69,13 +70,29 @@ class SyncService : Service() {
     private var capture: ClipboardCaptureEngine? = null
     @Volatile private var ws: WsClient? = null
     @Volatile private var blob: BlobClient? = null
+    // Separate blob channel for INBOUND on-demand preview pulls: the server
+    // broker-pulls the bytes from the origin device (up to ~60s), which exceeds
+    // the default 10s read timeout the shared `client` uses for the WS + eager
+    // ops. Built with a 120s timeout, matching Downloads.kt, so large/slow
+    // previews don't spuriously time out and get downgraded to download-on-tap.
+    @Volatile private var blobPull: BlobClient? = null
+    // The pinned OkHttpClient is reused across reconnects (idiomatic OkHttp: one
+    // client owns a Dispatcher executor + ConnectionPool). Rebuilt only when the
+    // pin changes (re-pair). Reusing it avoids leaking a Dispatcher/ConnectionPool
+    // per reconnect attempt and lets the connection pool aid reconnects.
+    @Volatile private var httpClient: okhttp3.OkHttpClient? = null
+    @Volatile private var httpPullClient: okhttp3.OkHttpClient? = null
+    private var httpClientPin: String? = null
     @Volatile private var threshold: Long = 0 // bytes; files over this go on demand (from hello_ok)
     @Volatile private var key: ByteArray? = null // E2E group key (null = off)
     private var kid: String = ""
     @Volatile private var keyChecked = false
     @Volatile private var clearJob: Job? = null
     private val PREVIEW_CAP_BYTES = 25L * 1024 * 1024 // images up to this are fetched to show a history thumbnail
-    private var seq = 0L
+    // Atomic: outbound ClipEvents are built from concurrently-launched coroutines
+    // on Dispatchers.IO, so the increment must be a single atomic op (not a plain
+    // read-modify-write on a non-volatile Long).
+    private val seq = java.util.concurrent.atomic.AtomicLong(0)
 
     // Doze hardening: a CPU partial wakelock + a high-perf Wi-Fi lock keep the
     // persistent socket alive while the screen is off. Held for the service
@@ -281,7 +298,7 @@ class SyncService : Service() {
                     val mimes = if (htmlField != null) listOf("text/html", "text/plain") else listOf("text/plain")
                     val sent = ws?.sendClip(
                         ClipEvent(
-                            id = UUID.randomUUID().toString(), seq = ++seq, mime = mimes,
+                            id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = mimes,
                             inlineText = inline, html = htmlField,
                             size = c.text.toByteArray().size.toLong(), sha256 = wireSha, enc = encMeta,
                             targets = currentTargets(),
@@ -341,7 +358,7 @@ class SyncService : Service() {
                             val em = EncMeta("aes-256-gcm", kid)
                             if (threshold > 0 && c.size > threshold) {
                                 runCatching { File(File(cacheDir, "clip-src").apply { mkdirs() }, ctSha).writeBytes(ct) }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             } else {
                                 DebugLog.v("blob") { "put attempt (e2e ciphertext, ${ct.size} bytes, $blobId)" }
                                 val r = runCatching { blob?.put(ct) }
@@ -350,7 +367,7 @@ class SyncService : Service() {
                                     return@launch
                                 }
                                 DebugLog.v("blob") { "put result OK (e2e $blobId)" }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
                             }
                             c.file.delete()
                             dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, ctSha, kind, blobId, c.name, c.size, c.mime, enc = true))
@@ -360,7 +377,7 @@ class SyncService : Service() {
                             val blobId = "sha256:" + c.sha
                             stashThumb(blobId)
                             if (threshold > 0 && c.size > threshold) {
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha, targets = currentTargets()))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = true, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 SyncState.lastEvent.value = "↑ ${c.name} (on-demand ${c.size / 1024}KB)"
                             } else {
@@ -371,7 +388,7 @@ class SyncService : Service() {
                                     return@launch
                                 }
                                 DebugLog.v("blob") { "putFile result OK ($blobId)" }
-                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = ++seq, mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
+                                ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
                                 dao.insert(fileEntity(UUID.randomUUID().toString(), "out", dev, c.sha, kind, blobId, c.name, c.size, c.mime))
                                 c.file.delete()
                                 SyncState.lastEvent.value = "↑ ${c.name} (${c.size / 1024}KB)"
@@ -415,10 +432,21 @@ class SyncService : Service() {
                         break
                     }
                     attempt++
-                    val client = pinnedClient(pin)
+                    // Reuse one pinned client across reconnects (only rebuild on
+                    // re-pair, i.e. a changed pin). Avoids leaking a Dispatcher
+                    // executor + ConnectionPool per attempt.
+                    if (httpClientPin != pin) {
+                        httpClient = pinnedClient(pin)
+                        // Long-timeout client for inbound on-demand preview pulls
+                        // (the server broker-pulls from the origin, up to ~60s).
+                        httpPullClient = pinnedClient(pin, java.time.Duration.ofSeconds(120))
+                        httpClientPin = pin
+                    }
+                    val client = httpClient!!
                     val w = WsClient(client)
                     ws = w
                     blob = BlobClient(client, url, token)
+                    blobPull = BlobClient(httpPullClient!!, url, token)
                     val incomingJob = launch {
                         // Guard each frame: one throwing/unparseable frame must not kill
                         // the whole receive loop (it'd silently stop all inbound sync).
@@ -469,6 +497,7 @@ class SyncService : Service() {
                         incomingJob.cancel()
                         w.close()
                         blob = null
+                        blobPull = null
                     }
                 } catch (e: Exception) {
                     // SAFE FIX: a CancellationException means the scope is being torn
@@ -581,7 +610,11 @@ class SyncService : Service() {
                         // Any image (eager, or on-demand within the cap) is fetched + decrypted +
                         // cached locally so the history list can render a real thumbnail.
                         ensureKey()
-                        var data = runCatching { blob?.get(ev.blobId!!) }.getOrNull()
+                        // On-demand previews trigger a server broker-pull from the
+                        // origin (up to ~60s), so use the long-timeout pull client;
+                        // eager bytes are already uploaded and use the snappy client.
+                        val fetcher = if (ev.onDemand) blobPull else blob
+                        var data = runCatching { fetcher?.get(ev.blobId!!) }.getOrNull()
                         if (data != null && ev.enc != null) {
                             val k = key
                             data = if (k != null) runCatching { E2eCrypto.open(k, data!!) }.getOrNull() else null
@@ -649,6 +682,22 @@ class SyncService : Service() {
                 dao.prune(300)
                 refreshNotification()
             }
+            MsgType.HELLO_ERR, MsgType.ERROR -> {
+                val he = runCatching { env.decodePayload<HelloErr>() }.getOrNull()
+                val code = he?.code ?: "error"
+                val message = he?.message ?: ""
+                DebugLog.w("server rejected: $code${if (message.isNotEmpty()) " — $message" else ""}")
+                update("rejected: $code${if (message.isNotEmpty()) " — $message" else ""}")
+                // Credential/auth rejections won't recover by retrying the same
+                // dead token — stop the reconnect loop and surface a re-pair CTA
+                // instead of spinning forever re-sending it.
+                if (code == "unauthorized" || code == "bad_hello") {
+                    SyncState.needsRepair.value = true
+                    SyncState.running.value = false
+                    DebugLog.w("auth rejected ($code) — re-pair required; stopping reconnect loop")
+                }
+            }
+            else -> DebugLog.w("unhandled frame type: ${env.t}")
         }
     }
 
@@ -685,6 +734,13 @@ class SyncService : Service() {
         capture?.stop()
         capture = null
         ws?.close()
+        // Release the reused OkHttpClients' Dispatcher executors + ConnectionPools.
+        listOfNotNull(httpClient, httpPullClient).forEach { c ->
+            runCatching { c.dispatcher.executorService.shutdown(); c.connectionPool.evictAll() }
+        }
+        httpClient = null
+        httpPullClient = null
+        httpClientPin = null
         releaseLocks()
         scope.cancel()
         super.onDestroy()

@@ -48,21 +48,36 @@ type Deps struct {
 	ValidateToken func(model.DeviceID, string) (model.Device, bool)
 	// MaybeRotateToken runs after a successful auth (Stage-3 token rotation). It
 	// retires a now-confirmed previous token and decides whether to re-issue the
-	// bearer token, returning a NEW plaintext token to deliver (or "" for none).
-	// It MUST NOT durably commit the rotation: the caller only commits once the
-	// new token has actually been queued for delivery (via CommitTokenRotation),
-	// so a dropped token_rotate frame cannot wedge the device on a never-retired
-	// token that the client never learns.
-	MaybeRotateToken func(model.DeviceID, string) string
+	// bearer token, returning a RotateDecision whose Token is the NEW plaintext
+	// token to deliver (or "" for none). The decision is self-contained: it also
+	// carries whether this is a grace re-issue (and the grace hash) so the commit
+	// step needs no cross-connection side state. It MUST NOT durably commit the
+	// rotation: the caller only commits once the new token has actually been
+	// queued for delivery (via CommitTokenRotation), so a dropped token_rotate
+	// frame cannot wedge the device on a never-retired token the client never
+	// learns.
+	MaybeRotateToken func(model.DeviceID, string) RotateDecision
 	// CommitTokenRotation durably records a rotation issued by MaybeRotateToken,
-	// keyed by the new plaintext token. Called only after the token_rotate frame
-	// was successfully enqueued.
-	CommitTokenRotation func(model.DeviceID, string)
+	// keyed by the same decision. Called only after the token_rotate frame was
+	// successfully enqueued.
+	CommitTokenRotation func(model.DeviceID, RotateDecision)
 	// MaxMessage returns the current WS read limit in bytes.
 	MaxMessage func() int64
 	// Debug enables verbose connection-lifecycle logging (COPYSYNC_DEBUG=1),
 	// read once at startup. Lines are prefixed "ws-debug" so they are greppable.
 	Debug bool
+}
+
+// RotateDecision is the self-contained outcome of MaybeRotateToken. Token is the
+// new plaintext token to deliver (empty means "no rotation"). When Reissue is
+// true the rotation re-mints an orphaned, never-delivered token from the grace
+// state, and PrevHash is the grace (previous) token hash the device presented;
+// the commit step uses these instead of any cross-connection map, so a dropped
+// token_rotate frame can never leak an intent that wedges a later rotation.
+type RotateDecision struct {
+	Token    string
+	Reissue  bool
+	PrevHash string
 }
 
 // dbg emits a greppable connection-lifecycle line when debug is enabled.
@@ -147,11 +162,11 @@ func serve(parent context.Context, d Deps, c *websocket.Conn, remote string) {
 	// the commit so the device keeps its current token and rotation is retried on
 	// the next reconnect — rather than wedging on a new token it never learned.
 	if d.MaybeRotateToken != nil {
-		if newTok := d.MaybeRotateToken(hello.DeviceID, hello.Token); newTok != "" {
-			if b, err := protocol.Encode(protocol.TypeTokenRotate, protocol.TokenRotate{Token: newTok}); err == nil {
+		if dec := d.MaybeRotateToken(hello.DeviceID, hello.Token); dec.Token != "" {
+			if b, err := protocol.Encode(protocol.TypeTokenRotate, protocol.TokenRotate{Token: dec.Token}); err == nil {
 				if client.Enqueue(b) {
 					if d.CommitTokenRotation != nil {
-						d.CommitTokenRotation(hello.DeviceID, newTok)
+						d.CommitTokenRotation(hello.DeviceID, dec)
 					}
 				} else {
 					d.Log.Warn("token_rotate frame dropped (send buffer full); rotation deferred to next reconnect", "device", hello.DeviceID)

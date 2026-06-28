@@ -165,6 +165,11 @@ enum BlobResult {
         emit_json: serde_json::Value,
         // user-facing error sink: true => emit.error, false => emit.notify
         err_via_error: bool,
+        // idx 9: content hash to record in the local echo-dedup ring ONLY after a
+        // successful upload+advertise (images set this; files leave it None). This
+        // ties echo suppression to clips that genuinely went out, so a re-copy of
+        // an image whose upload failed isn't silently swallowed.
+        echo_img_sha: Option<String>,
     },
     /// An on-demand `blob_request` upload finished. On success the loop drops the
     /// hold from `on_demand` so the map can't grow without bound.
@@ -654,15 +659,17 @@ pub async fn run(
                             continue;
                         }
                         match res {
-                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error } => {
+                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error, echo_img_sha } => {
                                 dlog!("send", "re-advertising pending upload seq={} blob_id={} on new connection", ev.seq, ev.blob_id);
                                 if ws::send(&mut sock, protocol::T_CLIP, &ev).await.is_err() {
                                     dlog!("send", "re-advertise seq={}: ws::send FAILED — control channel down again", ev.seq);
                                     requeue_failed = true;
                                     pending_uploads.push(BlobResult::Upload {
-                                        outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error,
+                                        outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error, echo_img_sha,
                                     });
                                 } else {
+                                    // idx 9: the clip finally went out — record the echo hash now.
+                                    if let Some(sha) = echo_img_sha { remember(&mut recent_img, sha); }
                                     add_history(&hist, &ev.ts, hist_kind, "me", "out", &hist_preview, &hist_mime, hist_size, &ev.blob_id, &hist_name);
                                     emit.clip(emit_json);
                                 }
@@ -713,7 +720,10 @@ pub async fn run(
                                     dlog!("send", "LocalText SKIPPED (echo/dedup) sha={}", &sha[..16.min(sha.len())]);
                                     continue;
                                 }
-                                remember(&mut recent_text, sha);
+                                // idx 9: do NOT remember pre-send — send_text_clip
+                                // records the hash only after a successful ws::send,
+                                // so a clip that never reached the wire (oversize,
+                                // E2E/encode error) won't suppress an identical re-copy.
                                 if exclude_flag.load(Ordering::Relaxed) {
                                     if let Some(reason) = privacy::classify(&text, &custom_res) {
                                         // Privacy filter: never sync; record locally + auto-purge.
@@ -726,11 +736,13 @@ pub async fn run(
                                         continue;
                                     }
                                 }
-                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&state.targets), max_msg, &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
+                                if !send_text_clip(&mut sock, &mut seq, &text, html.as_deref(), &key, current_targets(&state.targets), max_msg, &*emit, &hist, &mut recent_text).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::SendText(t)) => {
-                                remember(&mut recent_text, sha_hex(t.as_bytes()));
-                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&state.targets), max_msg, &*emit, &hist).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
+                                // idx 9: remember only on a successful send (inside
+                                // send_text_clip), so a failed manual send no longer
+                                // poisons the dedup ring against a later re-copy.
+                                if !send_text_clip(&mut sock, &mut seq, &t, None, &key, current_targets(&state.targets), max_msg, &*emit, &hist, &mut recent_text).await { break 'inner "텍스트 전송 실패 — 제어 채널 끊김".to_string(); }
                             }
                             Some(Cmd::LocalImage(img)) => {
                                 let sha = sha_hex(&img.rgba);
@@ -738,10 +750,13 @@ pub async fn run(
                                     dlog!("send", "LocalImage SKIPPED (echo/dedup) sha={}", &sha[..16.min(sha.len())]);
                                     continue;
                                 }
-                                remember(&mut recent_img, sha);
+                                // idx 9: do NOT remember pre-send. The sha is carried
+                                // through the BlobResult::Upload and recorded only after
+                                // a successful upload+advertise, so a re-copy of an image
+                                // whose upload failed isn't silently swallowed.
                                 // Upload runs OFF the loop; the T_CLIP frame is emitted
                                 // from the blob_rx arm when the upload completes.
-                                spawn_image_clip(&mut seq, &img, &key, current_targets(&state.targets), &*emit, &http, &cfg, &state.data_dir, &blob_tx);
+                                spawn_image_clip(&mut seq, &img, &key, current_targets(&state.targets), &*emit, &http, &cfg, &state.data_dir, &blob_tx, sha);
                             }
                             Some(Cmd::SendFile(p)) => {
                                 if !send_file_clip(&mut sock, &mut seq, &p, &key, current_targets(&state.targets), threshold, &mut on_demand, &mut on_demand_order, &*emit, &hist, &http, &cfg, &blob_tx).await { break 'inner "파일 전송 실패 — 제어 채널 끊김".to_string(); }
@@ -791,7 +806,7 @@ pub async fn run(
                         // alongside ws::recv is exactly what keeps the read half live
                         // (pongs flow) while a transfer is in flight.
                         Some(res) = blob_rx.recv() => match res {
-                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error } => {
+                            BlobResult::Upload { outcome, ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error, echo_img_sha } => {
                                 match outcome {
                                     Ok(()) => {
                                         dlog!("send", "upload done seq={} blob_id={} → control channel", ev.seq, ev.blob_id);
@@ -804,10 +819,13 @@ pub async fn run(
                                             dlog!("send", "upload done seq={}: ws::send FAILED — stashing for re-advertise on reconnect", ev.seq);
                                             pending_uploads.push(BlobResult::Upload {
                                                 outcome: Ok(()),
-                                                ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error,
+                                                ev, hist_kind, hist_preview, hist_mime, hist_size, hist_name, emit_json, err_via_error, echo_img_sha,
                                             });
                                             break 'inner "클립 전송 실패 — 제어 채널 끊김(보류 후 재연결 시 재전송)".to_string();
                                         }
+                                        // idx 9: record the echo-dedup hash only now that the
+                                        // clip actually went on the wire (images only).
+                                        if let Some(sha) = echo_img_sha { remember(&mut recent_img, sha); }
                                         add_history(&hist, &ev.ts, hist_kind, "me", "out", &hist_preview, &hist_mime, hist_size, &ev.blob_id, &hist_name);
                                         emit.clip(emit_json);
                                     }
@@ -918,6 +936,7 @@ fn apply_presence(emit: &dyn Emitter, roster: &Arc<Mutex<Vec<RosterDevice>>>, p:
 
 // ----------------------------------------------------------------- outbound
 
+#[allow(clippy::too_many_arguments)]
 async fn send_text_clip(
     sock: &mut ws::Ws,
     seq: &mut u64,
@@ -928,6 +947,7 @@ async fn send_text_clip(
     max_msg: i64,
     emit: &dyn Emitter,
     hist: &Arc<Mutex<History>>,
+    recent_text: &mut Dedup,
 ) -> bool {
     *seq += 1;
     let ev = match ClipEvent::new_text(
@@ -980,6 +1000,11 @@ async fn send_text_clip(
         dlog!("send", "text seq={}: ws::send FAILED — control channel down", *seq);
         return false;
     }
+    // idx 9: remember the hash ONLY after the clip actually went on the wire. The
+    // early `return true` failure branches above (E2E/build, encode, max_msg
+    // refusal) must NOT poison the echo ring, so an immediate re-copy of the same
+    // text that previously failed to send is not silently suppressed.
+    remember(recent_text, sha_hex(text.as_bytes()));
     add_history(hist, &ev.ts, "text", "me", "out", text, "text/plain", text.len() as i64, "", "");
     emit.clip(serde_json::json!({"direction":"out","kind":"text","text":text}));
     true
@@ -1013,6 +1038,7 @@ fn spawn_image_clip(
     cfg: &Config,
     data_dir: &Path,
     blob_tx: &UnboundedSender<BlobResult>,
+    echo_sha: String, // idx 9: remembered for echo-dedup only on a successful upload
 ) {
     let png = match clipboard::encode_png(img) {
         Ok(p) => p,
@@ -1079,6 +1105,7 @@ fn spawn_image_clip(
             hist_name: "clipboard.png".to_string(),
             emit_json,
             err_via_error: true,
+            echo_img_sha: Some(echo_sha),
         });
     });
 }
@@ -1208,6 +1235,7 @@ async fn send_file_clip(
                 hist_name,
                 emit_json,
                 err_via_error: false, // file upload errors went to emit.notify
+                echo_img_sha: None,   // files don't use the image echo ring
             });
         });
         true
@@ -1224,7 +1252,10 @@ fn hold_on_demand(
     key: String,
     hold: Hold,
 ) {
-    const MAX_HOLDS: usize = 16;
+    // idx 10: keep the ring generous so a realistic multi-file burst doesn't evict
+    // a still-unfetched hold before the recipient's lazy blob_request arrives. Bound
+    // it (Sealed holds keep full ciphertext in RAM) but well above a typical batch.
+    const MAX_HOLDS: usize = 64;
     if map.insert(key.clone(), hold).is_none() {
         order.push_back(key);
         while order.len() > MAX_HOLDS {
@@ -1362,7 +1393,16 @@ async fn handle_frame(
                         let _ = tx.send(BlobResult::Serve { id, ok });
                     });
                 } else {
+                    // idx 10: the server asked for an on-demand blob we no longer
+                    // hold (evicted from the bounded ring before the recipient
+                    // fetched it, or already served). Surface it instead of only
+                    // logging, so a dropped large/E2E clip is observable rather than
+                    // silently lost (the recipient's pull then 504s).
                     dlog!("blob", "blob_request: no held blob for id={} (already gone?)", br.id);
+                    emit.error(format!(
+                        "요청받은 파일을 더 이상 보관하고 있지 않습니다 (대기 중 제거됨) — 다시 복사해 주세요 (id={})",
+                        br.id
+                    ));
                 }
             }
         }
@@ -1424,11 +1464,22 @@ fn apply_blob(
             (None, _) => data,
         };
         let _ = std::fs::create_dir_all(downloads);
-        let name = if ev.name.is_empty() {
-            ev.blob_id.trim_start_matches("sha256:").to_string()
-        } else {
-            ev.name.clone()
-        };
+        // idx 0 (path traversal / arbitrary file write): `ev.name` is an untrusted,
+        // peer/server-controlled string. `Path::join` lets an absolute path replace
+        // the base and `..` components traverse upward, so writing to
+        // `downloads.join(ev.name)` verbatim is an arbitrary-file-write primitive
+        // (e.g. "../../.bashrc" or "/home/u/.config/autostart/x.desktop"). Reduce to
+        // a pure basename via file_name() (same sanitization the OUTBOUND side does,
+        // see file_name() above), rejecting empty / "." / ".." and falling back to
+        // the blob id. NOTE: a plain path.starts_with(downloads) guard is NOT enough
+        // because Rust's Path does not normalize "..".
+        let blob_fallback = || ev.blob_id.trim_start_matches("sha256:").to_string();
+        let name = std::path::Path::new(&ev.name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .map(|s| s.to_string())
+            .unwrap_or_else(blob_fallback);
         let path = downloads.join(&name);
         let _ = std::fs::write(&path, &plain);
         let is_image = ev.mime.first().map(|m| m.starts_with("image/")).unwrap_or(false);

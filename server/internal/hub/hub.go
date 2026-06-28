@@ -258,7 +258,13 @@ func (h *Hub) handleBlobAuth(id model.BlobID, dev model.DeviceID, mode BlobAuthM
 }
 
 // pruneOnDemand drops every on-demand blob holding (and its ACL) owned by id and
-// returns how many on-demand entries were removed.
+// returns how many on-demand entries were removed. It ALSO reclaims blobACL
+// entries for EAGER (non-on-demand) blobs originated by id: those never appear in
+// h.onDemand, so without this they would accumulate for the whole process
+// lifetime (a client-driven memory leak — e.g. a device streaming many distinct
+// small images). Once the origin is offline its ACLs are dead weight (a fetch
+// would have to come from a still-routed recipient, and the bytes are GC'd on
+// TTL), so dropping them caps blobACL at the live origins' distinct blob sets.
 func (h *Hub) pruneOnDemand(id model.DeviceID) int {
 	pruned := 0
 	for blobID, holder := range h.onDemand {
@@ -266,6 +272,12 @@ func (h *Hub) pruneOnDemand(id model.DeviceID) int {
 			delete(h.onDemand, blobID)
 			delete(h.blobACL, blobID)
 			pruned++
+		}
+	}
+	// Reclaim any remaining (eager) ACLs whose origin is this now-offline device.
+	for blobID, acl := range h.blobACL {
+		if acl.origin == id {
+			delete(h.blobACL, blobID)
 		}
 	}
 	return pruned
@@ -411,16 +423,33 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	// (origin ∪ targets) so a later GET /blob/<id> is only served to a device the
 	// clip was actually routed to (mirroring resolveTargets' pool/target scoping).
 	if ev.BlobID != "" {
-		allowed := make(map[model.DeviceID]bool, len(targets)+1)
-		allowed[ev.OriginDevice] = true
-		for _, d := range targets {
-			allowed[d.ID] = true
+		// Refuse to let one device clobber a blob already claimed by a DIFFERENT,
+		// still-connected origin: BlobID/OnDemand are client-controlled, so an
+		// attacker could otherwise forge a clip referencing a victim's blob id to
+		// take over its ACL (denying the real recipients) and its on-demand origin
+		// (redirecting/withholding pulls). The legitimate holder keeps its claim
+		// until it disconnects (pruneOnDemand) or re-registers the blob itself. The
+		// clip itself is still relayed to its targets below; only the blob-supplier
+		// bookkeeping is protected. claimOK gates both the ACL and on-demand writes.
+		claimOK := true
+		if cur, exists := h.blobACL[ev.BlobID]; exists && cur.origin != ev.OriginDevice {
+			if _, online := h.clients[cur.origin]; online {
+				h.dbg("blob-claim-rejected", "blob", ev.BlobID, "holder", cur.origin, "attempted_by", ev.OriginDevice)
+				claimOK = false
+			}
 		}
-		h.blobACL[ev.BlobID] = blobACL{origin: ev.OriginDevice, allowed: allowed}
-	}
-	// Remember who holds an on-demand blob so a later GET can pull it from them.
-	if ev.OnDemand && ev.BlobID != "" {
-		h.onDemand[ev.BlobID] = ev.OriginDevice
+		if claimOK {
+			allowed := make(map[model.DeviceID]bool, len(targets)+1)
+			allowed[ev.OriginDevice] = true
+			for _, d := range targets {
+				allowed[d.ID] = true
+			}
+			h.blobACL[ev.BlobID] = blobACL{origin: ev.OriginDevice, allowed: allowed}
+			// Remember who holds an on-demand blob so a later GET can pull it from them.
+			if ev.OnDemand {
+				h.onDemand[ev.BlobID] = ev.OriginDevice
+			}
+		}
 	}
 	var queuedFor []model.DeviceID
 	relayedAny := false

@@ -609,9 +609,19 @@ async fn handle_conn(engine: Arc<Engine>, conn: TokioStream) -> Result<()> {
                         write.flush().await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Dropped some events under backpressure — resync state.
-                        let out = Outbound::Event(Event::Status(engine.status_snapshot()));
-                        write.write_all(out.to_line().as_bytes()).await?;
+                        // Dropped some events under backpressure — resync the full
+                        // pushed state. Status alone is not enough: a Roster event
+                        // (or a clip storm displacing one) inside the dropped window
+                        // would otherwise leave the GUI's device list frozen, since
+                        // the GUI only updates its roster from pushed Roster events.
+                        // History is pulled on demand, so Status + Roster suffices.
+                        let status = Outbound::Event(Event::Status(engine.status_snapshot()));
+                        write.write_all(status.to_line().as_bytes()).await?;
+                        let roster = {
+                            let r = engine.roster.lock().unwrap_or_else(|e| e.into_inner());
+                            Outbound::Event(Event::Roster(roster_to_ipc(&r)))
+                        };
+                        write.write_all(roster.to_line().as_bytes()).await?;
                         write.flush().await?;
                     }
                     Err(broadcast::error::RecvError::Closed) => { rx = None; }

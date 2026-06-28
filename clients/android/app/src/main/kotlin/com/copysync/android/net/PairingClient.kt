@@ -55,10 +55,16 @@ fun parsePairQr(s: String): PairQr = json.decodeFromString(s)
 object PairingClient {
     private val JSON = "application/json".toMediaType()
 
-    /** Trust-on-first-use: fetch the server's identity + pin without verification. */
-    fun fetchServerInfo(serverUrl: String): ServerInfo {
+    /**
+     * Fetch the server's identity + pin. When [pin] is non-blank the connection
+     * is SPKI-pinned to that key (consistent with WsClient/data-plane pinning),
+     * so a MITM cannot answer. Only when [pin] is blank does this fall back to an
+     * unverified (trust-on-first-use) connection for initial pin discovery.
+     */
+    fun fetchServerInfo(serverUrl: String, pin: String = ""): ServerInfo {
         val req = Request.Builder().url(serverUrl.trimEnd('/') + "/pair/serverinfo").get().build()
-        insecureClient().newCall(req).execute().use { resp ->
+        val client = if (pin.isNotBlank()) pinnedClient(pin) else insecureClient()
+        client.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             require(resp.isSuccessful) { "serverinfo HTTP ${resp.code}" }
             return json.decodeFromString(body)
@@ -86,7 +92,29 @@ object PairingClient {
  * and stores the server config + token. Blocking; call off the main thread.
  */
 fun claimAndStore(ctx: Context, serverUrl: String, otp: String, deviceName: String, pinOpt: String): ClaimResult {
-    val pin = pinOpt.ifBlank { PairingClient.fetchServerInfo(serverUrl).spkiPin }
+    val pin: String
+    if (pinOpt.isNotBlank()) {
+        // Out-of-band pin (QR or manual entry): the trusted path.
+        pin = pinOpt
+    } else {
+        // No out-of-band pin: discover it (trust-on-first-use), then BIND the
+        // discovered pin to the cert the server actually presents by re-fetching
+        // /pair/serverinfo over a connection SPKI-pinned to that pin. This rejects
+        // a host that advertises a pin it cannot prove ownership of, and makes the
+        // discovered pin consistent with the data-plane (WsClient) pinning that all
+        // subsequent traffic relies on. (A fully active on-path MITM can still be
+        // self-consistent here — that residual risk is the documented TOFU tradeoff;
+        // prefer the QR path to eliminate it.)
+        val discovered = PairingClient.fetchServerInfo(serverUrl).spkiPin
+        require(discovered.isNotBlank()) { "server did not provide a pin" }
+        val verified = runCatching { PairingClient.fetchServerInfo(serverUrl, discovered) }
+            .getOrElse { throw IllegalStateException("핀 검증 실패: 서버가 광고한 SPKI 핀과 인증서가 일치하지 않습니다 (MITM 의심)", it) }
+        require(verified.spkiPin == discovered) { "서버 핀 불일치 (MITM 의심)" }
+        com.copysync.android.sync.DebugLog.w(
+            "pairing: trust-on-first-use pin discovered + cert-bound (serverId=${verified.serverId}, pin=${discovered.take(16)}…) — QR 페어링이 더 안전합니다",
+        )
+        pin = discovered
+    }
     require(pin.isNotBlank()) { "server did not provide a pin" }
     val result = PairingClient.claim(pinnedClient(pin), serverUrl, otp, deviceName)
     Settings(ctx).apply {

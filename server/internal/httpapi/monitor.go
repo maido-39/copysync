@@ -8,6 +8,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"net/http"
 
 	"github.com/syaro/copysync/internal/blob"
@@ -99,6 +100,26 @@ func (s *Server) handleMonitorBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = rc.Close() }()
+	// Guard against a decompression bomb: the blob's bytes are uploaded by a paired
+	// (low-privilege) device, and PUT /blob only checks the sha256 + encoded size,
+	// NOT the decoded pixel count. A few-KB PNG/GIF can declare enormous dimensions,
+	// and image.Decode would allocate width*height*4 bytes BEFORE we downscale,
+	// OOM-killing the relay. Read only the header first (no pixel buffer allocated)
+	// and reject oversized images, then rewind and decode for real.
+	cfg, _, cerr := image.DecodeConfig(rc)
+	if cerr != nil {
+		http.Error(w, "not a decodable image", http.StatusUnsupportedMediaType)
+		return
+	}
+	const maxMegapixels = 64
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxMegapixels*1_000_000 {
+		http.Error(w, "image too large", http.StatusUnprocessableEntity)
+		return
+	}
+	if _, err := rc.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, "io error", http.StatusInternalServerError)
+		return
+	}
 	img, _, derr := image.Decode(rc)
 	if derr != nil {
 		http.Error(w, "not a decodable image", http.StatusUnsupportedMediaType)

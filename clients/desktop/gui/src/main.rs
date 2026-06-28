@@ -2268,19 +2268,36 @@ impl App {
                     Some(rgb) => hex(rgb),
                     None => base.fg,
                 };
+                // `color_changed` drives the live theme preview every frame the
+                // value moves; `color_committed` gates the disk write so we persist
+                // only when the edit is released/clicked — not once per drag frame.
+                // (Mirrors the wallpaper-slider pattern above, which persists on
+                // `drag_stopped` rather than thrashing gui.json each frame.)
                 let mut color_changed = false;
+                let mut color_committed = false;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("테마색").size(12.5).color(pal.muted));
-                    if ui.color_edit_button_srgba(&mut accent_col).changed() {
+                    let r = ui.color_edit_button_srgba(&mut accent_col);
+                    if r.changed() {
                         // Drop any alpha — the palette accent is always opaque.
                         self.accent_override = Some(rgb24(accent_col));
                         color_changed = true;
                     }
+                    // The popup's hue/value pads are click-and-drag sliders, so
+                    // `dragged()` is the "still held" signal; `changed() && !dragged()`
+                    // is the release frame (and discrete clicks / keyboard steps).
+                    if r.changed() && !r.dragged() {
+                        color_committed = true;
+                    }
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("글자색").size(12.5).color(pal.muted));
-                    if ui.color_edit_button_srgba(&mut fg_col).changed() {
+                    let r = ui.color_edit_button_srgba(&mut fg_col);
+                    if r.changed() {
                         self.fg_override = Some(rgb24(fg_col));
                         color_changed = true;
+                    }
+                    if r.changed() && !r.dragged() {
+                        color_committed = true;
                     }
                     ui.add_space(8.0);
                     if (self.accent_override.is_some() || self.fg_override.is_some())
@@ -2289,13 +2306,18 @@ impl App {
                         self.accent_override = None;
                         self.fg_override = None;
                         color_changed = true;
+                        // A discrete click — commit immediately.
+                        color_committed = true;
                     }
                 });
                 if color_changed {
                     // Re-assert visuals so egui's widget fills pick up the new
                     // accent/fg immediately (the hand-painted frames already read the
-                    // live palette next frame), then persist.
+                    // live palette next frame). Keep this live every frame for preview.
                     self.apply_theme(ctx);
+                }
+                if color_committed {
+                    // Persist only when the edit is committed/released, not per frame.
                     save_prefs(&self.prefs_snapshot());
                 }
             });

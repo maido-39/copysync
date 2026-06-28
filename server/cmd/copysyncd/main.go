@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -83,7 +82,17 @@ func run(cfg config.Config, log *slog.Logger) error {
 
 	h := hub.New(st, log, time.Now, serverID, cfg.ServerName)
 	h.SetDebug(debug)
-	go h.Run(ctx)
+	// Run the hub on a context that OUTLIVES the HTTP server so the registry stays
+	// drainable during graceful shutdown. The hub's public methods are bare,
+	// unbuffered channel sends to its Run goroutine with no select-on-context; if
+	// Run returned the instant the signal ctx was cancelled, any in-flight handler
+	// already blocked on such a send (e.g. a clip Route or a blob AuthorizedForBlob
+	// on the hot path) would hang forever, stalling srv.Shutdown for its full
+	// timeout. Cancelling hubCtx only AFTER srv.Shutdown returns keeps Run draining
+	// until every handler has finished.
+	hubCtx, cancelHub := context.WithCancel(context.Background())
+	defer cancelHub()
+	go h.Run(hubCtx)
 	go housekeeping(ctx, st, blobStore, log)
 
 	validate := func(id model.DeviceID, token string) (model.Device, bool) {
@@ -103,36 +112,31 @@ func run(cfg config.Config, log *slog.Logger) error {
 		return dev, true
 	}
 
-	// pendingReissue records, per device, the grace (previous) token hash a device
-	// presented when maybeRotate decided to re-mint a token from the grace state
-	// (a prior rotation whose token_rotate frame was lost). commitRotation reads it
-	// to choose ReissuePendingToken over RotateToken. Guarded because maybeRotate
-	// runs on a per-connection goroutine.
-	var reissueMu sync.Mutex
-	pendingReissue := make(map[model.DeviceID]string)
-
 	// maybeRotate runs after a successful auth (Stage-3 token rotation): it retires
 	// the old token once the new one is in use, and decides whether to re-issue a
-	// token older than the configured age. Returns a new plaintext token to
-	// deliver, or "". It deliberately does NOT persist the rotation — the new token
-	// is committed only once it has actually been queued for delivery (see
-	// commitRotation), so a dropped token_rotate frame can never wedge the device
-	// on a never-retired token it never received.
-	maybeRotate := func(id model.DeviceID, token string) string {
+	// token older than the configured age. Returns a self-contained decision whose
+	// Token is the new plaintext to deliver (or "" for none). It deliberately does
+	// NOT persist the rotation — the new token is committed only once it has
+	// actually been queued for delivery (see commitRotation), so a dropped
+	// token_rotate frame can never wedge the device on a never-retired token it
+	// never received. The reissue intent (and the grace hash it depends on) travels
+	// inside the decision rather than a cross-connection side map, so a dropped
+	// frame cannot leak a stale intent that later wedges an unrelated rotation.
+	maybeRotate := func(id model.DeviceID, token string) transport.RotateDecision {
 		rec, found, err := st.GetToken(id)
 		if err != nil || !found {
-			return ""
+			return transport.RotateDecision{}
 		}
 		presented := auth.HashToken(secret, token)
 		curMatch := auth.ConstantTimeEqual(rec.TokenHash, presented)
 		// Client presented the NEW token while an old one is still pending → retire it.
 		if curMatch && rec.PrevHash != "" {
 			_ = st.RetireOldToken(id)
-			return ""
+			return transport.RotateDecision{}
 		}
 		s, _ := st.GetSettings()
 		if s.TokenRotateDays <= 0 {
-			return ""
+			return transport.RotateDecision{}
 		}
 		// Self-heal a wedged rotation: the device is authenticating on the GRACE
 		// (previous) token while a rotation is pending — i.e. it never received the
@@ -142,36 +146,40 @@ func run(cfg config.Config, log *slog.Logger) error {
 		// is never locked out, until it finally ACKs by presenting the new token.
 		prevMatch := rec.PrevHash != "" && auth.ConstantTimeEqual(rec.PrevHash, presented)
 		if !curMatch && prevMatch {
-			reissueMu.Lock()
-			pendingReissue[id] = rec.PrevHash
-			reissueMu.Unlock()
-			return auth.GenerateToken()
+			return transport.RotateDecision{Token: auth.GenerateToken(), Reissue: true, PrevHash: rec.PrevHash}
 		}
 		// Re-issue only from the current token, when not already rotating, and old enough.
 		if rec.PrevHash != "" || !curMatch {
-			return ""
+			return transport.RotateDecision{}
 		}
 		if time.Since(rec.IssuedAt) < time.Duration(s.TokenRotateDays)*24*time.Hour {
-			return ""
+			return transport.RotateDecision{}
 		}
-		return auth.GenerateToken()
+		return transport.RotateDecision{Token: auth.GenerateToken()}
 	}
 
 	// commitRotation durably records a rotation (called by the transport only after
-	// the token_rotate frame carrying newToken was successfully queued).
-	commitRotation := func(id model.DeviceID, newToken string) {
-		newHash := auth.HashToken(secret, newToken)
-		reissueMu.Lock()
-		prevHash, reissue := pendingReissue[id]
-		delete(pendingReissue, id)
-		reissueMu.Unlock()
-		if reissue {
+	// the token_rotate frame carrying dec.Token was successfully queued). The
+	// decision is self-contained, so there is no cross-connection state to leak.
+	commitRotation := func(id model.DeviceID, dec transport.RotateDecision) {
+		newHash := auth.HashToken(secret, dec.Token)
+		if dec.Reissue {
 			// Grace re-issue path: replace the orphaned pending token rather than
 			// no-op'ing on the already-set PrevHash (which RotateToken would do).
-			if _, err := st.ReissuePendingToken(id, prevHash, newHash, time.Now()); err != nil {
+			ok, err := st.ReissuePendingToken(id, dec.PrevHash, newHash, time.Now())
+			if err != nil {
 				log.Warn("commit token re-issue failed", "device", id, "err", err)
+				return
 			}
-			return
+			if ok {
+				return
+			}
+			// The grace state vanished between decide and commit (e.g. the device
+			// retired its old token on a concurrent connection), so the re-issue
+			// no-op'd. The client has ALREADY been handed (and will persist) the new
+			// token, so fall through and commit it as a normal rotation instead of
+			// orphaning it — otherwise the device would present a token the store
+			// never recorded and be locked out.
 		}
 		if err := st.RotateToken(id, newHash, time.Now()); err != nil {
 			log.Warn("commit token rotation failed", "device", id, "err", err)
@@ -242,7 +250,11 @@ func run(cfg config.Config, log *slog.Logger) error {
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+	// Now that all in-flight handlers have drained (or the deadline elapsed), it is
+	// safe to stop the hub: no handler can still be blocked on a send to Run.
+	cancelHub()
+	return err
 }
 
 func seedAdmin(st *store.Store, cfg config.Config, log *slog.Logger) error {

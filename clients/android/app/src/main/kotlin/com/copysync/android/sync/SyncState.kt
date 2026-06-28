@@ -22,6 +22,13 @@ object SyncState {
 
     /** A clip the privacy filter just blocked from syncing — drives the toast. */
     val blockedToast = MutableStateFlow<BlockedClip?>(null)
+
+    /**
+     * Set when the server rejects this device's credentials (hello_err with an
+     * auth-type code). The UI/notification layer observes this to surface an
+     * actionable "re-pair this device" prompt instead of looping a dead token.
+     */
+    val needsRepair = MutableStateFlow(false)
 }
 
 /** Reason + content preview for a blocked-clip toast. `at` makes each emit distinct. */
