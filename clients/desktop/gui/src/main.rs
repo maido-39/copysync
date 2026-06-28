@@ -227,9 +227,17 @@ fn spawn_agent_and_wait() -> Result<()> {
             agent.display()
         ));
     }
-    std::process::Command::new(&agent)
-        .arg("serve")
-        .spawn()
+    let mut cmd = std::process::Command::new(&agent);
+    cmd.arg("serve");
+    // Don't pop a console window for the headless agent. It's a console binary so
+    // its CLI subcommands keep stdout when run from a terminal — only THIS
+    // GUI-spawned daemon is created windowless (CREATE_NO_WINDOW = 0x08000000).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.spawn()
         .with_context(|| format!("spawn {}", agent.display()))?;
 
     let deadline = Instant::now() + Duration::from_secs(3);

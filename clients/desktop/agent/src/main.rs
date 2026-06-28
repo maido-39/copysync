@@ -770,7 +770,20 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("serve") | None => run_serve(),
+        Some("serve") | None => {
+            // Detach from any console so the background daemon never shows a
+            // terminal window — covers login-autostart + double-click. (The GUI
+            // already spawns us with CREATE_NO_WINDOW.) Only the serve daemon hits
+            // this arm, so the CLI subcommands below keep their stdout.
+            #[cfg(windows)]
+            {
+                extern "system" {
+                    fn FreeConsole() -> i32;
+                }
+                let _ = unsafe { FreeConsole() };
+            }
+            run_serve()
+        }
         Some("ping") | Some("status") => client_send(&Request::GetStatus),
         Some("history") => client_send(&Request::GetHistory { query: None }),
         Some("discover") => client_send(&Request::DiscoverServers),
