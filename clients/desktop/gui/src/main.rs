@@ -774,6 +774,10 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, events_rx: Receiver<Event>) -> Self {
+        // Korean (CJK) glyphs: register the embedded font before the first frame,
+        // otherwise the whole UI renders as □ tofu (egui's fonts are Latin-only).
+        install_fonts(&cc.egui_ctx);
+
         let prefs = load_prefs();
         let theme_mode = prefs.theme;
 
@@ -1979,6 +1983,26 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ============================================================ main
 
+/// Register an embedded Korean font (Nanum Gothic, OFL) as a fallback in both
+/// families so CJK text renders instead of □ tofu — egui's bundled fonts are
+/// Latin-only. Appended last so Latin keeps egui's default look.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "korean".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/korean.ttf")),
+    );
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push("korean".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// The CopySync character icon for the title bar / taskbar (embedded PNG).
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()
+}
+
 fn main() -> eframe::Result<()> {
     // FIRST thing: install the panic hook so even a crash during option/window
     // construction is written to gui.log (+ a MessageBox on Windows). Under
@@ -2011,7 +2035,8 @@ fn main() -> eframe::Result<()> {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([520.0, 680.0])
                 .with_min_inner_size([420.0, 480.0])
-                .with_title("CopySync"),
+                .with_title("CopySync")
+                .with_icon(app_icon()),
             // Prefer (not Require) HW accel so a weak driver degrades instead of failing.
             hardware_acceleration: eframe::HardwareAcceleration::Preferred,
             renderer,
