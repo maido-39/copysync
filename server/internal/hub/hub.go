@@ -239,9 +239,17 @@ func (h *Hub) AuthorizedForBlob(id model.BlobID, dev model.DeviceID, mode BlobAu
 
 func (h *Hub) handleBlobAuth(id model.BlobID, dev model.DeviceID, mode BlobAuthMode) bool {
 	if mode == BlobSupply {
-		// Only the device that advertised the on-demand blob may upload its bytes.
-		origin, ok := h.onDemand[id]
-		return ok && origin == dev
+		// On-demand blobs may only be supplied by the device that advertised them.
+		// But EAGER uploads (a small image/file PUT immediately, before/without any
+		// on-demand registration) are self-validating: the blob store enforces
+		// content-addressing (Put -> ErrHashMismatch unless the bytes hash to the
+		// id), so any authenticated device may supply them. Requiring an onDemand
+		// entry for every PUT rejected all eager uploads (404) — which broke
+		// image/file sync entirely (text is inline and needs no blob).
+		if origin, ok := h.onDemand[id]; ok {
+			return origin == dev
+		}
+		return true
 	}
 	// Fetch path: dev must be in the referencing clip's recipient set.
 	if acl, ok := h.blobACL[id]; ok {
