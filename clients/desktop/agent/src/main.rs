@@ -260,10 +260,19 @@ impl Engine {
     }
 
     /// Start (or restart) the sync actor for `cfg`. Ports `start_sync`: seeds the
-    /// privacy/clear atomics + status from the config, spins the clipboard watcher
-    /// on a std thread, and runs `engine::run` on a tokio task. A re-pair replaces
-    /// the old command sender (dropping it closes the channel → the old actor and
-    /// clipboard thread exit) and aborts the previous actor task.
+    /// privacy/clear atomics + status from the config, then spins a RESTART
+    /// SUPERVISOR task (stored in `self.join`) that owns the engine lifecycle.
+    ///
+    /// The supervisor loops: build a fresh `Cmd` channel (+ its clipboard watcher
+    /// std thread), run `engine::run` on an inner task, and await its JoinHandle. If
+    /// that inner task PANICKED (`JoinError::is_panic`), the supervisor logs, backs
+    /// off (bounded, jittered), and relaunches — sync recovers on its own instead of
+    /// staying dead until the daemon restarts. A clean `Ok(())` return from
+    /// `engine::run` means an intentional/fatal stop (the actor's command channel
+    /// closed, e.g. bad config early-return); the supervisor surfaces it and stops
+    /// (no hot-loop). A re-pair or `Shutdown` aborts THIS supervisor task from the
+    /// outside (see `start`'s abort below / the `Shutdown` handler), which tears
+    /// down the whole loop cleanly — the supervisor never fights that lifecycle.
     fn start(self: &Arc<Self>, cfg: Config) {
         dlog(&format!(
             "engine start: server={:?} device={:?} e2e={}",
@@ -289,45 +298,102 @@ impl Engine {
             s.e2e = !cfg.e2e_pass.is_empty();
         }
 
-        let (tx, rx) = unbounded_channel::<Cmd>();
-        // Swap in the new sender; dropping the previous one closes its channel so
-        // the prior actor's `rx.recv()` returns None and it shuts down cleanly.
-        *self.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
-        // Abort any previous actor task so we never run two engines at once.
+        // Abort any previous supervisor (a re-pair): dropping/aborting it stops the
+        // old engine+clipboard loop so we never run two engines at once. The new
+        // supervisor below installs its own fresh command channel.
         if let Some(prev) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            dlog("engine restart: aborting previous actor task");
+            dlog("engine restart: aborting previous supervisor task");
             prev.abort();
         }
 
-        let emit = self.new_emitter();
+        let this = self.clone();
+        let supervisor = tokio::spawn(async move {
+            let mut attempt: u32 = 0;
+            loop {
+                // (Re)build the command channel + clipboard watcher for this launch.
+                let (tx, rx) = unbounded_channel::<Cmd>();
+                *this.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+                let emit = this.new_emitter();
+                {
+                    // OS-clipboard watcher on its own std thread. It exits by itself
+                    // when `tx` is dropped (its `tx.is_closed()` check), which happens
+                    // when this loop iteration's `tx` + the actor's copy are gone.
+                    let emit_cb = emit.clone();
+                    std::thread::spawn(move || engine::clipboard_loop(tx, emit_cb));
+                }
 
-        // OS-clipboard watcher on its own std thread (the engine API requires it).
-        {
-            let emit_cb = emit.clone();
-            std::thread::spawn(move || engine::clipboard_loop(tx, emit_cb));
-        }
+                let state = this.state.engine_state();
+                let cfg_run = cfg.clone();
+                let inner: JoinHandle<()> =
+                    tokio::spawn(async move { engine::run(cfg_run, state, emit, rx).await });
 
-        let state = self.state.engine_state();
-        let events = self.events.clone();
-        let status = self.state.status.clone();
-        let handle = tokio::spawn(async move {
-            engine::run(cfg, state, emit, rx).await;
-            // The actor returned (command channel closed / fatal). Surface it and
-            // mark the status disconnected so later sends fail loudly, not silently.
-            dlog("engine stop: actor task returned (channel closed / fatal) — marking disconnected");
-            let _ = events.send(Event::Error {
-                message: "동기화가 멈췄습니다 — 다시 페어링하거나 에이전트를 재시작하세요.".into(),
-            });
-            let snap = {
-                let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
-                s.connected = false;
-                s.reconnecting = false;
-                status_to_ipc(&s)
-            };
-            let _ = events.send(Event::Status(snap));
+                match inner.await {
+                    Ok(()) => {
+                        // The actor returned normally: its command channel closed or
+                        // it hit a fatal early-return (bad pin/config). Surface it and
+                        // STOP — relaunching would just fail again the same way.
+                        dlog("engine stop: actor returned (channel closed / fatal) — marking disconnected, supervisor stops");
+                        let _ = this.events.send(Event::Error {
+                            message: "동기화가 멈췄습니다 — 다시 페어링하거나 에이전트를 재시작하세요.".into(),
+                        });
+                        let snap = {
+                            let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
+                            s.connected = false;
+                            s.reconnecting = false;
+                            status_to_ipc(&s)
+                        };
+                        let _ = this.events.send(Event::Status(snap));
+                        break;
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        // The inner task was aborted from the outside (only the
+                        // supervisor holds its handle, and it doesn't abort it) — treat
+                        // as an intentional stop and exit without relaunching.
+                        dlog("engine stop: actor task cancelled — supervisor stops");
+                        break;
+                    }
+                    Err(e) => {
+                        // Panic (or a runtime shutdown): log, mark disconnected, back
+                        // off, then relaunch so a single malformed-payload/bug panic
+                        // doesn't leave sync dead until the daemon is restarted.
+                        attempt = attempt.saturating_add(1);
+                        let delay = supervisor_backoff(attempt);
+                        dlog(&format!(
+                            "engine SUPERVISOR: actor task ended unexpectedly (panic={}) — relaunch #{} in {}ms",
+                            e.is_panic(),
+                            attempt,
+                            delay.as_millis()
+                        ));
+                        let _ = this.events.send(Event::Error {
+                            message: "동기화 엔진이 예기치 않게 중단되어 자동으로 재시작합니다.".into(),
+                        });
+                        let snap = {
+                            let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
+                            s.connected = false;
+                            s.reconnecting = true;
+                            status_to_ipc(&s)
+                        };
+                        let _ = this.events.send(Event::Status(snap));
+                        tokio::time::sleep(delay).await;
+                        // loop → relaunch
+                    }
+                }
+            }
         });
-        *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(supervisor);
     }
+}
+
+/// Bounded, jittered backoff for the engine restart supervisor: 1,2,4,8,16,30,30…
+/// seconds plus up to ~700ms jitter so a crash-looping build doesn't hammer in a
+/// tight loop and many devices don't relaunch in lockstep.
+fn supervisor_backoff(attempt: u32) -> std::time::Duration {
+    let secs = (1u64 << attempt.min(5)).min(30);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_millis() as u64) % 700)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(secs * 1000 + jitter)
 }
 
 // ----------------------------------------------------------------- history key
@@ -509,12 +575,13 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
         // Real shutdown: stop the engine and terminate this process. We schedule
         // the `process::exit(0)` on a short delay so the `Ok` reply below has a
         // chance to flush back to the caller (the GUI's tray "종료") before the
-        // daemon dies; the GUI ignores the reply either way. Dropping the command
-        // sender closes the actor's channel so `engine::run` shuts down cleanly.
+        // daemon dies; the GUI ignores the reply either way. Aborting the supervisor
+        // task tears down its engine actor + clipboard watcher, and it won't relaunch
+        // (an aborted supervisor is gone, not restarted).
         Request::Shutdown => {
             dlog("Shutdown requested — stopping engine and exiting process");
-            // Drop the command sender so the running actor's `rx.recv()` returns
-            // None and it (plus the clipboard thread) winds down.
+            // Clear the stored sender so no late IPC command races the teardown, then
+            // abort the SUPERVISOR (which owns the engine actor + clipboard thread).
             *engine.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
             if let Some(prev) = engine.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 prev.abort();

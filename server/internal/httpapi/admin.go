@@ -149,6 +149,11 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "could not save settings")
 		return
 	}
+	// Refresh the hub's cached settings snapshot so per-route reads (and the next
+	// register handshake) see the new values without a store hit.
+	if s.hub != nil {
+		s.hub.RefreshSettings()
+	}
 	out, _ := s.store.GetSettings()
 	writeJSON(w, http.StatusOK, out)
 }

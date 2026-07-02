@@ -8,6 +8,7 @@ import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.time.Duration
+import javax.net.SocketFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 
@@ -18,8 +19,20 @@ import javax.net.ssl.X509TrustManager
  *
  * X509Certificate.publicKey.encoded is the SubjectPublicKeyInfo DER, matching
  * the server's sha256(MarshalPKIXPublicKey(pub)).
+ *
+ * [socketFactory] pins every dial to a specific network interface (the Wi-Fi/LAN
+ * Network chosen by SyncService's NetworkCallback). Without it, a Wi-Fi↔cellular
+ * switch makes OkHttp redial over cellular against the LAN-only server → the
+ * source becomes the clatd 192.0.0.2 464XLAT address and the connect blackholes
+ * into a SocketTimeout. Passing network.socketFactory forces the dial to leave
+ * the correct interface. Also sets an explicit connectTimeout so a wrong-interface
+ * dial fails fast (instead of the default 10s) and the reconnect loop retries.
  */
-fun pinnedClient(spkiPinB64: String, readTimeout: Duration = Duration.ZERO): OkHttpClient {
+fun pinnedClient(
+    spkiPinB64: String,
+    readTimeout: Duration = Duration.ZERO,
+    socketFactory: SocketFactory? = null,
+): OkHttpClient {
     val pin = Base64.decode(spkiPinB64, Base64.DEFAULT)
     val tm = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -47,6 +60,13 @@ fun pinnedClient(spkiPinB64: String, readTimeout: Duration = Duration.ZERO): OkH
         .sslSocketFactory(ssl.socketFactory, tm)
         .hostnameVerifier { _, _ -> true } // SPKI pin is the real check
         .pingInterval(Duration.ofSeconds(20))
+        .connectTimeout(Duration.ofSeconds(8))
+    if (socketFactory != null) {
+        // Pin the underlying TCP socket to the chosen (Wi-Fi/LAN) Network. OkHttp
+        // wraps the plain socket from this factory with the SSLSocketFactory above,
+        // so pinning + interface-binding compose correctly.
+        b.socketFactory(socketFactory)
+    }
     if (!readTimeout.isZero) {
         // On-demand GETs long-poll while the server pulls from the origin device.
         b.readTimeout(readTimeout).callTimeout(readTimeout.plusSeconds(15))

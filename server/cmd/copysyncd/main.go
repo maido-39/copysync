@@ -221,6 +221,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		BlobStore:         blobStore,
 		ValidateBlobToken: validateBlobToken,
 		DataDir:           cfg.DataDir,
+		Debug:             debug,
 	})
 
 	srv := &http.Server{

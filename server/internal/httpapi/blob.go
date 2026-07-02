@@ -124,11 +124,13 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	// paired device cannot inject content for a blob id it never advertised.
 	if s.hub != nil && !s.hub.AuthorizedForBlob(model.BlobID(id), dev.ID, hub.BlobSupply) {
 		// 404 rather than 403 so the response does not confirm the id exists.
+		s.dbgBlob("blob_put-denied", "device", dev.ID, "id", id, "reason", "not the on-demand origin holder")
 		writeJSONError(w, http.StatusNotFound, "not_found", "blob not found")
 		return
 	}
 	settings, _ := s.store.GetSettings()
 	if r.ContentLength > settings.BlobMaxBytes {
+		s.dbgBlob("blob_put-denied", "device", dev.ID, "id", id, "reason", "content-length exceeds cap", "size", r.ContentLength, "cap", settings.BlobMaxBytes)
 		writeJSONError(w, http.StatusRequestEntityTooLarge, "too_large", "blob exceeds cap")
 		return
 	}
@@ -136,16 +138,20 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, blob.ErrHashMismatch):
+			s.dbgBlob("blob_put-denied", "device", dev.ID, "id", id, "reason", "hash mismatch")
 			writeJSONError(w, http.StatusBadRequest, "hash_mismatch", "content does not match id")
 		case errors.Is(err, blob.ErrTooLarge):
+			s.dbgBlob("blob_put-denied", "device", dev.ID, "id", id, "reason", "blob exceeds cap (during copy)")
 			writeJSONError(w, http.StatusRequestEntityTooLarge, "too_large", "blob exceeds cap")
 		default:
+			s.dbgBlob("blob_put-error", "device", dev.ID, "id", id, "err", err)
 			writeJSONError(w, http.StatusInternalServerError, "internal", "could not store blob")
 		}
 		return
 	}
 	_ = s.store.TouchBlob(model.BlobID(id), s.now(), size, r.Header.Get("Content-Type"))
 	s.blobWaiters.signal(id) // wake any on-demand GET waiting for this blob
+	s.dbgBlob("blob_put-accepted", "device", dev.ID, "id", id, "size", size)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "size": size})
 }
 
@@ -170,28 +176,58 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 	// fetch a blob it was a recipient of (origin ∪ targets / origin's pool). This
 	// also prevents an unauthorized requester from coercing pullOnDemand into
 	// waking the origin to upload bytes it only shared within another pool.
-	if s.hub != nil && !s.hub.AuthorizedForBlob(model.BlobID(id), dev.ID, hub.BlobFetch) {
+	authMode := "hub-acl"
+	authorized := s.hub != nil && s.hub.AuthorizedForBlob(model.BlobID(id), dev.ID, hub.BlobFetch)
+	if !authorized {
+		// The hub's in-memory ACL is pruned when the origin disconnects, so a fetch
+		// for an offline-queued or send-and-exit blob would 404 while the bytes sit
+		// on disk. Fall back to the ACL persisted on the blob record (origin ∪
+		// targets), which survives the origin going offline. Runs in the HTTP
+		// goroutine (not the hub Run goroutine), so it reads the store directly.
+		if entry, found, err := s.store.GetBlobEntry(model.BlobID(id)); err == nil && found {
+			if dev.ID == entry.Origin {
+				authorized = true
+				authMode = "persisted-acl-origin"
+			} else {
+				for _, a := range entry.Allowed {
+					if a == dev.ID {
+						authorized = true
+						authMode = "persisted-acl-allowed"
+						break
+					}
+				}
+			}
+		}
+	}
+	if !authorized {
 		// 404 rather than 403 so the response does not confirm the id exists.
+		s.dbgBlob("blob_get-denied", "device", dev.ID, "id", id, "reason", "not in ACL (hub or persisted)")
 		writeJSONError(w, http.StatusNotFound, "not_found", "blob not found")
 		return
 	}
 	rc, _, err := s.blobStore.Open(id)
+	pulled := false
 	if err != nil {
 		// Not stored yet — try to pull it on demand from the origin device.
 		rc, err = s.pullOnDemand(r.Context(), id)
 		if err != nil {
-			if errors.Is(err, errPullTimeout) {
+			switch {
+			case errors.Is(err, errPullTimeout):
+				s.dbgBlob("blob_get-404", "device", dev.ID, "id", id, "auth_mode", authMode, "reason", "on-demand pull timed out")
 				writeJSONError(w, http.StatusGatewayTimeout, "timeout", "source did not provide the file in time")
-			} else if errors.Is(err, context.Canceled) {
+			case errors.Is(err, context.Canceled):
 				return
-			} else {
+			default:
+				s.dbgBlob("blob_get-404", "device", dev.ID, "id", id, "auth_mode", authMode, "reason", "not stored and no online origin")
 				writeJSONError(w, http.StatusNotFound, "not_found", "blob not found")
 			}
 			return
 		}
+		pulled = true
 	}
 	defer func() { _ = rc.Close() }()
 	_ = s.store.TouchBlob(model.BlobID(id), s.now(), 0, "")
+	s.dbgBlob("blob_get-served", "device", dev.ID, "id", id, "auth_mode", authMode, "on_demand_pull", pulled)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", `"`+id+`"`)
 	http.ServeContent(w, r, "", time.Time{}, rc)

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/syaro/copysync/internal/config"
@@ -26,6 +27,11 @@ type Store interface {
 	DrainQueue(model.DeviceID) ([]model.QueueItem, error)
 	GetSettings() (config.RuntimeSettings, error)
 	RecordActivity(time.Time, int64) error
+	// SetBlobACL persists a blob's fetch ACL (origin ∪ targets) onto its record so
+	// a later GET stays authorizable after the origin disconnects (regression fix:
+	// pruneOnDemand drops the in-memory ACL on unregister — the persisted copy is
+	// the fallback and is reclaimed with the record on blob GC).
+	SetBlobACL(model.BlobID, model.DeviceID, []model.DeviceID) error
 }
 
 // Clock returns the current time (overridable in tests).
@@ -39,7 +45,26 @@ type RouteResult struct {
 
 type registerReq struct {
 	client *Client
-	reply  chan struct{}
+	// settings is the caller's cached runtime-settings snapshot, passed in so the
+	// hub critical section builds HelloOK without a store hit.
+	settings config.RuntimeSettings
+	// drained holds the device's offline queue, already read from the store and
+	// pre-encoded by the transport goroutine (outside the critical section). The
+	// hub enqueues these into the client's send buffer AHEAD of inserting it into
+	// the registry, so queued clips always precede any live clip. requeue receives
+	// the QueueItems whose frames could not be enqueued (send buffer full) so the
+	// transport goroutine can re-persist them off the hot path.
+	drained []queuedFrame
+	requeue chan []model.QueueItem
+	reply   chan struct{}
+}
+
+// queuedFrame pairs a pre-encoded queued clip with its original QueueItem, so an
+// undelivered tail can be re-persisted (preserving EnqueuedAt/TTL) without
+// re-encoding.
+type queuedFrame struct {
+	item    model.QueueItem
+	encoded []byte
 }
 
 type routeReq struct {
@@ -95,6 +120,12 @@ type Hub struct {
 	setPool    chan setPoolReq
 	evict      chan model.DeviceID
 
+	// settings caches the runtime settings behind an atomic snapshot so per-route
+	// reads (and the register handshake) never hit the store on the hot path. It is
+	// refreshed at startup (LoadSettings) and whenever the admin saves settings
+	// (RefreshSettings, called from PutSettings). Holds a *config.RuntimeSettings.
+	settings atomic.Pointer[config.RuntimeSettings]
+
 	clients  map[model.DeviceID]*Client      // owned by Run only
 	onDemand map[model.BlobID]model.DeviceID // on-demand blobId -> origin holder; owned by Run
 	// blobACL authorizes the blob channel: blobId -> the device set permitted to
@@ -113,7 +144,7 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 	if now == nil {
 		now = time.Now
 	}
-	return &Hub{
+	h := &Hub{
 		store:      store,
 		log:        log,
 		now:        now,
@@ -132,6 +163,33 @@ func New(store Store, log *slog.Logger, now Clock, serverID, serverName string) 
 		blobACL:    make(map[model.BlobID]blobACL),
 		monSubs:    make(map[int]chan MonitorEvent),
 	}
+	// Prime the settings snapshot from the store so the very first route/register
+	// has a value; on error we fall back to defaults rather than a nil pointer.
+	h.RefreshSettings()
+	return h
+}
+
+// RefreshSettings reloads the runtime-settings snapshot from the store into the
+// atomic cache. It is called at startup and after the admin saves settings
+// (wired from PutSettings), so per-route reads via Settings() never touch disk.
+func (h *Hub) RefreshSettings() {
+	s, err := h.store.GetSettings()
+	if err != nil && h.log != nil {
+		h.log.Warn("refresh settings snapshot failed; keeping previous/defaults", "err", err)
+	}
+	// GetSettings already returns normalized defaults even on error, so caching the
+	// returned value is safe.
+	h.settings.Store(&s)
+}
+
+// Settings returns the cached runtime-settings snapshot without hitting the store.
+// It never returns a zero value: the snapshot is primed in New and refreshed on
+// save. Safe to call from any goroutine.
+func (h *Hub) Settings() config.RuntimeSettings {
+	if p := h.settings.Load(); p != nil {
+		return *p
+	}
+	return config.DefaultRuntimeSettings()
 }
 
 // SetDebug toggles verbose connection-lifecycle logging. It is meant to be
@@ -177,10 +235,51 @@ func (h *Hub) Run(ctx context.Context) {
 
 // Register adds a client, sends it HelloOK followed by any queued clips, and
 // announces its presence. It blocks until registration completes.
+//
+// Register runs on the per-connection transport goroutine, so all its disk-bound
+// work — reading the runtime settings (from the atomic cache) and draining +
+// encoding the offline queue — happens HERE, off the single hub Run goroutine.
+// Only the tiny critical section (registry insert + roster snapshot + presence
+// broadcast, all in-memory) is dispatched to Run via the register channel, so a
+// reconnect storm no longer stalls Route/Roster/BlobReq for every other client
+// behind another client's DrainQueue. Any queue frames that could not be enqueued
+// (send buffer full) are re-persisted here — again off the Run goroutine.
 func (h *Hub) Register(c *Client) {
+	id := c.Device.ID
+	settings := h.Settings()
+
+	// Drain + pre-encode the offline queue outside the critical section.
+	var drained []queuedFrame
+	if items, err := h.store.DrainQueue(id); err == nil && len(items) > 0 {
+		drained = make([]queuedFrame, 0, len(items))
+		for _, it := range items {
+			b, err := protocol.Encode(protocol.TypeClip, it.Event)
+			if err != nil {
+				continue
+			}
+			drained = append(drained, queuedFrame{item: it, encoded: b})
+		}
+	} else if err != nil {
+		h.log.Warn("drain queue on register failed", "device", id, "err", err)
+	}
+
 	reply := make(chan struct{})
-	h.register <- registerReq{client: c, reply: reply}
+	requeue := make(chan []model.QueueItem, 1)
+	h.register <- registerReq{client: c, settings: settings, drained: drained, requeue: requeue, reply: reply}
 	<-reply
+	undelivered := <-requeue
+
+	// Re-persist any tail that didn't fit the send buffer (preserving each item's
+	// EnqueuedAt/TTL). DrainQueue already emptied the bucket, so this slice is the
+	// only copy; the next reconnect re-drains it. Done off the Run goroutine.
+	if len(undelivered) > 0 {
+		depth := settings.QueueDepthPerDevice
+		for _, rem := range undelivered {
+			if _, err := h.store.Enqueue(id, rem, depth); err != nil {
+				h.log.Warn("re-enqueue undelivered tail failed", "device", id, "err", err)
+			}
+		}
+	}
 }
 
 // Unregister removes a client and announces that it went offline.
@@ -247,22 +346,34 @@ func (h *Hub) handleBlobAuth(id model.BlobID, dev model.DeviceID, mode BlobAuthM
 		// entry for every PUT rejected all eager uploads (404) — which broke
 		// image/file sync entirely (text is inline and needs no blob).
 		if origin, ok := h.onDemand[id]; ok {
+			if origin != dev {
+				h.dbg("blob_auth-deny", "mode", "supply", "device", dev, "blob", id, "reason", "not the on-demand origin holder", "holder", origin)
+			}
 			return origin == dev
 		}
 		return true
 	}
 	// Fetch path: dev must be in the referencing clip's recipient set.
 	if acl, ok := h.blobACL[id]; ok {
+		if !acl.allowed[dev] {
+			h.dbg("blob_auth-deny", "mode", "fetch", "device", dev, "blob", id, "reason", "not in in-memory ACL")
+		}
 		return acl.allowed[dev]
 	}
 	// No ACL recorded for this blob (e.g. it predates this process or was never
 	// routed through here). Fall back to pool scoping against the on-demand
-	// origin if we know one; otherwise deny.
+	// origin if we know one; otherwise deny. (The HTTP layer additionally falls
+	// back to the persisted blob-record ACL when this returns false.)
 	origin, ok := h.onDemand[id]
 	if !ok {
+		h.dbg("blob_auth-deny", "mode", "fetch", "device", dev, "blob", id, "reason", "no in-memory ACL and no on-demand origin")
 		return false
 	}
-	return h.poolOf(origin) == h.poolOf(dev)
+	if h.poolOf(origin) != h.poolOf(dev) {
+		h.dbg("blob_auth-deny", "mode", "fetch", "device", dev, "blob", id, "reason", "pool mismatch with on-demand origin", "origin", origin)
+		return false
+	}
+	return true
 }
 
 // pruneOnDemand drops every on-demand blob holding (and its ACL) owned by id and
@@ -320,16 +431,25 @@ func (h *Hub) handleBlobRequest(id model.BlobID) bool {
 func (h *Hub) handleRegister(r registerReq) {
 	c := r.client
 	id := c.Device.ID
+	settings := r.settings
 	if old, ok := h.clients[id]; ok {
 		h.dbg("replace", "device", id, "reason", "replaced by a newer connection", "side", "server")
 		old.Close("replaced by a newer connection")
 		delete(h.clients, id)
 	}
-	h.clients[id] = c
-	h.dbg("register", "device", id, "name", c.Device.Name, "pool", poolName(c.Device.Pool), "online_count", len(h.clients))
 	_ = h.store.UpdateLastSeen(id, h.now())
 
-	settings, _ := h.store.GetSettings()
+	// Insert into the registry first so the client's own HelloOK roster shows it
+	// online (preserving prior behavior). Ordering with any live clip is still safe
+	// because this whole handler runs on the single Run goroutine: no concurrent
+	// Route can enqueue to this client until handleRegister returns, and HelloOK +
+	// the drained queue are enqueued below before that happens.
+	h.clients[id] = c
+	h.dbg("register", "device", id, "name", c.Device.Name, "pool", poolName(c.Device.Pool), "online_count", len(h.clients))
+
+	// The roster snapshot and availablePools read the clients map, so HelloOK is
+	// built here on the Run goroutine; settings come from the caller's cached
+	// snapshot (no store hit in the critical section).
 	ok := protocol.HelloOK{
 		ServerID:          h.serverID,
 		ServerName:        h.serverName,
@@ -346,32 +466,24 @@ func (h *Hub) handleRegister(r registerReq) {
 		c.Enqueue(b)
 	}
 
-	// Drain the offline queue (oldest first) before any live clip can arrive.
-	if items, err := h.store.DrainQueue(id); err == nil {
-		settings, _ := h.store.GetSettings()
-		for i, it := range items {
-			b, err := protocol.Encode(protocol.TypeClip, it.Event)
-			if err != nil {
-				continue
+	// Deliver the pre-drained offline queue (oldest first). The frames were encoded
+	// off the hot path by the transport goroutine; any that don't fit the send
+	// buffer are handed back so the caller re-persists them (preserving their
+	// EnqueuedAt/TTL) without blocking the hub on a store write.
+	var undelivered []model.QueueItem
+	for i, qf := range r.drained {
+		if !c.Enqueue(qf.encoded) {
+			undelivered = make([]model.QueueItem, 0, len(r.drained)-i)
+			for _, rem := range r.drained[i:] {
+				undelivered = append(undelivered, rem.item)
 			}
-			if !c.Enqueue(b) {
-				// Send buffer is full: DrainQueue already deleted the whole queue
-				// bucket, so the undelivered tail exists only in this slice. Re-persist
-				// it (preserving the original QueueItem so EnqueuedAt/TTL accounting
-				// stays correct) before bailing; the next reconnect — or a slot freeing
-				// up — re-drains it. Without this the tail is silently lost forever.
-				for _, rem := range items[i:] {
-					if _, err := h.store.Enqueue(id, rem, settings.QueueDepthPerDevice); err != nil {
-						h.log.Warn("re-enqueue undelivered tail failed", "device", id, "err", err)
-					}
-				}
-				break
-			}
+			break
 		}
 	}
 
 	h.broadcastPresence(c.Device, true, id)
 	close(r.reply)
+	r.requeue <- undelivered
 }
 
 func (h *Hub) handleUnregister(c *Client) {
@@ -410,7 +522,10 @@ func (h *Hub) handleEvict(id model.DeviceID) {
 }
 
 func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
-	settings, _ := h.store.GetSettings()
+	// Read settings from the atomic snapshot, not the store: this runs on the hub
+	// Run goroutine, so a per-route disk read would serialize every client behind
+	// bbolt I/O. The snapshot is refreshed on save (RefreshSettings).
+	settings := h.Settings()
 	// Enforce E2E on ingest: when E2E is enabled the server must never see, store,
 	// echo, or relay plaintext. A clip carrying inline plaintext (text or HTML)
 	// with no encryption metadata violates that invariant — reject it before it
@@ -448,11 +563,25 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 		}
 		if claimOK {
 			allowed := make(map[model.DeviceID]bool, len(targets)+1)
-			allowed[ev.OriginDevice] = true
+			allowedList := make([]model.DeviceID, 0, len(targets)+1)
+			addAllowed := func(id model.DeviceID) {
+				if !allowed[id] {
+					allowed[id] = true
+					allowedList = append(allowedList, id)
+				}
+			}
+			addAllowed(ev.OriginDevice)
 			for _, d := range targets {
-				allowed[d.ID] = true
+				addAllowed(d.ID)
 			}
 			h.blobACL[ev.BlobID] = blobACL{origin: ev.OriginDevice, allowed: allowed}
+			// Persist the ACL alongside the blob record so a GET stays authorizable
+			// after the origin disconnects (its in-memory ACL is pruned on unregister).
+			// One bbolt write per blob-clip; blob clips are infrequent. The persisted
+			// copy is reclaimed with the record when the blob is GC'd (DeleteBlobEntry).
+			if err := h.store.SetBlobACL(ev.BlobID, ev.OriginDevice, allowedList); err != nil {
+				h.log.Warn("persist blob ACL failed", "blob", ev.BlobID, "err", err)
+			}
 			// Remember who holds an on-demand blob so a later GET can pull it from them.
 			if ev.OnDemand {
 				h.onDemand[ev.BlobID] = ev.OriginDevice
@@ -490,6 +619,15 @@ func (h *Hub) handleRoute(ev model.ClipEvent) RouteResult {
 	status := protocol.AckRelayed
 	if !relayedAny && len(queuedFor) > 0 {
 		status = protocol.AckQueued
+	}
+	if h.debug {
+		recipients := make([]model.DeviceID, 0, len(targets))
+		for _, d := range targets {
+			recipients = append(recipients, d.ID)
+		}
+		h.dbg("route", "origin", ev.OriginDevice, "pool", h.poolOf(ev.OriginDevice),
+			"blob", ev.BlobID, "on_demand", ev.OnDemand, "recipients", recipients,
+			"queued_for", queuedFor, "status", status)
 	}
 	return RouteResult{Status: status, QueuedFor: queuedFor}
 }

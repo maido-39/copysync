@@ -158,6 +158,9 @@ struct AppState {
     mark_sensitive: Arc<AtomicBool>,
     /// Notified to force an immediate reconnect (manual "재연결" + wakes backoff).
     reconnect: Arc<Notify>,
+    /// The engine RESTART SUPERVISOR task (see `start_sync`). A re-pair aborts the
+    /// previous supervisor before spawning a new one so we never run two engines.
+    sync_supervisor: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 /// The engine's UI sink, wired to Tauri's `app.emit` (the WebView listens to these
@@ -417,6 +420,28 @@ async fn pair(
 
 // ----------------------------------------------------------------- sync wiring
 
+/// Bounded, jittered backoff for the engine restart supervisor: 1,2,4,8,16,30,30…
+/// seconds plus up to ~700ms jitter, so a crash-looping build doesn't hammer and
+/// many devices don't relaunch in lockstep.
+fn supervisor_backoff(attempt: u32) -> std::time::Duration {
+    let secs = (1u64 << attempt.min(5)).min(30);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_millis() as u64) % 700)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(secs * 1000 + jitter)
+}
+
+/// Start (or restart) the sync engine under a RESTART SUPERVISOR. The supervisor
+/// task loops: rebuild the `Cmd` channel (+ its clipboard-watcher std thread), run
+/// `engine::run`, and await its JoinHandle. If that inner task PANICKED
+/// (`JoinError::is_panic`), it logs, backs off (bounded + jittered), and relaunches
+/// so a single malformed-payload/bug panic doesn't leave sync dead until the app
+/// restarts. A clean `Ok(())` return means an intentional/fatal stop (the actor's
+/// command channel closed, e.g. a bad-config early return); the supervisor surfaces
+/// it and stops (no hot-loop). A re-pair aborts the PREVIOUS supervisor (stored in
+/// `AppState::sync_supervisor`) before spawning a fresh one, so two engines never
+/// run at once — the supervisor never fights the existing lifecycle.
 fn start_sync(app: &AppHandle, cfg: Config) {
     let state = app.state::<AppState>();
     state.exclude_sensitive.store(cfg.exclude_sensitive, Ordering::Relaxed);
@@ -431,51 +456,118 @@ fn start_sync(app: &AppHandle, cfg: Config) {
         s.e2e = !cfg.e2e_pass.is_empty();
     }
 
-    // Build the engine's shared state from the (re-used) AppState Arcs.
-    let engine_state = EngineState {
-        hist: state.hist.clone(),
-        status: state.status.clone(),
-        roster: state.roster.clone(),
-        targets: state.targets.clone(),
-        exclude_sensitive: state.exclude_sensitive.clone(),
-        auto_clear_secs: state.auto_clear_secs.clone(),
-        mark_sensitive: state.mark_sensitive.clone(),
-        reconnect: state.reconnect.clone(),
-        cfg_path: state.cfg_path.clone(),
-        downloads: state.downloads.clone(),
-        data_dir: state.data_dir.clone(),
-    };
+    // Snapshot the AppState Arcs/paths the engine needs so each supervised launch
+    // can rebuild a fresh `EngineState` (it is not `Clone`, and the engine takes it
+    // by value). The command-sender slot is re-published each relaunch via the
+    // AppHandle's managed state (see inside the task).
+    let hist = state.hist.clone();
+    let status = state.status.clone();
+    let roster = state.roster.clone();
+    let targets = state.targets.clone();
+    let exclude_sensitive = state.exclude_sensitive.clone();
+    let auto_clear_secs = state.auto_clear_secs.clone();
+    let mark_sensitive = state.mark_sensitive.clone();
+    let reconnect = state.reconnect.clone();
+    let cfg_path = state.cfg_path.clone();
+    let downloads = state.downloads.clone();
+    let data_dir = state.data_dir.clone();
+    let app_handle = app.clone();
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
-    *state.tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
-
-    // The engine's UI sink: maps its callbacks onto the same Tauri events the
-    // WebView already listens to (status/clip/roster/reconnect/error/cliplog).
-    let emit: Arc<dyn EngineEmitter> = Arc::new(TauriEmitter(app.clone()));
-
-    // OS-clipboard watcher on its own std thread (the engine API requires it).
+    // Abort a previous supervisor (a re-pair) so we never run two engines at once.
+    if let Some(prev) = state
+        .sync_supervisor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
     {
-        let emit_cb = emit.clone();
-        std::thread::spawn(move || engine::clipboard_loop(tx, emit_cb));
+        prev.abort();
     }
 
-    let emit_sup = emit.clone();
-    let status = state.status.clone();
-    tauri::async_runtime::spawn(async move {
-        engine::run(cfg, engine_state, emit, rx).await;
-        // The sync engine stopped (bad config / fatal error). Surface it instead of
-        // letting later actions fail silently with "sync not running".
-        emit_sup.error(
-            "동기화가 멈췄습니다 — 설정 → 기기 페어링에서 다시 연결하거나 앱을 재시작하세요.".to_string(),
-        );
-        let snap = {
-            let mut s = status.lock().unwrap_or_else(|e| e.into_inner());
-            s.connected = false;
-            s.reconnecting = false;
-            s.clone()
-        };
-        emit_sup.status(&snap);
+    let supervisor = tauri::async_runtime::spawn(async move {
+        let mut attempt: u32 = 0;
+        loop {
+            let engine_state = EngineState {
+                hist: hist.clone(),
+                status: status.clone(),
+                roster: roster.clone(),
+                targets: targets.clone(),
+                exclude_sensitive: exclude_sensitive.clone(),
+                auto_clear_secs: auto_clear_secs.clone(),
+                mark_sensitive: mark_sensitive.clone(),
+                reconnect: reconnect.clone(),
+                cfg_path: cfg_path.clone(),
+                downloads: downloads.clone(),
+                data_dir: data_dir.clone(),
+            };
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+            // Publish the new command sender so UI `enqueue` reaches this launch.
+            *app_handle.state::<AppState>().tx.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(tx.clone());
+
+            // The engine's UI sink: maps its callbacks onto the same Tauri events the
+            // WebView already listens to (status/clip/roster/reconnect/error/cliplog).
+            let emit: Arc<dyn EngineEmitter> = Arc::new(TauriEmitter(app_handle.clone()));
+            {
+                // OS-clipboard watcher on its own std thread; exits by itself when
+                // this launch's `tx` (+ the actor's copy) drop (its `tx.is_closed()`).
+                let emit_cb = emit.clone();
+                std::thread::spawn(move || engine::clipboard_loop(tx, emit_cb));
+            }
+
+            let emit_sup = emit.clone();
+            let status_inner = status.clone();
+            let cfg_run = cfg.clone();
+            let inner = tauri::async_runtime::spawn(async move {
+                engine::run(cfg_run, engine_state, emit, rx).await;
+            });
+
+            match inner.await {
+                Ok(()) => {
+                    // The engine returned normally: its command channel closed or a
+                    // fatal early-return (bad config). Surface it and STOP — a
+                    // relaunch would just fail again the same way.
+                    emit_sup.error(
+                        "동기화가 멈췄습니다 — 설정 → 기기 페어링에서 다시 연결하거나 앱을 재시작하세요.".to_string(),
+                    );
+                    let snap = {
+                        let mut s = status_inner.lock().unwrap_or_else(|e| e.into_inner());
+                        s.connected = false;
+                        s.reconnecting = false;
+                        s.clone()
+                    };
+                    emit_sup.status(&snap);
+                    break;
+                }
+                Err(e) if e.is_cancelled() => {
+                    // Inner task aborted from the outside — intentional stop.
+                    break;
+                }
+                Err(_) => {
+                    // Panic (or runtime shutdown): mark disconnected, back off, and
+                    // relaunch so a single panic doesn't leave sync dead permanently.
+                    attempt = attempt.saturating_add(1);
+                    let delay = supervisor_backoff(attempt);
+                    emit_sup.error(
+                        "동기화 엔진이 예기치 않게 중단되어 자동으로 재시작합니다.".to_string(),
+                    );
+                    let snap = {
+                        let mut s = status_inner.lock().unwrap_or_else(|e| e.into_inner());
+                        s.connected = false;
+                        s.reconnecting = true;
+                        s.clone()
+                    };
+                    emit_sup.status(&snap);
+                    tokio::time::sleep(delay).await;
+                    // loop → relaunch
+                }
+            }
+        }
     });
+    *app.state::<AppState>()
+        .sync_supervisor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(supervisor);
 }
 
 // ----------------------------------------------------------------- entrypoint
@@ -528,6 +620,7 @@ fn main() {
                 auto_clear_secs: Arc::new(AtomicU64::new(0)),
                 mark_sensitive: Arc::new(AtomicBool::new(false)),
                 reconnect: Arc::new(Notify::new()),
+                sync_supervisor: Mutex::new(None),
             };
             let cfg_path = state.cfg_path.clone();
             app.manage(state);

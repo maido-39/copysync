@@ -139,13 +139,22 @@ type QueueItem struct {
 }
 
 // BlobEntry is on-disk blob metadata; the bytes themselves live on the filesystem.
+//
+// Origin/Allowed persist the blob's fetch ACL (origin holder ∪ the referencing
+// clip's recipients) alongside the record, so a GET /blob/<id> stays authorizable
+// after the origin device disconnects and its in-memory ACL is pruned. This makes
+// offline-queued and send-and-exit image/file delivery work: the bytes on disk
+// remain fetchable by their recorded recipients. The whole record (ACL included)
+// is reclaimed when the blob itself is GC'd via DeleteBlobEntry.
 type BlobEntry struct {
-	ID         BlobID    `json:"id"`
-	Size       int64     `json:"size"`
-	Mime       string    `json:"mime"`
-	CreatedAt  time.Time `json:"createdAt"`
-	LastAccess time.Time `json:"lastAccess"`
-	Refcount   int       `json:"refcount"`
+	ID         BlobID     `json:"id"`
+	Size       int64      `json:"size"`
+	Mime       string     `json:"mime"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	LastAccess time.Time  `json:"lastAccess"`
+	Refcount   int        `json:"refcount"`
+	Origin     DeviceID   `json:"origin,omitempty"`  // device that holds/advertised the blob
+	Allowed    []DeviceID `json:"allowed,omitempty"` // recipients permitted to fetch (origin ∪ targets)
 }
 
 // AdminUser is the single administrator account for the web UI.

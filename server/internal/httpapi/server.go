@@ -29,6 +29,7 @@ type Server struct {
 	spkiPin    string
 	secret     string
 	apiKey     string
+	debug      bool // verbose blob-channel logging (COPYSYNC_DEBUG=1)
 
 	wsHandler http.Handler
 	webui     http.Handler
@@ -59,6 +60,9 @@ type Config struct {
 	BlobStore         *blob.FsBlobStore
 	ValidateBlobToken func(string) (model.Device, bool)
 	DataDir           string
+	// Debug enables verbose blob-channel logging (COPYSYNC_DEBUG=1), read once at
+	// startup. Lines are prefixed "blob-debug" so they are greppable.
+	Debug bool
 }
 
 // New creates the HTTP API server.
@@ -89,6 +93,7 @@ func New(c Config) *Server {
 		spkiPin:           c.SPKIPin,
 		secret:            c.Secret,
 		apiKey:            apiKey,
+		debug:             c.Debug,
 		wsHandler:         c.WSHandler,
 		webui:             c.WebUI,
 		blobStore:         c.BlobStore,
@@ -98,6 +103,16 @@ func New(c Config) *Server {
 		pairLimiter:       newIPLimiter(rate.Every(2*time.Second), 5),
 		blobWaiters:       newBlobWaiters(),
 	}
+}
+
+// dbgBlob emits a greppable verbose blob-channel line when debug is enabled.
+// The P0 ACL-persistence bug produced zero server log lines under COPYSYNC_DEBUG=1;
+// these lines make blob PUT/GET/auth outcomes diagnosable.
+func (s *Server) dbgBlob(event string, args ...any) {
+	if !s.debug || s.log == nil {
+		return
+	}
+	s.log.Info("blob-debug "+event, args...)
 }
 
 // Handler builds the root http.Handler.

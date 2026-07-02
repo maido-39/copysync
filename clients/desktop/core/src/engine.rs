@@ -847,7 +847,19 @@ pub async fn run(
                                 }
                             }
                             BlobResult::Download { outcome, ev } => match outcome {
-                                Ok(data) => apply_blob(ev, data, &key, &*emit, &state, &hist, &downloads, &mut recent_img, &mut recent_files),
+                                // idx defense: a malformed/adversarial inbound blob
+                                // (bad image decode, unexpected bytes) must not unwind
+                                // the whole engine actor. catch_unwind around the sync
+                                // apply so a panic is logged + the frame skipped.
+                                Ok(data) => {
+                                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        apply_blob(ev, data, &key, &*emit, &state, &hist, &downloads, &mut recent_img, &mut recent_files)
+                                    }));
+                                    if r.is_err() {
+                                        dlog!("recv", "apply_blob PANICKED — inbound blob skipped (engine kept alive)");
+                                        emit.error("받은 파일 처리 중 내부 오류 — 이 항목만 건너뜁니다".to_string());
+                                    }
+                                }
                                 Err((_class, msg)) => emit.notify("CopySync", &msg),
                             },
                         }
@@ -1362,7 +1374,18 @@ async fn handle_frame(
                             let _ = tx.send(BlobResult::Download { outcome, ev });
                         });
                     } else {
-                        handle_incoming_text(ev, key, cfg, emit, state, hist, recent_text).await;
+                        // idx defense: apply the inbound text/HTML clip under
+                        // catch_unwind so a malformed crypto/base64/clipboard payload
+                        // logs + is skipped instead of unwinding the engine actor.
+                        // (handle_incoming_text is fully synchronous — no await — so it
+                        // is safe to catch_unwind around.)
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_incoming_text(ev, key, cfg, emit, state, hist, recent_text)
+                        }));
+                        if r.is_err() {
+                            dlog!("recv", "handle_incoming_text PANICKED — inbound clip skipped (engine kept alive)");
+                            emit.error("받은 클립 처리 중 내부 오류 — 이 항목만 건너뜁니다".to_string());
+                        }
                     }
                 }
                 Err(e) => { dlog!("recv", "clip decode FAILED: {e}"); emit.error(format!("받은 클립 디코딩 실패: {e}")); }
@@ -1520,7 +1543,7 @@ fn apply_blob(
 /// Apply an inbound text/HTML clip (no network involved) — the tail of the old
 /// `handle_incoming` text branch. Runs inline on the connection loop.
 #[allow(clippy::too_many_arguments)]
-async fn handle_incoming_text(
+fn handle_incoming_text(
     ev: ClipEvent,
     key: &Option<(Vec<u8>, String)>,
     cfg: &Config,

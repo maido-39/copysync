@@ -6,7 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -83,6 +85,23 @@ class SyncService : Service() {
     @Volatile private var httpClient: okhttp3.OkHttpClient? = null
     @Volatile private var httpPullClient: okhttp3.OkHttpClient? = null
     private var httpClientPin: String? = null
+
+    // P0 — NETWORK BINDING. The socket is otherwise unbound: a Wi-Fi↔cellular
+    // switch makes OkHttp redial over cellular against the LAN-only server →
+    // SocketTimeout from the clatd 192.0.0.2 464XLAT source. We register a
+    // ConnectivityManager callback for a Wi-Fi+INTERNET network, thread the
+    // chosen Network's socketFactory into the pinned client so every dial pins to
+    // the Wi-Fi/LAN interface, and force a clean WS rebuild on availability change.
+    private var connectivityMgr: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var boundNetwork: Network? = null
+    // The pinned client is rebuilt when the bound Network changes (its socketFactory
+    // is baked in at build time). Compared alongside the pin in the connect loop.
+    private var httpClientNetwork: Network? = null
+    // Bumped on every network change so the connect loop's inner wait/session loop
+    // exits promptly and rebuilds on the new interface instead of blocking up to a
+    // full backoff cycle on the dead one.
+    private val netGeneration = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var threshold: Long = 0 // bytes; files over this go on demand (from hello_ok)
     @Volatile private var key: ByteArray? = null // E2E group key (null = off)
     private var kid: String = ""
@@ -93,6 +112,55 @@ class SyncService : Service() {
     // on Dispatchers.IO, so the increment must be a single atomic op (not a plain
     // read-modify-write on a non-volatile Long).
     private val seq = java.util.concurrent.atomic.AtomicLong(0)
+
+    // P1 — OUTBOUND RETRY QUEUE. Clips captured while disconnected, or whose send
+    // fails (blob upload / not-connected), used to be dropped with only a debug
+    // line. We now enqueue the ORIGINAL Captured item into a bounded in-memory
+    // queue and re-run the full send pipeline in order once (re)connected (after
+    // hello_ok). Sensitive-filtered clips are never enqueued (they return before
+    // reaching here). Oldest is dropped when the cap is exceeded.
+    private val OUTBOUND_QUEUE_CAP = 50
+    private val pendingOutbound = java.util.concurrent.ConcurrentLinkedDeque<Captured>()
+    // Guards the flush so a reconnect racing with an in-progress flush can't run
+    // two drains concurrently (which would double-send).
+    @Volatile private var flushing = false
+
+    /**
+     * Enqueue a clip that could not be sent (offline / blob channel down / send
+     * failure), bounded + drop-oldest. Sensitive clips must be filtered BEFORE
+     * calling this — never enqueue them.
+     */
+    private fun enqueueOutbound(c: Captured, why: String) {
+        pendingOutbound.addLast(c)
+        while (pendingOutbound.size > OUTBOUND_QUEUE_CAP) {
+            pendingOutbound.pollFirst()
+            DebugLog.w("outbound queue full (cap=$OUTBOUND_QUEUE_CAP) — dropped oldest pending clip")
+        }
+        DebugLog.i("queued outbound clip ($why); pending=${pendingOutbound.size}")
+    }
+
+    /** Flush queued outbound clips in FIFO order after a (re)connect + hello_ok. */
+    private fun flushOutbound() {
+        if (flushing) return
+        if (pendingOutbound.isEmpty()) return
+        flushing = true
+        scope.launch {
+            try {
+                // Only drain the items present at flush start. Items that re-fail
+                // re-enqueue to the TAIL; capping the drain to the initial count
+                // prevents an immediate hot re-retry spin on a persistently-failing
+                // clip (it waits for the next reconnect/flush instead).
+                var remaining = pendingOutbound.size
+                DebugLog.i("flushing $remaining queued outbound clip(s)")
+                while (remaining-- > 0 && SyncState.connected.value) {
+                    val c = pendingOutbound.pollFirst() ?: break
+                    sendCaptured(c, fromQueue = true)
+                }
+            } finally {
+                flushing = false
+            }
+        }
+    }
 
     // Doze hardening: a CPU partial wakelock + a high-perf Wi-Fi lock keep the
     // persistent socket alive while the screen is off. Held for the service
@@ -153,6 +221,58 @@ class SyncService : Service() {
         DebugLog.v("svc") { "onCreate" }
         Notifications.ensureChannels(this)
         acquireLocks()
+        registerNetworkCallback()
+    }
+
+    /**
+     * P0 — bind the socket to the Wi-Fi/LAN interface. Request a network with
+     * TRANSPORT_WIFI + INTERNET capability and remember it as [boundNetwork]; the
+     * connect loop threads its socketFactory into the pinned client so every dial
+     * leaves that interface (never the clatd 192.0.0.2 cellular path against the
+     * LAN-only server). onAvailable/onLost bump [netGeneration] + kick the ws so a
+     * clean rebuild happens on the correct interface. minSdk 29 → callbacks are
+     * always available; guarded defensively anyway.
+     */
+    private fun registerNetworkCallback() {
+        runCatching {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            connectivityMgr = cm
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    boundNetwork = network
+                    netGeneration.incrementAndGet()
+                    DebugLog.i("network available (wifi) → binding socket + forcing reconnect")
+                    forceReconnect("network available")
+                }
+
+                override fun onLost(network: Network) {
+                    if (boundNetwork == network) {
+                        boundNetwork = null
+                        netGeneration.incrementAndGet()
+                        DebugLog.w("bound network lost → will rebuild on next available interface")
+                        forceReconnect("network lost")
+                    }
+                }
+            }
+            networkCallback = cb
+            // requestNetwork keeps a Wi-Fi network up (and reports the specific one);
+            // registerDefaultNetworkCallback would follow the system default even when
+            // it flips to cellular, which is exactly what we want to avoid here.
+            cm.requestNetwork(req, cb)
+            DebugLog.v("svc") { "NetworkCallback registered (TRANSPORT_WIFI + INTERNET)" }
+        }.onFailure { DebugLog.e("svc", "registerNetworkCallback failed", it) }
+    }
+
+    /** Tear the current WS down so the connect loop redials immediately on the
+     *  freshly-chosen interface (rather than waiting out a backoff on a dead one). */
+    private fun forceReconnect(why: String) {
+        if (!SyncState.running.value) return
+        DebugLog.v("svc") { "forceReconnect ($why)" }
+        runCatching { ws?.close() }
     }
 
     /** Acquire a PARTIAL_WAKE_LOCK + a high-perf Wi-Fi lock for the service lifetime. */
@@ -258,24 +378,38 @@ class SyncService : Service() {
     }
 
     private fun onCaptured(c: Captured) {
-        scope.launch {
+        // Sensitive-filter FIRST, on capture, so a filtered clip is never persisted
+        // to history nor enqueued into the retry queue. Non-sensitive clips proceed
+        // to sendCaptured (which enqueues on failure/offline).
+        if (c is Captured.Text && settings.excludeSensitive) {
+            val sens = Privacy.classify(c.text)
+            if (sens != null) {
+                SyncState.lastEvent.value = "🔒 민감(${sens.label}) — 동기화 안 함"
+                SyncState.blockedToast.value =
+                    BlockedClip(sens.label, c.text.take(90), System.currentTimeMillis())
+                DebugLog.i("sensitive clip filtered (not synced): ${sens.label}")
+                DebugLog.v("capture") { "SKIP send: sensitive (${sens.label})" }
+                return
+            }
+        }
+        scope.launch { sendCaptured(c, fromQueue = false) }
+    }
+
+    /**
+     * Run the full outbound send pipeline for one captured clip. On a
+     * disconnected/failed send the clip is enqueued for retry (P1) instead of
+     * being dropped. Sensitive clips are already filtered out in onCaptured.
+     * [fromQueue] items re-enqueue to the TAIL on failure so a permanently-failing
+     * head does not block the rest of the drain.
+     */
+    private suspend fun sendCaptured(c: Captured, fromQueue: Boolean) {
+        run {
             when (c) {
                 is Captured.Text -> {
                     ensureKey()
                     val sha = sha256Hex(c.text)
                     DebugLog.v("capture") { "text captured: ${c.text.toByteArray().size} bytes, sha=${sha.take(12)}, html=${c.html != null}" }
-                    if (settings.excludeSensitive) {
-                        val sens = Privacy.classify(c.text)
-                        if (sens != null) {
-                            SyncState.lastEvent.value = "🔒 민감(${sens.label}) — 동기화 안 함"
-                            SyncState.blockedToast.value =
-                                BlockedClip(sens.label, c.text.take(90), System.currentTimeMillis())
-                            DebugLog.i("sensitive clip filtered (not synced): ${sens.label}")
-                            DebugLog.v("capture") { "SKIP send: sensitive (${sens.label})" }
-                            return@launch
-                        }
-                    }
-                    dao.insert(
+                    if (!fromQueue) dao.insert(
                         ClipEntity(
                             clipId = UUID.randomUUID().toString(), ts = System.currentTimeMillis(),
                             direction = "out", origin = settings.deviceId.orEmpty(),
@@ -304,17 +438,26 @@ class SyncService : Service() {
                             targets = currentTargets(),
                         ),
                     )
+                    if (sent != true) {
+                        // Not connected (ws null) or the frame couldn't be enqueued
+                        // on the socket: queue for retry after (re)connect instead of
+                        // dropping. Enqueue the ORIGINAL plaintext Captured (re-sealed
+                        // on flush) so E2E/key changes stay correct.
+                        enqueueOutbound(c, "text send failed (ws=${ws != null})")
+                        return
+                    }
                     SyncState.lastEvent.value = "↑ ${c.text.take(40)}"
                     DebugLog.i("local copy -> sendClip (ws=${ws != null}, sent=$sent, e2e=${key != null})")
                 }
                 is Captured.Binary -> {
                     ensureKey()
                     DebugLog.v("capture") { "binary captured: ${c.name} kind=${if (c.mime.startsWith("image/")) "image" else "file"} mime=${c.mime} size=${c.size} sha=${c.sha.take(12)}" }
-                    if (blob == null) {
-                        // SAFE FIX: make the drop LOUD (retry-queue is DEFERRED). Without a
-                        // live blob channel (socket down/connecting) a copied file is silently
-                        // lost — this is the most common "my file didn't sync" cause.
-                        DebugLog.e("blob", "DROPPED binary clip '${c.name}' (${c.size} bytes): no blob channel (connected=${SyncState.connected.value}, net=${networkType()}) — not queued (retry DEFERRED)")
+                    if (blob == null || ws == null) {
+                        // No live blob channel / socket (down or connecting): queue the
+                        // clip for retry after (re)connect instead of dropping it. This
+                        // is the most common "my file didn't sync" cause.
+                        DebugLog.w("no blob channel for '${c.name}' (${c.size} bytes, connected=${SyncState.connected.value}, net=${networkType()}) — queuing for retry")
+                        enqueueOutbound(c, "no blob channel")
                     } else {
                         val kind = if (c.mime.startsWith("image/")) "image" else "file"
                         val dev = settings.deviceId.orEmpty()
@@ -363,8 +506,9 @@ class SyncService : Service() {
                                 DebugLog.v("blob") { "put attempt (e2e ciphertext, ${ct.size} bytes, $blobId)" }
                                 val r = runCatching { blob?.put(ct) }
                                 if (r.isFailure) {
-                                    DebugLog.e("blob", "DROPPED e2e binary clip '${c.name}' (${c.size} bytes): blob.put failed ($blobId) — not queued (retry DEFERRED)", r.exceptionOrNull())
-                                    return@launch
+                                    DebugLog.w("e2e blob.put failed for '${c.name}' (${c.size} bytes, $blobId) — queuing for retry: ${r.exceptionOrNull()?.message}")
+                                    enqueueOutbound(c, "e2e blob.put failed")
+                                    return
                                 }
                                 DebugLog.v("blob") { "put result OK (e2e $blobId)" }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = ctSha, enc = em, targets = currentTargets()))
@@ -384,8 +528,9 @@ class SyncService : Service() {
                                 DebugLog.v("blob") { "putFile attempt (${c.name}, ${c.size} bytes, $blobId)" }
                                 val r = runCatching { blob?.putFile(c.file, c.mime, blobId) }
                                 if (r.isFailure) {
-                                    DebugLog.e("blob", "DROPPED binary clip '${c.name}' (${c.size} bytes): blob.putFile failed ($blobId) — not queued (retry DEFERRED)", r.exceptionOrNull())
-                                    return@launch
+                                    DebugLog.w("blob.putFile failed for '${c.name}' (${c.size} bytes, $blobId) — queuing for retry: ${r.exceptionOrNull()?.message}")
+                                    enqueueOutbound(c, "blob.putFile failed")
+                                    return
                                 }
                                 DebugLog.v("blob") { "putFile result OK ($blobId)" }
                                 ws?.sendClip(ClipEvent(id = UUID.randomUUID().toString(), seq = seq.incrementAndGet(), mime = listOf(c.mime), name = c.name, blobId = blobId, onDemand = false, size = c.size, sha256 = c.sha, targets = currentTargets()))
@@ -432,15 +577,28 @@ class SyncService : Service() {
                         break
                     }
                     attempt++
-                    // Reuse one pinned client across reconnects (only rebuild on
-                    // re-pair, i.e. a changed pin). Avoids leaking a Dispatcher
-                    // executor + ConnectionPool per attempt.
-                    if (httpClientPin != pin) {
-                        httpClient = pinnedClient(pin)
+                    // Snapshot the interface-bound network for this attempt + the
+                    // generation we build against, so the inner loops can detect a
+                    // mid-session network flip and rebuild promptly.
+                    val net = boundNetwork
+                    val genAtBuild = netGeneration.get()
+                    // Reuse one pinned client across reconnects; rebuild only when the
+                    // pin (re-pair) OR the bound network changes. The socketFactory is
+                    // baked into the client at build time, so a new Network needs a new
+                    // client to pin dials to the fresh interface. Shut the old clients'
+                    // executor/pool down before replacing to avoid a leak.
+                    if (httpClientPin != pin || httpClientNetwork != net) {
+                        listOfNotNull(httpClient, httpPullClient).forEach { old ->
+                            runCatching { old.dispatcher.executorService.shutdown(); old.connectionPool.evictAll() }
+                        }
+                        val sf = net?.socketFactory
+                        httpClient = pinnedClient(pin, socketFactory = sf)
                         // Long-timeout client for inbound on-demand preview pulls
                         // (the server broker-pulls from the origin, up to ~60s).
-                        httpPullClient = pinnedClient(pin, java.time.Duration.ofSeconds(120))
+                        httpPullClient = pinnedClient(pin, java.time.Duration.ofSeconds(120), socketFactory = sf)
                         httpClientPin = pin
+                        httpClientNetwork = net
+                        DebugLog.v("ws") { "pinned client (re)built (net=${if (net != null) "wifi-bound" else "unbound"})" }
                     }
                     val client = httpClient!!
                     val w = WsClient(client)
@@ -483,12 +641,14 @@ class SyncService : Service() {
                         })
 
                         var waited = 0
-                        while (isActive && !w.connected.value && waited < 8000) {
+                        while (isActive && !w.connected.value && waited < 8000 && netGeneration.get() == genAtBuild) {
                             delay(200); waited += 200
                         }
                         if (w.connected.value) { backoff = 1000L; DebugLog.v("ws") { "connected; backoff reset to 1000ms" } }
                         else DebugLog.v("ws") { "connect attempt #$attempt did not open within ${waited}ms" }
-                        while (isActive && SyncState.running.value && w.connected.value) {
+                        // Also break the hold loop on a network flip so we rebuild the
+                        // pinned client on the new interface without waiting a full cycle.
+                        while (isActive && SyncState.running.value && w.connected.value && netGeneration.get() == genAtBuild) {
                             delay(1000)
                         }
                     } finally {
@@ -531,6 +691,9 @@ class SyncService : Service() {
                 SyncState.currentPool.value = ok?.pool?.ifEmpty { "default" } ?: "default"
                 update("synced with ${ok?.serverName ?: "server"}")
                 refreshNotification()
+                // P1 — hello_ok means the session is fully usable (threshold known,
+                // blob channel live): drain any clips queued while disconnected/failed.
+                flushOutbound()
             }
             MsgType.ACK -> {
                 val a = runCatching { env.decodePayload<Ack>() }.getOrNull()
@@ -734,6 +897,12 @@ class SyncService : Service() {
         capture?.stop()
         capture = null
         ws?.close()
+        // Release the ConnectivityManager NetworkCallback (P0).
+        runCatching { networkCallback?.let { connectivityMgr?.unregisterNetworkCallback(it) } }
+            .onFailure { DebugLog.w("unregisterNetworkCallback failed: ${it.message}") }
+        networkCallback = null
+        connectivityMgr = null
+        boundNetwork = null
         // Release the reused OkHttpClients' Dispatcher executors + ConnectionPools.
         listOfNotNull(httpClient, httpPullClient).forEach { c ->
             runCatching { c.dispatcher.executorService.shutdown(); c.connectionPool.evictAll() }
