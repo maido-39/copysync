@@ -518,7 +518,11 @@ fn start_sync(app: &AppHandle, cfg: Config) {
             let emit_sup = emit.clone();
             let status_inner = status.clone();
             let cfg_run = cfg.clone();
-            let inner = tauri::async_runtime::spawn(async move {
+            // tokio::spawn (not tauri::async_runtime::spawn): the supervisor needs the
+            // tokio JoinError (is_cancelled/is_panic) to tell an intentional abort from
+            // a panic; tauri's handle wraps it in tauri::Error and hides that. Tauri 2's
+            // async runtime IS tokio, so spawning directly here is safe.
+            let inner = tokio::spawn(async move {
                 engine::run(cfg_run, engine_state, emit, rx).await;
             });
 
