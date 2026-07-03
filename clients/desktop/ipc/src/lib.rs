@@ -16,8 +16,16 @@ pub fn socket_label() -> String {
 }
 
 /// Live connection/sync state, mirroring the old Tauri `status` event.
+///
+/// The trailing settings mirror (`privacy_filter`/`mark_sensitive`/`auto_clear_secs`)
+/// lets the GUI seed its 설정 controls from the agent's REAL engine state instead of
+/// hardcoded defaults; all are `#[serde(default)]` so an older agent that doesn't
+/// send them still deserializes cleanly (they fall back to type defaults).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    /// Whether a device pairing exists (drives first-run onboarding on 연결).
+    #[serde(default)]
+    pub paired: bool,
     pub connected: bool,
     pub reconnecting: bool,
     pub server: String,
@@ -25,6 +33,15 @@ pub struct Status {
     pub e2e: bool,
     pub pool: String,
     pub pools: Vec<String>,
+    /// Real engine value of `exclude_sensitive` (민감 클립 동기화 제외).
+    #[serde(default)]
+    pub privacy_filter: bool,
+    /// Real engine value of `mark_received_sensitive` (받은 항목 민감 표시).
+    #[serde(default)]
+    pub mark_sensitive: bool,
+    /// Real engine value of `auto_clear_secs` (자동 지우기).
+    #[serde(default)]
+    pub auto_clear_secs: u64,
 }
 
 /// One history row for the GUI's 기록 list.

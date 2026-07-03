@@ -421,6 +421,20 @@ fn tint(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+/// Composite `over` at coverage `alpha` (0..=1) on top of the OPAQUE `base`,
+/// yielding a new opaque color. Used to pre-compute an opaque danger-toned toast
+/// backing (an `Area` paints no backdrop, so its fill must be fully opaque to stay
+/// legible over any wallpaper/scrim).
+fn blend_over(base: Color32, over: Color32, alpha: f32) -> Color32 {
+    let a = alpha.clamp(0.0, 1.0);
+    let mix = |b: u8, o: u8| ((b as f32) * (1.0 - a) + (o as f32) * a).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(
+        mix(base.r(), over.r()),
+        mix(base.g(), over.g()),
+        mix(base.b(), over.b()),
+    )
+}
+
 /// The resolved token set for one theme (dark or light). Built once per
 /// `apply_theme` and re-read every frame from a fresh `Palette::resolve(...)`.
 #[derive(Clone, Copy)]
@@ -887,9 +901,21 @@ enum Tab {
     Debug,
 }
 
-/// A blocked-clip toast: the mapped Korean reason chip + the preview, with a
-/// spawn time so we can auto-dismiss after ~5s.
+/// Which transient-toast variant to paint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    /// A blocked (privacy-filtered) outbound clip — pink "동기화 차단됨" styling.
+    Blocked,
+    /// A failure surfaced from the engine (e.g. a failed image/file upload) —
+    /// danger-toned "오류" banner so it's visible outside the buried debug tab.
+    Error,
+}
+
+/// A transient toast: a title chip + body/preview, with a spawn time so we can
+/// auto-dismiss after ~5s. Reused for both blocked-clip warnings and engine
+/// error banners (see [`ToastKind`]).
 struct Toast {
+    kind: ToastKind,
     reason: String,
     preview: String,
     spawned: Instant,
@@ -1362,8 +1388,16 @@ impl App {
         }
     }
 
-    /// Take a fresh `Status` and seed the local settings mirror + pool combo.
+    /// Take a fresh `Status` and seed the local settings mirror so the 설정 tab's
+    /// toggles/segments reflect the agent's REAL engine state (privacy filter /
+    /// mark-sensitive / auto-clear) rather than the hardcoded `App::new` defaults.
+    /// The controls write-through synchronously on toggle (each `SetPrivacyFilter`
+    /// etc. round-trips before the next pushed Status), so re-seeding here can't
+    /// race a user edit back to a stale value.
     fn adopt_status(&mut self, s: Status) {
+        self.privacy_filter = s.privacy_filter;
+        self.mark_sensitive = s.mark_sensitive;
+        self.auto_clear_secs = s.auto_clear_secs;
         self.status = s;
     }
 
@@ -1393,6 +1427,7 @@ impl App {
                             .unwrap_or_default();
                         self.logline(true, format!("차단된 클립: {reason}"));
                         self.toasts.push(Toast {
+                            kind: ToastKind::Blocked,
                             reason: reason_ko(&reason).to_string(),
                             preview,
                             spawned: Instant::now(),
@@ -1411,6 +1446,16 @@ impl App {
                 }
                 Event::Error { message } => {
                     self.logline(true, format!("오류: {message}"));
+                    // Surface engine errors (e.g. a failed image/file upload) as a
+                    // visible, auto-dismissing banner — not just a line buried in the
+                    // debug tab. Reuses the toast mechanism with the danger-toned
+                    // Error variant.
+                    self.toasts.push(Toast {
+                        kind: ToastKind::Error,
+                        reason: "오류".to_string(),
+                        preview: message,
+                        spawned: Instant::now(),
+                    });
                 }
                 Event::Notify { title, body } => {
                     self.logline(false, format!("알림: {title} — {body}"));
@@ -1526,10 +1571,13 @@ impl eframe::App for App {
         // frame (the event thread will keep them fresh from here on).
         if !self.bootstrapped {
             self.bootstrapped = true;
+            // `reload_status()` → `adopt_status()` seeds the 설정 mirror
+            // (privacy_filter / mark_sensitive / auto_clear_secs) from the agent's
+            // REAL engine state, so the settings controls no longer show hardcoded
+            // `App::new` defaults.
             self.reload_status();
             self.reload_roster();
             self.reload_history();
-            self.privacy_filter = true;
             self.logline(true, "GUI 시작");
         }
 
@@ -1831,7 +1879,32 @@ impl App {
 impl App {
     fn tab_connect(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette(ui.ctx());
+        // First-run onboarding: when no pairing exists yet, the 상태 grid is all
+        // dashes and would leave the user with no idea what to do. Show a prominent
+        // call-to-action pointing at 설정 → 기기 페어링 instead. Decided before the
+        // ScrollArea closure (which can't touch `&mut self`) and the tab-jump applied
+        // after it.
+        let show_onboarding = !self.status.paired;
+        let mut go_pair = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if show_onboarding {
+                Self::card(ui, &pal, |ui| {
+                    Self::card_title(ui, &pal, "기기를 페어링하세요");
+                    ui.label(
+                        egui::RichText::new(
+                            "아직 연결된 기기가 없습니다. 서버의 OTP로 이 데스크톱을 페어링하면 클립보드 동기화가 시작됩니다.",
+                        )
+                        .size(13.0)
+                        .color(pal.muted),
+                    );
+                    ui.add_space(8.0);
+                    if Self::primary_button(ui, &pal, "기기 페어링하기").clicked() {
+                        go_pair = true;
+                    }
+                });
+                ui.add_space(12.0);
+            }
+
             // ---- 상태
             Self::card(ui, &pal, |ui| {
                 Self::card_title(ui, &pal, "상태");
@@ -1976,6 +2049,10 @@ impl App {
                 }
             });
         });
+        // Onboarding CTA click: jump to 설정 (which hosts the 기기 페어링 fields).
+        if go_pair {
+            self.tab = Tab::Settings;
+        }
     }
 }
 
@@ -2003,9 +2080,20 @@ impl App {
                 ui.add_space(8.0);
                 ui.weak("기록이 없습니다.");
             }
-            // Clone for borrow simplicity; lists are capped at 200 rows.
+            // Clone for borrow simplicity; lists are capped at 200 rows. The card
+            // closure must NOT touch `&mut self`, so each row hands back the text to
+            // re-copy (if any) via `recopy_this`, applied after the closure returns.
             let rows = self.history.clone();
+            // The one text to re-copy this frame, decided inside the row closures.
+            let mut recopy_text: Option<String> = None;
             for row in &rows {
+                // Only text rows carry their full content in `preview` (image/file
+                // rows only have a label — the actual bytes/path aren't in the IPC
+                // HistRow), so re-copy is enabled for text with non-empty content and
+                // greyed out otherwise.
+                let is_text = row.kind != "image" && row.kind != "file";
+                let recopyable = is_text && !row.preview.trim().is_empty();
+                let mut recopy_this = false;
                 Self::card(ui, &pal, |ui| {
                     ui.horizontal(|ui| {
                         Self::kind_chip(ui, &pal, &row.kind);
@@ -2018,6 +2106,29 @@ impl App {
                             egui::RichText::new(body)
                                 .size(14.0)
                                 .color(pal.fg),
+                        );
+                        // Right-aligned "복사" affordance. Enabled for text rows;
+                        // disabled (greyed) for image/file rows that lack re-copy data.
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("복사").size(12.0).color(pal.fg),
+                                )
+                                .fill(pal.panel2)
+                                .stroke(Stroke::new(1.0, pal.line))
+                                .rounding(Rounding::same(8.0));
+                                let resp = ui
+                                    .add_enabled(recopyable, btn)
+                                    .on_hover_text(if recopyable {
+                                        "클립보드에 복사하고 다시 동기화"
+                                    } else {
+                                        "이 항목은 다시 복사할 수 없습니다"
+                                    });
+                                if resp.clicked() {
+                                    recopy_this = true;
+                                }
+                            },
                         );
                     });
                     // Coded meta: 보냄 in strong-fg, 받음 in muted (NOT teal).
@@ -2042,7 +2153,22 @@ impl App {
                         );
                     });
                 });
+                if recopy_this {
+                    // Place on the OS clipboard now (the user's immediate "복사"
+                    // expectation) via egui's output, and remember the text so we can
+                    // also re-send it through the agent below (re-sync to peers).
+                    ui.output_mut(|o| o.copied_text = row.preview.clone());
+                    recopy_text = Some(row.preview.clone());
+                }
                 ui.add_space(12.0);
+            }
+            // Apply the re-copy outside the row/card closures (they can't borrow
+            // `&mut self`): re-send the text so it re-syncs to paired devices.
+            if let Some(text) = recopy_text {
+                match request_ok(&Request::SendText { text }) {
+                    Ok(_) => self.logline(true, "기록 항목 재복사·재전송"),
+                    Err(e) => self.logline(true, format!("재복사 전송 실패: {e}")),
+                }
             }
         });
     }
@@ -2483,47 +2609,80 @@ impl App {
         for (i, toast) in self.toasts.iter().rev().enumerate() {
             let y = screen.bottom() - 70.0 - (i as f32) * 86.0;
             let pos = egui::pos2(screen.center().x, y);
+            // Per-variant chrome. Blocked = pink DESIGN.md §3 recipe; Error = a
+            // danger-toned banner composited over the OPAQUE panel tier (the panel
+            // is always opaque here — `blocked_toasts` uses `self.palette(ctx)` which
+            // only lowers panel alpha under a wallpaper; to stay legible over any
+            // backdrop we blend the danger tint over the theme bg by hand).
+            let is_error = toast.kind == ToastKind::Error;
+            let (fill, stroke, title_col, body_col, chip_fill, icon, heading) = if is_error {
+                // Opaque danger backing: danger@ ~18% composited over the opaque bg.
+                let backing = blend_over(pal.bg, pal.danger, if pal.dark { 0.20 } else { 0.12 });
+                (
+                    backing,
+                    tint(pal.danger, 0.55),
+                    pal.danger,
+                    pal.fg,
+                    tint(pal.danger, 0.35),
+                    "⚠",
+                    "오류",
+                )
+            } else {
+                (
+                    pal.toast_fill,
+                    pal.toast_stroke,
+                    pal.toast_title,
+                    pal.toast_body,
+                    tint(pal.blocked_pink, 0.40),
+                    "🔒",
+                    "동기화 차단됨",
+                )
+            };
             egui::Area::new(egui::Id::new(("blocked_toast", i)))
                 .fixed_pos(egui::pos2(pos.x - 180.0, pos.y))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     // Critical: `Area` paints no backdrop, so we paint an OPAQUE
                     // backing surface (dark #482B31 pre-composited / light near-
-                    // solid #FDE7F1) before any pink tint — see DESIGN.md §3.
+                    // solid #FDE7F1) before any tint — see DESIGN.md §3.
                     egui::Frame::none()
-                        .fill(pal.toast_fill)
-                        .stroke(Stroke::new(1.0, pal.toast_stroke))
+                        .fill(fill)
+                        .stroke(Stroke::new(1.0, stroke))
                         .rounding(Rounding::same(12.0))
                         .inner_margin(Margin::symmetric(14.0, 11.0))
                         .show(ui, |ui| {
                             ui.set_width(332.0);
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("🔒").size(18.0));
+                                ui.label(egui::RichText::new(icon).size(18.0));
                                 ui.label(
-                                    egui::RichText::new("동기화 차단됨")
+                                    egui::RichText::new(heading)
                                         .strong()
                                         .size(14.0)
-                                        .color(pal.toast_title),
+                                        .color(title_col),
                                 );
-                                // Reason chip: pink@40% fill, rounding 10, micro.
-                                egui::Frame::none()
-                                    .fill(tint(pal.blocked_pink, 0.40))
-                                    .rounding(Rounding::same(10.0))
-                                    .inner_margin(Margin::symmetric(6.0, 1.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&toast.reason)
-                                                .size(11.5)
-                                                .color(pal.toast_title),
-                                        );
-                                    });
+                                // Reason chip (only meaningful for the blocked variant;
+                                // the error variant's `reason` is just "오류", same as
+                                // the heading, so skip the redundant chip there).
+                                if !is_error {
+                                    egui::Frame::none()
+                                        .fill(chip_fill)
+                                        .rounding(Rounding::same(10.0))
+                                        .inner_margin(Margin::symmetric(6.0, 1.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&toast.reason)
+                                                    .size(11.5)
+                                                    .color(title_col),
+                                            );
+                                        });
+                                }
                             });
                             if !toast.preview.is_empty() {
                                 let preview = truncate(&toast.preview, 80);
                                 ui.label(
                                     egui::RichText::new(preview)
                                         .size(12.5)
-                                        .color(pal.toast_body),
+                                        .color(body_col),
                                 );
                             }
                         });

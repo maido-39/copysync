@@ -106,8 +106,14 @@ fn dlog(msg: &str) {
 
 // ----------------------------------------------------------------- conversions
 
-fn status_to_ipc(s: &CoreStatus) -> IpcStatus {
+/// Convert the engine's `CoreStatus` to the IPC `Status`, folding in the three
+/// live settings atomics (`privacy_filter`/`mark_sensitive`/`auto_clear_secs`) so
+/// the GUI can seed its 설정 controls from the agent's REAL state, not hardcoded
+/// defaults. Callers pass the current atomic values (the emitter's status callback
+/// only holds `&CoreStatus`, so the settings are threaded in explicitly).
+fn status_to_ipc(s: &CoreStatus, privacy_filter: bool, mark_sensitive: bool, auto_clear_secs: u64) -> IpcStatus {
     IpcStatus {
+        paired: s.paired,
         connected: s.connected,
         reconnecting: s.reconnecting,
         server: s.server_name.clone(),
@@ -115,6 +121,9 @@ fn status_to_ipc(s: &CoreStatus) -> IpcStatus {
         e2e: s.e2e,
         pool: s.pool.clone(),
         pools: s.pools.clone(),
+        privacy_filter,
+        mark_sensitive,
+        auto_clear_secs,
     }
 }
 
@@ -163,11 +172,22 @@ fn entry_to_histrow(e: &copysync_core::history::Entry) -> HistRow {
 struct BroadcastEmitter {
     events: broadcast::Sender<Event>,
     roster: Arc<Mutex<Vec<CoreRoster>>>,
+    // Live settings atomics, cloned from `SharedState`, so a pushed `Event::Status`
+    // carries the same real privacy_filter/mark_sensitive/auto_clear_secs values the
+    // one-shot `GetStatus` snapshot does.
+    exclude_sensitive: Arc<AtomicBool>,
+    mark_sensitive: Arc<AtomicBool>,
+    auto_clear_secs: Arc<AtomicU64>,
 }
 
 impl Emitter for BroadcastEmitter {
     fn status(&self, s: &CoreStatus) {
-        let _ = self.events.send(Event::Status(status_to_ipc(s)));
+        let _ = self.events.send(Event::Status(status_to_ipc(
+            s,
+            self.exclude_sensitive.load(Ordering::Relaxed),
+            self.mark_sensitive.load(Ordering::Relaxed),
+            self.auto_clear_secs.load(Ordering::Relaxed),
+        )));
     }
     fn clip(&self, payload: serde_json::Value) {
         let _ = self.events.send(Event::Clip(clip_to_info(&payload)));
@@ -248,14 +268,33 @@ impl SharedState {
 }
 
 impl Engine {
+    /// Read the three live settings atomics as a tuple, in the order
+    /// `status_to_ipc` expects: `(privacy_filter, mark_sensitive, auto_clear_secs)`.
+    fn settings_tuple(&self) -> (bool, bool, u64) {
+        (
+            self.state.exclude_sensitive.load(Ordering::Relaxed),
+            self.state.mark_sensitive.load(Ordering::Relaxed),
+            self.state.auto_clear_secs.load(Ordering::Relaxed),
+        )
+    }
+
     fn status_snapshot(&self) -> IpcStatus {
-        status_to_ipc(&self.state.status.lock().unwrap_or_else(|e| e.into_inner()))
+        let (pf, ms, ac) = self.settings_tuple();
+        status_to_ipc(
+            &self.state.status.lock().unwrap_or_else(|e| e.into_inner()),
+            pf,
+            ms,
+            ac,
+        )
     }
 
     fn new_emitter(&self) -> Arc<dyn Emitter> {
         Arc::new(BroadcastEmitter {
             events: self.events.clone(),
             roster: self.roster.clone(),
+            exclude_sensitive: self.state.exclude_sensitive.clone(),
+            mark_sensitive: self.state.mark_sensitive.clone(),
+            auto_clear_secs: self.state.auto_clear_secs.clone(),
         })
     }
 
@@ -336,11 +375,12 @@ impl Engine {
                         let _ = this.events.send(Event::Error {
                             message: "동기화가 멈췄습니다 — 다시 페어링하거나 에이전트를 재시작하세요.".into(),
                         });
+                        let (pf, ms, ac) = this.settings_tuple();
                         let snap = {
                             let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
                             s.connected = false;
                             s.reconnecting = false;
-                            status_to_ipc(&s)
+                            status_to_ipc(&s, pf, ms, ac)
                         };
                         let _ = this.events.send(Event::Status(snap));
                         break;
@@ -367,11 +407,12 @@ impl Engine {
                         let _ = this.events.send(Event::Error {
                             message: "동기화 엔진이 예기치 않게 중단되어 자동으로 재시작합니다.".into(),
                         });
+                        let (pf, ms, ac) = this.settings_tuple();
                         let snap = {
                             let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
                             s.connected = false;
                             s.reconnecting = true;
-                            status_to_ipc(&s)
+                            status_to_ipc(&s, pf, ms, ac)
                         };
                         let _ = this.events.send(Event::Status(snap));
                         tokio::time::sleep(delay).await;
