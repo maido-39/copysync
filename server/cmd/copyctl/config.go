@@ -16,6 +16,12 @@ type Config struct {
 	Token      string `json:"token"`   // bearer token (secret)
 	Pin        string `json:"spkiPin"` // server SPKI SHA-256, base64
 	E2EPass    string `json:"e2ePass"` // optional E2E passphrase (secret); empty = no E2E
+	// Privacy filter (mirrors the desktop/Android clients): captured clips that
+	// classify as sensitive (passwords/OTP/cards/keys/custom) are NOT synced.
+	// Zero value = filter ON, so configs from before this field keep the safe
+	// default; explicit `send --text` is never blocked (deliberate user action).
+	PrivacyFilterOff bool     `json:"privacyFilterOff,omitempty"`
+	CustomPatterns   []string `json:"customPatterns,omitempty"` // extra sensitive regexes
 }
 
 func defaultConfigPath() string {

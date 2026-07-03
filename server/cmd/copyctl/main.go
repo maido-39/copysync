@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/syaro/copysync/internal/model"
+	"github.com/syaro/copysync/internal/privacy"
 	"github.com/syaro/copysync/internal/protocol"
 )
 
@@ -183,6 +184,14 @@ func cmdSend(args []string) error {
 	}
 
 	if *text != "" {
+		// Explicit sends are never blocked (deliberate user action — matches the
+		// desktop's SendText semantics), but warn when the clip looks sensitive.
+		if !cfg.PrivacyFilterOff {
+			res, _ := privacy.CompilePatterns(cfg.CustomPatterns)
+			if why := privacy.Classify(*text, res); why != 0 {
+				fmt.Fprintf(os.Stderr, "warning: clip classifies as sensitive (%s) — sending anyway (explicit send)\n", why.Label())
+			}
+		}
 		id, err := cl.sendText(ctx, conn, *text, targets)
 		if err != nil {
 			return err
@@ -348,12 +357,28 @@ func cmdRun(args []string) error {
 		}
 	}()
 
+	// Privacy filter (parity with the desktop/Android clients): captured clips
+	// that classify as sensitive are not synced. Deliberately NOT recorded in
+	// history.jsonl either — unlike the desktop's encrypted+purged history,
+	// copyctl's log is plaintext, so writing the secret there would defeat the
+	// point of blocking it.
+	customRes, patErrs := privacy.CompilePatterns(cfg.CustomPatterns)
+	for _, e := range patErrs {
+		fmt.Fprintln(os.Stderr, "warning: bad customPatterns regex ignored:", e)
+	}
+
 	// Outgoing: broadcast local clipboard changes (suppressing our own writes).
 	cb.Watch(ctx, func(text string) {
 		sum := sha256.Sum256([]byte(text))
 		sha := hex.EncodeToString(sum[:])
 		if cl.echo.seen(sha) {
 			return
+		}
+		if !cfg.PrivacyFilterOff {
+			if why := privacy.Classify(text, customRes); why != 0 {
+				fmt.Fprintf(os.Stderr, "blocked by privacy filter (%s) — not synced; set privacyFilterOff in the config to disable\n", why.Label())
+				return
+			}
 		}
 		if _, err := cl.sendText(ctx, conn, text, targets); err != nil {
 			fmt.Fprintln(os.Stderr, "send failed:", err)
