@@ -1521,16 +1521,19 @@ fn apply_blob(
             }
             emit.notify(&clip_origin_name(state, &ev.origin_device), &format!("🖼 {name} · {}", human(plain.len())));
         } else {
-            // Eager (≤ threshold) file: put it on the clipboard so it's pasteable.
-            if !ev.on_demand {
-                let p = path.to_string_lossy().to_string();
-                remember(recent_files, p.clone());
-                if let Err(e) = clipboard::set_files(&[p]) {
-                    dlog!("recv", "apply file to clipboard FAILED (RDP contention?): {e}");
-                    emit.error(format!("받은 파일 클립보드 적용 실패(RDP 경합?): {e}"));
-                } else {
-                    dlog!("recv", "applied file to clipboard: {}", path.to_string_lossy());
-                }
+            // Put the received file on the clipboard so Ctrl+V pastes it. This
+            // applies to on-demand transfers too: by the time apply_blob runs the
+            // bytes are FULLY downloaded — on-demand only changed how the transfer
+            // was brokered, and gating this on `!ev.on_demand` made every large
+            // (> threshold) file from Android/desktop land silently in the
+            // downloads folder with paste doing nothing (user-reported).
+            let p = path.to_string_lossy().to_string();
+            remember(recent_files, p.clone());
+            if let Err(e) = clipboard::set_files(&[p]) {
+                dlog!("recv", "apply file to clipboard FAILED (RDP contention?): {e}");
+                emit.error(format!("받은 파일 클립보드 적용 실패(RDP 경합?): {e}"));
+            } else {
+                dlog!("recv", "applied file to clipboard: {}", path.to_string_lossy());
             }
             emit.notify(&clip_origin_name(state, &ev.origin_device), &format!("📎 {name} · {}", human(plain.len())));
         }
