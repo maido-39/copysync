@@ -336,23 +336,121 @@ fn schedule_clear_text(expected: String, secs: u64) {
 /// The OS-clipboard polling loop (runs on its own std::thread). Emits `Cmd`s for
 /// text/image/file changes and surfaces odd/unhandled clipboard states via
 /// `emit.cliplog`. Identical logic to the Tauri build.
+/// Per-run clipboard watcher state: the last-seen sequence number plus per-format
+/// last-hashes for echo/dedup. Threaded through [`poll_once`] so the same read
+/// body serves both the event-driven (Windows) and polling (other OSes / fallback)
+/// drivers below.
+struct ClipState {
+    last_seq: Option<u32>,
+    last_text: String,
+    last_img: String,
+    last_files: String,
+    had_rich_last: bool,
+}
+
+impl ClipState {
+    fn new() -> Self {
+        ClipState {
+            last_seq: None,
+            last_text: String::new(),
+            last_img: String::new(),
+            last_files: String::new(),
+            had_rich_last: false,
+        }
+    }
+}
+
+/// The OS-clipboard watcher.
+///
+/// Windows: **event-driven** via `AddClipboardFormatListener` (through
+/// `clipboard_win::Monitor`) — a hidden message-only window that unblocks the
+/// moment the clipboard changes, so there is no idle polling and no up-to-800ms
+/// latency. A tiny reaper thread drops the monitor's `Shutdown` handle when the
+/// engine drops the `Cmd` receiver (`tx.is_closed()`), which unblocks `recv()` so
+/// this thread exits — preserving the exact self-exit contract the polling loop
+/// had. If the listener can't be created we fall back to polling.
+///
+/// Other OSes: polling (`arboard` exposes no change event). Same read body.
 pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
-    let mut last_seq: Option<u32> = None;
-    let mut last_text = String::new();
-    let mut last_img = String::new();
-    let mut last_files = String::new();
-    // idx 13: track whether an image/file format was present on the PREVIOUS
-    // generation so the priority cliplog fires only on the rising edge (when a
-    // rich format first appears) rather than on every 800ms poll tick. On
-    // non-Windows seq_num() is None so every tick is a "generation"; without this
-    // edge-gate a persistent image would flood the event feed ~75×/min.
-    let mut had_rich_last = false;
+    #[cfg(windows)]
+    {
+        match clipboard_win::Monitor::new() {
+            Ok(mut monitor) => {
+                // Reaper: translate "engine dropped rx" into a monitor shutdown so
+                // the blocking recv() below returns and this thread ends. Holding a
+                // tx clone does NOT keep rx alive (is_closed tracks the receiver).
+                let shutdown = monitor.shutdown_channel();
+                let tx_reaper = tx.clone();
+                std::thread::spawn(move || {
+                    while !tx_reaper.is_closed() {
+                        std::thread::sleep(Duration::from_millis(1000));
+                    }
+                    drop(shutdown); // PostMessage → unblocks monitor.recv()
+                });
+                let mut st = ClipState::new();
+                // Process whatever is already on the clipboard at startup, then react
+                // to each change event.
+                poll_once(&tx, &emit, &mut st);
+                loop {
+                    match monitor.recv() {
+                        Ok(true) => {
+                            if tx.is_closed() {
+                                return;
+                            }
+                            poll_once(&tx, &emit, &mut st);
+                        }
+                        Ok(false) => return, // shutdown requested (engine stopped)
+                        Err(e) => {
+                            debug_log("clipboard", &format!("monitor.recv error: {e}; falling back to a poll tick"));
+                            if tx.is_closed() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            poll_once(&tx, &emit, &mut st);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug_log("clipboard", &format!("AddClipboardFormatListener unavailable ({e}); using polling watcher"));
+                clipboard_poll_loop(tx, emit);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    clipboard_poll_loop(tx, emit);
+}
+
+/// Polling driver: run one read every 800ms until the engine drops the receiver.
+/// Used on non-Windows and as the Windows fallback if the event listener fails.
+fn clipboard_poll_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
+    let mut st = ClipState::new();
     loop {
+        poll_once(&tx, &emit, &mut st);
+        std::thread::sleep(Duration::from_millis(800));
+        if tx.is_closed() {
+            return;
+        }
+    }
+}
+
+/// Read the current clipboard once, diff each format against `st`, and dispatch a
+/// `Cmd` for whatever genuinely changed. Shared by the event-driven and polling
+/// drivers. On Windows the sequence-number guard short-circuits an unchanged
+/// clipboard (so a duplicate event is cheap); elsewhere `seq_num()` is None and
+/// every call reads content.
+fn poll_once(tx: &UnboundedSender<Cmd>, emit: &Arc<dyn Emitter>, st: &mut ClipState) {
+    let last_seq = &mut st.last_seq;
+    let last_text = &mut st.last_text;
+    let last_img = &mut st.last_img;
+    let last_files = &mut st.last_files;
+    let had_rich_last = &mut st.had_rich_last;
+    {
         // On Windows, only touch the clipboard when its sequence number changes —
         // re-opening it every tick contends with RDP's redirector and drops copies.
         // Elsewhere seq_num() is None, so we keep polling content every tick.
         let seq = clipboard::seq_num();
-        let changed = seq.map_or(true, |s| Some(s) != last_seq);
+        let changed = seq.map_or(true, |s| Some(s) != *last_seq);
         if changed {
             // NOTE: do NOT commit `last_seq` yet — only after at least one format
             // read succeeds. A transiently-locked clipboard generation (RDP
@@ -386,21 +484,21 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
             let img_changed = match &img_res {
                 Ok(img) => {
                     read_ok = true;
-                    sha_hex(&img.rgba) != last_img
+                    sha_hex(&img.rgba) != *last_img
                 }
                 Err(_) => false,
             };
             let files_changed = match &files_opt {
                 Some(files) => {
                     read_ok = true;
-                    files.join("\u{1}") != last_files
+                    files.join("\u{1}") != *last_files
                 }
                 None => false,
             };
             let text_changed = match &text_res {
                 Ok(t) if !t.is_empty() => {
                     read_ok = true;
-                    *t != last_text
+                    *t != *last_text
                 }
                 Ok(_) => { read_ok = true; false } // empty text, nothing to send
                 Err(e) => { dlog!("clipboard", "gen: text read failed: {e}"); false }
@@ -408,7 +506,7 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
 
             if img_changed {
                 let img = img_res.expect("img_changed implies Ok");
-                last_img = sha_hex(&img.rgba);
+                *last_img = sha_hex(&img.rgba);
                 // idx 3 fix: a NEW image arrived; we prefer it over any coexisting
                 // text/file fallback this generation. But do NOT clear last_text/
                 // last_files to empty — that would make the SAME still-present
@@ -416,8 +514,8 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
                 // re-synced as its own clip. Instead snapshot whatever companion is
                 // currently present as "already seen", so an unchanged companion is
                 // deduped next tick while a genuinely-new later change still fires.
-                last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
-                last_files = files_opt.as_ref().map(|f| f.join("\u{1}")).unwrap_or_default();
+                *last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
+                *last_files = files_opt.as_ref().map(|f| f.join("\u{1}")).unwrap_or_default();
                 let (w, hh, bytes) = (img.width, img.height, img.rgba.len());
                 dlog!("clipboard", "gen: chose IMAGE {w}x{hh} ({bytes}B rgba); preferred over text/files");
                 let _ = tx.send(Cmd::LocalImage(img));
@@ -425,13 +523,13 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
             } else if files_changed {
                 // Windows Explorer file copy (CF_HDROP).
                 let files = files_opt.clone().expect("files_changed implies Some");
-                last_files = files.join("\u{1}");
+                *last_files = files.join("\u{1}");
                 // idx 3 fix: same as the image branch — snapshot the coexisting
                 // text/image companions as already-seen instead of clearing to
                 // empty, so an unchanged companion isn't spuriously re-synced next
                 // tick while a genuinely-new later change still fires.
-                last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
-                last_img = img_res.as_ref().ok().map(|img| sha_hex(&img.rgba)).unwrap_or_default();
+                *last_text = text_res.as_ref().ok().filter(|t| !t.is_empty()).cloned().unwrap_or_default();
+                *last_img = img_res.as_ref().ok().map(|img| sha_hex(&img.rgba)).unwrap_or_default();
                 dlog!("clipboard", "gen: chose FILES ({} path(s)); preferred over text", files.len());
                 let _ = tx.send(Cmd::LocalFiles(files));
                 handled = true;
@@ -440,7 +538,7 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
                 // text genuinely changed (even if a stale image/file is still present),
                 // so sync it instead of letting an unchanged rich format shadow it.
                 let t = text_res.as_ref().expect("text_changed implies Ok").clone();
-                last_text = t.clone();
+                *last_text = t.clone();
                 // Don't clear last_img/last_files here: an unchanged coexisting
                 // image/file is still valid and must NOT be force-resynced next tick.
                 let html = clipboard::get_html().ok().filter(|h| !h.is_empty());
@@ -467,17 +565,17 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
             // tick — so a persistent image doesn't flood the feed on non-Windows
             // where every 800ms tick is a "generation".
             let had_rich = had_image || had_files;
-            if had_rich && !had_rich_last {
+            if had_rich && !*had_rich_last {
                 emit.cliplog(format!(
                     "클립보드 우선순위: 이미지/파일 포맷 감지 (image={had_image}, files={had_files}) → 텍스트보다 우선 동기화"
                 ));
             }
-            had_rich_last = had_rich;
+            *had_rich_last = had_rich;
 
             if read_ok {
                 // Only now mark this generation as consumed.
                 if let Some(s) = seq {
-                    last_seq = Some(s);
+                    *last_seq = Some(s);
                 }
             } else if seq.is_some() {
                 dlog!(
@@ -514,10 +612,6 @@ pub fn clipboard_loop(tx: UnboundedSender<Cmd>, emit: Arc<dyn Emitter>) {
                     ));
                 }
             }
-        }
-        std::thread::sleep(Duration::from_millis(800));
-        if tx.is_closed() {
-            return;
         }
     }
 }

@@ -34,7 +34,9 @@ mdns-sd = "0.11"
 dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
-clipboard-win = "5"
+# `monitor` pulls windows-win for AddClipboardFormatListener (event-driven
+# clipboard watcher — see engine::clipboard_loop).
+clipboard-win = { version = "5", features = ["monitor"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
