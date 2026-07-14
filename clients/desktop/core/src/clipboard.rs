@@ -19,6 +19,35 @@ pub struct Image {
 const OPEN_ATTEMPTS: u32 = 5;
 const OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
 
+// Standard Win32 clipboard format ids (stable ABI). Used with the no-open
+// `IsClipboardFormatAvailable` probe so we never open the clipboard just to learn
+// a format is absent — opening contends with the RDP redirector (`rdpclip`) and
+// with the app that owns the clipboard, which is the #1 cause of copies being
+// dropped across an RDP boundary or in clipboard-sensitive apps.
+#[cfg(windows)]
+mod cf {
+    pub const CF_TEXT: u32 = 1;
+    pub const CF_DIB: u32 = 8;
+    pub const CF_UNICODETEXT: u32 = 13;
+    pub const CF_DIBV5: u32 = 17;
+}
+
+/// Is a text format advertised on the clipboard? A pure format probe — does NOT
+/// open the clipboard and does NOT force a delayed-render. Always true off Windows
+/// (there the read path polls content directly every tick).
+#[cfg(windows)]
+fn text_available() -> bool {
+    use clipboard_win::raw::is_format_avail;
+    is_format_avail(cf::CF_UNICODETEXT) || is_format_avail(cf::CF_TEXT)
+}
+
+/// Is a bitmap/image format advertised? Same no-open, no-render semantics.
+#[cfg(windows)]
+fn image_available() -> bool {
+    use clipboard_win::raw::is_format_avail;
+    is_format_avail(cf::CF_DIBV5) || is_format_avail(cf::CF_DIB)
+}
+
 fn open_clipboard(what: &str) -> Result<arboard::Clipboard> {
     let mut last_err = None;
     for attempt in 1..=OPEN_ATTEMPTS {
@@ -49,6 +78,15 @@ fn open_clipboard(what: &str) -> Result<arboard::Clipboard> {
 }
 
 pub fn get_text() -> Result<String> {
+    // Windows: if no text format is advertised, report "not available" WITHOUT
+    // opening the clipboard. arboard would also return an error here — but only
+    // AFTER opening, which needlessly contends with rdpclip / the owning app on
+    // every non-text copy. The caller (clipboard_loop) treats this Err exactly as
+    // it treats arboard's ContentNotAvailable, so behavior is unchanged.
+    #[cfg(windows)]
+    if !text_available() {
+        anyhow::bail!("no text format on clipboard");
+    }
     Ok(open_clipboard("get_text")?.get_text()?)
 }
 
@@ -92,6 +130,15 @@ pub fn set_text_sensitive(s: &str) -> Result<()> {
 }
 
 pub fn get_image() -> Result<Image> {
+    // Windows: skip the clipboard open entirely when no bitmap format is present
+    // (the common case on every text/file copy). Besides cutting rdpclip/app
+    // contention, this avoids calling GetClipboardData(CF_DIB) when there is no
+    // image — which for a delayed-render owner would force an unnecessary (and on
+    // RDP, slow) render. Same Err the loop already handles, minus the open.
+    #[cfg(windows)]
+    if !image_available() {
+        anyhow::bail!("no image format on clipboard");
+    }
     let img = open_clipboard("get_image")?.get_image()?;
     Ok(Image {
         width: img.width,
@@ -254,6 +301,18 @@ pub fn set_image(img: &Image) -> Result<()> {
 
 /// Read the clipboard's rich-text (HTML) representation, if any.
 pub fn get_html() -> Result<String> {
+    // Windows: most text copies (Notepad, terminals, code editors) carry NO "HTML
+    // Format", so probe for it before opening. Saves the second clipboard open on
+    // every plain-text copy — again reducing rdpclip/app contention.
+    #[cfg(windows)]
+    {
+        let avail = clipboard_win::raw::register_format("HTML Format")
+            .map(|f| clipboard_win::raw::is_format_avail(f.get()))
+            .unwrap_or(false);
+        if !avail {
+            anyhow::bail!("no HTML format on clipboard");
+        }
+    }
     Ok(open_clipboard("get_html")?.get().html()?)
 }
 
