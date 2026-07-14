@@ -80,5 +80,6 @@ pub async fn claim(
         quick_panel_shortcut: crate::config::DEFAULT_QUICK_PANEL_SHORTCUT.to_string(),
         auto_clear_secs: 0,
         mark_received_sensitive: false,
+        telemetry: true,
     })
 }

@@ -153,6 +153,7 @@
     { id: "downloads", label: "다운로드", ic: "📥" },
     { id: "theme", label: "화면", ic: "🎨" },
     { id: "monitor", label: "모니터링", ic: "📡" },
+    { id: "logs", label: "로그", ic: "📝" },
     { id: "account", label: "계정", ic: "👤" },
   ];
 
@@ -183,7 +184,10 @@
 
   function go(id) {
     state.section = id;
+    // Tear down any live resources from the section we're leaving so they can't
+    // leak (the SSE stream and the telemetry poll timer).
     if (state.monitorES) { state.monitorES.close(); state.monitorES = null; }
+    if (state.logsTimer) { clearInterval(state.logsTimer); state.logsTimer = null; }
     for (var k in state.nav) state.nav[k].classList.toggle("active", k === id);
     clear(state.main);
     if (id === "overview") sectionOverview();
@@ -193,6 +197,7 @@
     else if (id === "downloads") sectionDownloads();
     else if (id === "theme") sectionTheme();
     else if (id === "monitor") sectionMonitor();
+    else if (id === "logs") sectionTelemetry();
     else sectionAccount();
   }
 
@@ -535,6 +540,39 @@
       listEl.insertBefore(row, listEl.firstChild);
       while (listEl.childNodes.length > 200) listEl.removeChild(listEl.lastChild);
     };
+  }
+
+  // ---- logs (client telemetry) -----------------------------------------------
+  function sectionTelemetry() {
+    var m = state.main;
+    m.appendChild(pageHead("로그", "클라이언트가 올린 시스템 동작 로그 (엔진 시작/정지 · 재연결 · 오류 · 페어링). 클립 내용은 포함되지 않습니다."));
+    var card = el("div", { class: "card" });
+    var listEl = el("div", { class: "log-list" }, el("p", { class: "muted" }, "불러오는 중…"));
+    card.appendChild(listEl);
+    m.appendChild(card);
+    function render(lines) {
+      clear(listEl);
+      if (!lines.length) {
+        listEl.appendChild(el("p", { class: "empty" }, "아직 수집된 로그가 없습니다. 클라이언트가 15초마다 전송합니다 (텔레메트리 켜짐 시)."));
+        return;
+      }
+      lines.forEach(function (l) {
+        listEl.appendChild(el("div", { class: "log-row log-" + (l.level || "info") },
+          el("span", { class: "log-lvl" }, (l.level || "info").toUpperCase()),
+          el("span", { class: "log-dev" }, l.device || l.deviceId || "?"),
+          el("span", { class: "log-cli" }, l.client || ""),
+          el("span", { class: "log-msg" }, l.msg || ""),
+          el("span", { class: "log-ts" }, l.recvTs || l.ts || "")));
+      });
+    }
+    function load() {
+      api("GET", "/admin/telemetry?limit=500").then(function (r) {
+        render(r.lines || []);
+      }).catch(function (e) { clear(listEl); listEl.appendChild(el("p", { class: "msg err" }, e.message)); });
+    }
+    load();
+    // Poll every 5s; the timer is cleared in go() when leaving this section.
+    state.logsTimer = setInterval(load, 5000);
   }
 
   // ---- account ---------------------------------------------------------------

@@ -10,11 +10,13 @@
 //!   copysync-agent serve    # serve
 //!   copysync-agent ping     # connect, GetStatus, print the reply (self-test)
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use copysync_core::telemetry as core_telemetry;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -104,6 +106,97 @@ fn dlog(msg: &str) {
     }
 }
 
+// ----------------------------------------------------------------- telemetry
+//
+// Operational events (engine lifecycle, reconnects, errors, pairing) are mirrored
+// into a small BOUNDED in-memory buffer that a background task uploads to the
+// paired server (default ON, opt-out via Config::telemetry). This is how an
+// operator diagnoses a client without shell access — the agent.log file never
+// leaves the machine otherwise. NEVER enqueue clipboard content here.
+
+/// Max buffered telemetry lines. Bounded so a long offline stretch (upload
+/// failing) can't grow this without limit — the leak we are explicitly avoiding.
+const TELEMETRY_BUF_CAP: usize = 500;
+
+/// The process-wide telemetry line buffer (FIFO). Only `tlog` pushes (to the
+/// back); only the uploader task drains (from the front).
+fn telemetry_buf() -> &'static Mutex<VecDeque<core_telemetry::Line>> {
+    static B: OnceLock<Mutex<VecDeque<core_telemetry::Line>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Record an operational event: always into the bounded telemetry buffer (for
+/// upload), and — when `COPYSYNC_DEBUG` is on — into `agent.log` too. `level` is
+/// "info" | "warn" | "error". NEVER pass clipboard content.
+fn tlog(level: &'static str, msg: impl Into<String>) {
+    let msg = msg.into();
+    dlog(&msg);
+    let mut b = telemetry_buf().lock().unwrap_or_else(|e| e.into_inner());
+    if b.len() >= TELEMETRY_BUF_CAP {
+        b.pop_front();
+    }
+    b.push_back(core_telemetry::Line {
+        level: level.to_string(),
+        ts: debug_stamp(),
+        msg,
+    });
+}
+
+/// The config file path (`dirs::config_dir()/copysync/config.json`), shared by
+/// `build_engine` and the telemetry uploader so both read the same file.
+fn config_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("copysync").join("config.json")
+}
+
+/// Background task: every 15s, upload any buffered telemetry lines to the paired
+/// server. Reads the config fresh each cycle so a re-pair (new server/token) is
+/// picked up automatically, and honors the `telemetry` opt-out. On a failed
+/// upload the drained lines are re-buffered at the front (bounded) for retry.
+async fn telemetry_uploader() {
+    let cfg_path = config_path();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let cfg = match Config::load(&cfg_path) {
+            Ok(c) => c,
+            Err(_) => continue, // not paired yet / unreadable — nothing to send to
+        };
+        if !cfg.telemetry || cfg.server_url.is_empty() || cfg.token.is_empty() {
+            continue;
+        }
+        let pin = match copysync_core::pinning::decode_pin(&cfg.pin) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Drain up to 200 from the front. On success they're gone; on failure we
+        // push them back (see below) so nothing is lost by a transient outage.
+        let batch: Vec<core_telemetry::Line> = {
+            let mut b = telemetry_buf().lock().unwrap_or_else(|e| e.into_inner());
+            let n = b.len().min(200);
+            b.drain(..n).collect()
+        };
+        if batch.is_empty() {
+            continue;
+        }
+        match copysync_core::telemetry::upload(&cfg.server_url, &cfg.token, pin, "agent", &batch)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                dlog(&format!("telemetry upload failed (will retry): {e}"));
+                let mut b = telemetry_buf().lock().unwrap_or_else(|e| e.into_inner());
+                // Re-buffer at the front (preserving order), keeping the ring bounded.
+                for line in batch.into_iter().rev() {
+                    b.push_front(line);
+                    if b.len() > TELEMETRY_BUF_CAP {
+                        b.pop_back();
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------- conversions
 
 /// Convert the engine's `CoreStatus` to the IPC `Status`, folding in the three
@@ -111,7 +204,7 @@ fn dlog(msg: &str) {
 /// the GUI can seed its 설정 controls from the agent's REAL state, not hardcoded
 /// defaults. Callers pass the current atomic values (the emitter's status callback
 /// only holds `&CoreStatus`, so the settings are threaded in explicitly).
-fn status_to_ipc(s: &CoreStatus, privacy_filter: bool, mark_sensitive: bool, auto_clear_secs: u64) -> IpcStatus {
+fn status_to_ipc(s: &CoreStatus, privacy_filter: bool, mark_sensitive: bool, auto_clear_secs: u64, telemetry: bool) -> IpcStatus {
     IpcStatus {
         paired: s.paired,
         connected: s.connected,
@@ -124,6 +217,7 @@ fn status_to_ipc(s: &CoreStatus, privacy_filter: bool, mark_sensitive: bool, aut
         privacy_filter,
         mark_sensitive,
         auto_clear_secs,
+        telemetry,
     }
 }
 
@@ -178,6 +272,7 @@ struct BroadcastEmitter {
     exclude_sensitive: Arc<AtomicBool>,
     mark_sensitive: Arc<AtomicBool>,
     auto_clear_secs: Arc<AtomicU64>,
+    telemetry: Arc<AtomicBool>,
 }
 
 impl Emitter for BroadcastEmitter {
@@ -187,6 +282,7 @@ impl Emitter for BroadcastEmitter {
             self.exclude_sensitive.load(Ordering::Relaxed),
             self.mark_sensitive.load(Ordering::Relaxed),
             self.auto_clear_secs.load(Ordering::Relaxed),
+            self.telemetry.load(Ordering::Relaxed),
         )));
     }
     fn clip(&self, payload: serde_json::Value) {
@@ -197,9 +293,14 @@ impl Emitter for BroadcastEmitter {
         let _ = self.events.send(Event::Roster(roster_to_ipc(r)));
     }
     fn reconnect(&self, info: String) {
+        // Reconnects are the single most useful signal for "why does this device
+        // keep dropping" — mirror them to telemetry (warn).
+        tlog("warn", format!("reconnect: {info}"));
         let _ = self.events.send(Event::Reconnect { info });
     }
     fn error(&self, msg: String) {
+        // Engine errors (failed uploads, fatal disconnects) → telemetry (error).
+        tlog("error", format!("engine error: {msg}"));
         let _ = self.events.send(Event::Error { message: msg });
     }
     fn cliplog(&self, msg: String) {
@@ -241,6 +342,9 @@ struct SharedState {
     exclude_sensitive: Arc<AtomicBool>,
     auto_clear_secs: Arc<AtomicU64>,
     mark_sensitive: Arc<AtomicBool>,
+    // Telemetry opt-out (server-log upload). Agent-only — the engine never reads
+    // it (the uploader task does), so it is NOT part of EngineState.
+    telemetry: Arc<AtomicBool>,
     reconnect: Arc<Notify>,
     cfg_path: PathBuf,
     downloads: PathBuf,
@@ -270,21 +374,23 @@ impl SharedState {
 impl Engine {
     /// Read the three live settings atomics as a tuple, in the order
     /// `status_to_ipc` expects: `(privacy_filter, mark_sensitive, auto_clear_secs)`.
-    fn settings_tuple(&self) -> (bool, bool, u64) {
+    fn settings_tuple(&self) -> (bool, bool, u64, bool) {
         (
             self.state.exclude_sensitive.load(Ordering::Relaxed),
             self.state.mark_sensitive.load(Ordering::Relaxed),
             self.state.auto_clear_secs.load(Ordering::Relaxed),
+            self.state.telemetry.load(Ordering::Relaxed),
         )
     }
 
     fn status_snapshot(&self) -> IpcStatus {
-        let (pf, ms, ac) = self.settings_tuple();
+        let (pf, ms, ac, tel) = self.settings_tuple();
         status_to_ipc(
             &self.state.status.lock().unwrap_or_else(|e| e.into_inner()),
             pf,
             ms,
             ac,
+            tel,
         )
     }
 
@@ -295,6 +401,7 @@ impl Engine {
             exclude_sensitive: self.state.exclude_sensitive.clone(),
             mark_sensitive: self.state.mark_sensitive.clone(),
             auto_clear_secs: self.state.auto_clear_secs.clone(),
+            telemetry: self.state.telemetry.clone(),
         })
     }
 
@@ -313,7 +420,7 @@ impl Engine {
     /// outside (see `start`'s abort below / the `Shutdown` handler), which tears
     /// down the whole loop cleanly — the supervisor never fights that lifecycle.
     fn start(self: &Arc<Self>, cfg: Config) {
-        dlog(&format!(
+        tlog("info", format!(
             "engine start: server={:?} device={:?} e2e={}",
             cfg.server_name,
             cfg.device_name,
@@ -328,6 +435,7 @@ impl Engine {
         self.state
             .mark_sensitive
             .store(cfg.mark_received_sensitive, Ordering::Relaxed);
+        self.state.telemetry.store(cfg.telemetry, Ordering::Relaxed);
         {
             let mut s = self.state.status.lock().unwrap_or_else(|e| e.into_inner());
             s.paired = true;
@@ -377,16 +485,16 @@ impl Engine {
                         // The actor returned normally: its command channel closed or
                         // it hit a fatal early-return (bad pin/config). Surface it and
                         // STOP — relaunching would just fail again the same way.
-                        dlog("engine stop: actor returned (channel closed / fatal) — marking disconnected, supervisor stops");
+                        tlog("error", "engine stop: actor returned (channel closed / fatal) — marking disconnected, supervisor stops");
                         let _ = this.events.send(Event::Error {
                             message: "동기화가 멈췄습니다 — 다시 페어링하거나 에이전트를 재시작하세요.".into(),
                         });
-                        let (pf, ms, ac) = this.settings_tuple();
+                        let (pf, ms, ac, tel) = this.settings_tuple();
                         let snap = {
                             let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
                             s.connected = false;
                             s.reconnecting = false;
-                            status_to_ipc(&s, pf, ms, ac)
+                            status_to_ipc(&s, pf, ms, ac, tel)
                         };
                         let _ = this.events.send(Event::Status(snap));
                         break;
@@ -404,7 +512,7 @@ impl Engine {
                         // doesn't leave sync dead until the daemon is restarted.
                         attempt = attempt.saturating_add(1);
                         let delay = supervisor_backoff(attempt);
-                        dlog(&format!(
+                        tlog("warn", format!(
                             "engine SUPERVISOR: actor task ended unexpectedly (panic={}) — relaunch #{} in {}ms",
                             e.is_panic(),
                             attempt,
@@ -413,12 +521,12 @@ impl Engine {
                         let _ = this.events.send(Event::Error {
                             message: "동기화 엔진이 예기치 않게 중단되어 자동으로 재시작합니다.".into(),
                         });
-                        let (pf, ms, ac) = this.settings_tuple();
+                        let (pf, ms, ac, tel) = this.settings_tuple();
                         let snap = {
                             let mut s = this.state.status.lock().unwrap_or_else(|e| e.into_inner());
                             s.connected = false;
                             s.reconnecting = true;
-                            status_to_ipc(&s, pf, ms, ac)
+                            status_to_ipc(&s, pf, ms, ac, tel)
                         };
                         let _ = this.events.send(Event::Status(snap));
                         tokio::time::sleep(delay).await;
@@ -575,6 +683,15 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
             }
             Outbound::Reply(Response::Ok)
         }
+        Request::SetTelemetry { on } => {
+            engine.state.telemetry.store(on, Ordering::Relaxed);
+            if let Ok(mut cfg) = Config::load(&engine.state.cfg_path) {
+                cfg.telemetry = on;
+                let _ = cfg.save(&engine.state.cfg_path);
+            }
+            tlog("info", format!("telemetry {}", if on { "enabled" } else { "disabled" }));
+            Outbound::Reply(Response::Ok)
+        }
 
         Request::Reconnect => {
             engine.state.reconnect.notify_waiters();
@@ -623,12 +740,12 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
                             message: format!("설정 저장 실패: {e}"),
                         });
                     }
-                    dlog("Pair succeeded — starting engine");
+                    tlog("info", "Pair succeeded — starting engine");
                     engine.start(cfg);
                     Outbound::Reply(Response::Paired(engine.status_snapshot()))
                 }
                 Err(e) => {
-                    dlog(&format!("Pair failed: {e:#}"));
+                    tlog("error", format!("Pair failed: {e:#}"));
                     Outbound::Reply(Response::Error {
                         message: e.to_string(),
                     })
@@ -646,7 +763,7 @@ async fn handle_request(engine: &Arc<Engine>, req: Request) -> Outbound {
         // task tears down its engine actor + clipboard watcher, and it won't relaunch
         // (an aborted supervisor is gone, not restarted).
         Request::Shutdown => {
-            dlog("Shutdown requested — stopping engine and exiting process");
+            tlog("info", "Shutdown requested — stopping engine and exiting process");
             // Clear the stored sender so no late IPC command races the teardown, then
             // abort the SUPERVISOR (which owns the engine actor + clipboard thread).
             *engine.cmd_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -835,6 +952,7 @@ fn build_engine() -> Result<Arc<Engine>> {
         .as_ref()
         .map(|c| c.mark_received_sensitive)
         .unwrap_or(false);
+    let telemetry = loaded.as_ref().map(|c| c.telemetry).unwrap_or(true);
 
     let state = SharedState {
         hist: Arc::new(Mutex::new(hist)),
@@ -844,6 +962,7 @@ fn build_engine() -> Result<Arc<Engine>> {
         exclude_sensitive: Arc::new(AtomicBool::new(exclude)),
         auto_clear_secs: Arc::new(AtomicU64::new(auto_clear)),
         mark_sensitive: Arc::new(AtomicBool::new(mark)),
+        telemetry: Arc::new(AtomicBool::new(telemetry)),
         reconnect: Arc::new(Notify::new()),
         cfg_path,
         downloads,
@@ -877,9 +996,12 @@ fn run_serve() -> Result<()> {
         .context("build tokio runtime")?;
     rt.block_on(async {
         dlog("agent serve starting (COPYSYNC_DEBUG on)");
+        tlog("info", "agent serve starting");
         let engine = build_engine().inspect_err(|e| {
             dlog(&format!("build_engine failed: {e:#}"));
         })?;
+        // Background telemetry uploader (default ON; opt-out via Config::telemetry).
+        tokio::spawn(telemetry_uploader());
         let result = serve(engine).await;
         if let Err(e) = &result {
             dlog(&format!("serve exited with error: {e:#}"));

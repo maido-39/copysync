@@ -42,6 +42,13 @@ pub struct Status {
     /// Real engine value of `auto_clear_secs` (자동 지우기).
     #[serde(default)]
     pub auto_clear_secs: u64,
+    /// Real config value of `telemetry` (서버로 동작 로그 전송). Default ON.
+    #[serde(default = "default_true")]
+    pub telemetry: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One history row for the GUI's 기록 list.
@@ -107,6 +114,7 @@ pub enum Request {
     SetPrivacyFilter { on: bool },
     SetAutoClear { secs: u64 },
     SetMarkSensitive { on: bool },
+    SetTelemetry { on: bool },
     DiscoverServers,
     Pair {
         server: String,

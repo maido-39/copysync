@@ -972,6 +972,7 @@ struct App {
     // settings mirror (seeded from status / toggled locally)
     privacy_filter: bool,
     mark_sensitive: bool,
+    telemetry: bool,
     auto_clear_secs: u64,
 
     // discovery worker channel (DiscoverServers runs off-thread, ~2.5s)
@@ -1070,6 +1071,7 @@ impl App {
             pair_rx: None,
             privacy_filter: true,
             mark_sensitive: false,
+            telemetry: true,
             auto_clear_secs: 0,
             discovered: Vec::new(),
             discover_rx: None,
@@ -1397,6 +1399,7 @@ impl App {
     fn adopt_status(&mut self, s: Status) {
         self.privacy_filter = s.privacy_filter;
         self.mark_sensitive = s.mark_sensitive;
+        self.telemetry = s.telemetry;
         self.auto_clear_secs = s.auto_clear_secs;
         self.status = s;
     }
@@ -2193,6 +2196,12 @@ impl App {
                     let _ = request_ok(&Request::SetMarkSensitive { on });
                     self.logline(true, format!("민감 표시: {on}"));
                 }
+                if ui.checkbox(&mut self.telemetry, "서버로 동작 로그 전송 (텔레메트리)").changed() {
+                    let on = self.telemetry;
+                    let _ = request_ok(&Request::SetTelemetry { on });
+                    self.logline(true, format!("텔레메트리: {on}"));
+                }
+                ui.weak("엔진 시작/정지·재연결·오류 등 시스템 동작 로그만 전송하며, 클립 내용은 포함되지 않습니다.");
                 ui.add_space(4.0);
                 ui.label("자동 지우기");
                 ui.horizontal(|ui| {

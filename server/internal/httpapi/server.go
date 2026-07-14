@@ -42,6 +42,11 @@ type Server struct {
 	pairLimiter  *ipLimiter
 
 	blobWaiters *blobWaiters
+
+	// telemetry is a bounded in-memory ring of client-uploaded operational log
+	// lines (see telemetry.go). Always on; the default-ON behavior lives on the
+	// client, and this store is capped so it cannot leak.
+	telemetry *telemetryRing
 }
 
 // Config holds what the HTTP server needs at construction time.
@@ -102,6 +107,7 @@ func New(c Config) *Server {
 		loginLimiter:      newIPLimiter(rate.Every(2*time.Second), 5),
 		pairLimiter:       newIPLimiter(rate.Every(2*time.Second), 5),
 		blobWaiters:       newBlobWaiters(),
+		telemetry:         newTelemetryRing(telemetryCap),
 	}
 }
 
@@ -130,6 +136,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /blob/{id}", s.handleBlobGet)
 	mux.HandleFunc("HEAD /blob/{id}", s.handleBlobGet)
 
+	// Client telemetry ingest (device-token auth, inside the handler).
+	mux.HandleFunc("POST /telemetry", s.handleTelemetryIngest)
+
 	// Device pairing (public, rate-limited).
 	mux.HandleFunc("GET /pair/serverinfo", s.handleServerInfo)
 	mux.HandleFunc("POST /pair/claim", s.handlePairClaim)
@@ -150,6 +159,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/monitor/stream", s.requireAdmin(s.handleMonitorStream))
 	mux.HandleFunc("GET /admin/monitor/activity", s.requireAdmin(s.handleActivity))
 	mux.HandleFunc("GET /admin/monitor/blob/{id}", s.requireAdmin(s.handleMonitorBlob))
+	mux.HandleFunc("GET /admin/telemetry", s.requireAdmin(s.handleAdminTelemetry))
 
 	// File hosting: public download endpoints (gated by the DownloadsEnabled
 	// setting) + admin management (list / upload / delete).

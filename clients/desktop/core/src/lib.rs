@@ -16,6 +16,7 @@ pub mod history;
 pub mod pairing;
 pub mod pinning;
 pub mod privacy;
+pub mod telemetry;
 pub mod protocol;
 pub mod ws;
 

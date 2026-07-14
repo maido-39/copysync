@@ -45,6 +45,13 @@ pub struct Config {
     /// (Windows only). Mirrors Android's "받은 항목 민감 표시".
     #[serde(default)]
     pub mark_received_sensitive: bool,
+
+    /// Upload this device's system-operation logs (engine lifecycle, reconnects,
+    /// errors, pairing) to the paired server so an operator can diagnose it
+    /// without shell access. ON by default; NEVER includes clipboard content.
+    /// Pre-existing configs (no field) default to ON via `default_true`.
+    #[serde(default = "default_true")]
+    pub telemetry: bool,
 }
 
 // NOTE: Detailed debug mode is gated by the `COPYSYNC_DEBUG=1` environment

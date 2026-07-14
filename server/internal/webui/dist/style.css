@@ -71,6 +71,18 @@ a { color: var(--accent2); }
 .heat { display: grid; grid-template-rows: repeat(7, 13px); grid-auto-flow: column; grid-auto-columns: 13px; gap: 3px; overflow-x: auto; padding: 4px 0; }
 .heat-cell { width: 13px; height: 13px; border-radius: 3px; }
 .mon-thumb { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; flex: none; background: var(--border); cursor: zoom-in; }
+.log-list { display: flex; flex-direction: column; max-height: 70vh; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.log-row { display: flex; gap: 10px; align-items: baseline; padding: 5px 6px; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.log-lvl { flex: none; width: 46px; font-size: 10.5px; font-weight: 700; letter-spacing: .03em; }
+.log-info .log-lvl { color: var(--muted); }
+.log-warn .log-lvl { color: #d98a1a; }
+.log-error .log-lvl { color: #e0588f; }
+.log-warn { background: color-mix(in srgb, #d98a1a 8%, transparent); }
+.log-error { background: color-mix(in srgb, #e0588f 9%, transparent); }
+.log-dev { flex: none; min-width: 80px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.log-cli { flex: none; width: 52px; color: var(--muted); font-size: 11px; }
+.log-msg { flex: 1; min-width: 0; word-break: break-word; }
+.log-ts { flex: none; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .mon-thumb.big { width: 240px; height: 240px; cursor: zoom-out; }
 .mon-body { flex: 1; min-width: 0; display: flex; gap: 9px; align-items: flex-start; }
 .mon-prev.expanded { white-space: pre-wrap; overflow: visible; word-break: break-word; }
