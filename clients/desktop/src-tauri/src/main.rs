@@ -432,6 +432,20 @@ fn supervisor_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(secs * 1000 + jitter)
 }
 
+/// Aborts the wrapped task when this guard is dropped, so aborting the SUPERVISOR
+/// (on re-pair) also aborts the inner `engine::run`. Without it, `prev.abort()`
+/// only cancels the supervisor future and DETACHES the inner task (dropping a
+/// `JoinHandle` does not abort it), leaking `engine::run`, its WS/TLS connection,
+/// and — since the leaked actor keeps the `Cmd` receiver alive — the clipboard OS
+/// thread (which exits only on `tx.is_closed()`), while a second engine starts and
+/// both sync at once. See the copysync-agent supervisor for the same fix.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Start (or restart) the sync engine under a RESTART SUPERVISOR. The supervisor
 /// task loops: rebuild the `Cmd` channel (+ its clipboard-watcher std thread), run
 /// `engine::run`, and await its JoinHandle. If that inner task PANICKED
@@ -525,6 +539,9 @@ fn start_sync(app: &AppHandle, cfg: Config) {
             let inner = tokio::spawn(async move {
                 engine::run(cfg_run, engine_state, emit, rx).await;
             });
+            // Aborting THIS supervisor (re-pair) must abort engine::run too, or it
+            // detaches and leaks along with the clipboard thread (see AbortOnDrop).
+            let _abort_inner = AbortOnDrop(inner.abort_handle());
 
             match inner.await {
                 Ok(()) => {

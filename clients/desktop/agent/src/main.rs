@@ -365,6 +365,12 @@ impl Engine {
                 let cfg_run = cfg.clone();
                 let inner: JoinHandle<()> =
                     tokio::spawn(async move { engine::run(cfg_run, state, emit, rx).await });
+                // If THIS supervisor is aborted (re-pair / Shutdown) while parked on
+                // `inner.await`, the guard's Drop aborts `engine::run` too — otherwise
+                // the inner task would detach and leak (see AbortOnDrop). On the normal
+                // completion paths below the task is already finished, so the guard's
+                // abort at scope-end is a harmless no-op.
+                let _abort_inner = AbortOnDrop(inner.abort_handle());
 
                 match inner.await {
                     Ok(()) => {
@@ -422,6 +428,26 @@ impl Engine {
             }
         });
         *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(supervisor);
+    }
+}
+
+/// Aborts the wrapped task when this guard is dropped.
+///
+/// The engine supervisor needs this because a re-pair / `Shutdown` stops the
+/// engine by calling `abort()` on the SUPERVISOR task — but that only cancels the
+/// supervisor future. The supervisor owns the inner `engine::run` handle as a
+/// plain `JoinHandle`, and dropping a `JoinHandle` DETACHES its task rather than
+/// aborting it. So without this guard the aborted supervisor left `engine::run`
+/// running forever; because that leaked actor keeps the `Cmd` receiver alive, the
+/// clipboard OS thread (which exits only on `tx.is_closed()`) also never stopped —
+/// leaking a thread, a WS/TLS connection, and its buffers on every re-pair, and
+/// running two engines at once. Holding the inner task's `AbortHandle` in a
+/// drop-guard makes aborting the supervisor also abort `engine::run`, which drops
+/// the receiver and lets the clipboard thread exit on its next poll tick.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
